@@ -81,7 +81,24 @@ async function initDb() {
         created_at TIMESTAMP DEFAULT NOW(), deleted_at TIMESTAMP
       );
       CREATE TABLE IF NOT EXISTS procure_plan (id SERIAL PRIMARY KEY, order_no VARCHAR(100) DEFAULT '', plan_date DATE, goods_info JSONB DEFAULT '[]', remark TEXT DEFAULT '', status INT DEFAULT 0, admin_name VARCHAR(100) DEFAULT '', created_at TIMESTAMP DEFAULT NOW(), deleted_at TIMESTAMP);
-      CREATE TABLE IF NOT EXISTS procure_return (id SERIAL PRIMARY KEY, order_no VARCHAR(100) DEFAULT '', supplier_id INT DEFAULT 0, supplier_name VARCHAR(200) DEFAULT '', return_date DATE, goods_info JSONB DEFAULT '[]', remark TEXT DEFAULT '', status INT DEFAULT 0, created_at TIMESTAMP DEFAULT NOW(), deleted_at TIMESTAMP);
+      CREATE TABLE IF NOT EXISTS procure_return (
+        id SERIAL PRIMARY KEY, order_no VARCHAR(100) DEFAULT '', order_sn VARCHAR(100) DEFAULT '',
+        order_id INT DEFAULT 0, supplier_id INT DEFAULT 0, supplier_name VARCHAR(200) DEFAULT '',
+        admin_name VARCHAR(100) DEFAULT '', return_date DATE,
+        total_amount DECIMAL(10,2) DEFAULT 0,
+        goods_info JSONB DEFAULT '[]', remark TEXT DEFAULT '', status INT DEFAULT 0,
+        warehouse_id INT DEFAULT 0, warehouse_name VARCHAR(100) DEFAULT '',
+        fund_id INT DEFAULT 0,
+        created_at TIMESTAMP DEFAULT NOW(), deleted_at TIMESTAMP
+      );
+      -- 补已有数据库缺少的列（幂等）
+      ALTER TABLE procure_return ADD COLUMN IF NOT EXISTS order_sn VARCHAR(100) DEFAULT '';
+      ALTER TABLE procure_return ADD COLUMN IF NOT EXISTS order_id INT DEFAULT 0;
+      ALTER TABLE procure_return ADD COLUMN IF NOT EXISTS admin_name VARCHAR(100) DEFAULT '';
+      ALTER TABLE procure_return ADD COLUMN IF NOT EXISTS total_amount DECIMAL(10,2) DEFAULT 0;
+      ALTER TABLE procure_return ADD COLUMN IF NOT EXISTS warehouse_id INT DEFAULT 0;
+      ALTER TABLE procure_return ADD COLUMN IF NOT EXISTS warehouse_name VARCHAR(100) DEFAULT '';
+      ALTER TABLE procure_return ADD COLUMN IF NOT EXISTS fund_id INT DEFAULT 0;
 
       CREATE TABLE IF NOT EXISTS sale_contracts (
         id SERIAL PRIMARY KEY, order_no VARCHAR(100) DEFAULT '', order_sn VARCHAR(100) DEFAULT '',
@@ -136,3 +153,4 @@ async function initDb() {
 }
 
 module.exports = { pool, initDb }
+

@@ -1007,51 +1007,52 @@ router.post('/procure/ProcureReturn/audit', async (req, res) => {
     const { id, status } = req.body
     if (!id) return fail(res, 'id不能为空')
 
-    // 获取退货单数据
     const retR = await pool.query('SELECT * FROM procure_return WHERE id=$1', [id])
     const ret = retR.rows[0]
     if (!ret) return fail(res, '退货单不存在')
 
-    // 解析 goods_info，支持 _meta 节点
     let goodsInfo = []
     try { goodsInfo = typeof ret.goods_info === 'string' ? JSON.parse(ret.goods_info) : (ret.goods_info || []) } catch {}
     const meta = goodsInfo.find(i => i._meta) || {}
     const items = goodsInfo.filter(i => !i._meta)
-    const warehouseId = meta.warehouse_id || ret.warehouse_id || 0
     const fundId = meta.fund_id || ret.fund_id || 0
     const totalAmount = parseFloat(meta.total_amount || ret.total_amount || 0)
     const orderTotalAmount = parseFloat(meta.order_total_amount || 0)
     const orderPayAmount = parseFloat(meta.order_pay_amount || 0)
 
-    // 审核通过：扣减库存 + 退款到资金账户
+    console.log('[ProcureReturn audit]', { id, status, fundId, totalAmount, itemsCount: items.length, meta })
+
     if (status === 1) {
+      // 扣减库存：不限仓库，直接按 goods_id 更新所有匹配行
       for (const item of items) {
         if (!item.goods_id || !item.num) continue
-        const sR = await pool.query('SELECT * FROM stock_inventory WHERE goods_id=$1 AND warehouse_id=$2 LIMIT 1', [item.goods_id, warehouseId])
-        if (sR.rows.length > 0) {
-          const newQty = Math.max(0, parseFloat(sR.rows[0].qty || 0) - parseFloat(item.num))
-          await pool.query('UPDATE stock_inventory SET qty=$1, update_time=NOW() WHERE id=$2', [newQty, sR.rows[0].id])
-        }
+        await pool.query(
+          'UPDATE stock_inventory SET qty=GREATEST(0, qty-$1), update_time=NOW() WHERE goods_id=$2',
+          [parseFloat(item.num), item.goods_id]
+        )
+        console.log('[stock deduct]', item.goods_id, item.num)
       }
+      // 退款到资金账户
       if (fundId && totalAmount > 0) {
         const unpaid = Math.max(0, orderTotalAmount - orderPayAmount)
         const refund = Math.max(0, totalAmount - unpaid)
+        console.log('[fund refund]', { fundId, totalAmount, unpaid, refund })
         if (refund > 0) {
           await pool.query('UPDATE finance_funds SET balance=balance+$1, update_time=NOW() WHERE id=$2', [refund, fundId])
         }
       }
     }
 
-    // 反审核：加回库存 + 从资金账户扣回退款
     if (status === 0) {
+      // 加回库存
       for (const item of items) {
         if (!item.goods_id || !item.num) continue
-        const sR = await pool.query('SELECT * FROM stock_inventory WHERE goods_id=$1 AND warehouse_id=$2 LIMIT 1', [item.goods_id, warehouseId])
-        if (sR.rows.length > 0) {
-          const newQty = parseFloat(sR.rows[0].qty || 0) + parseFloat(item.num)
-          await pool.query('UPDATE stock_inventory SET qty=$1, update_time=NOW() WHERE id=$2', [newQty, sR.rows[0].id])
-        }
+        await pool.query(
+          'UPDATE stock_inventory SET qty=qty+$1, update_time=NOW() WHERE goods_id=$2',
+          [parseFloat(item.num), item.goods_id]
+        )
       }
+      // 从资金账户扣回退款
       if (fundId && totalAmount > 0) {
         const unpaid = Math.max(0, orderTotalAmount - orderPayAmount)
         const refund = Math.max(0, totalAmount - unpaid)
@@ -1063,7 +1064,7 @@ router.post('/procure/ProcureReturn/audit', async (req, res) => {
 
     await pool.query('UPDATE procure_return SET status=$1 WHERE id=$2', [status ?? 1, id])
     return ok(res)
-  } catch (e) { fail(res, e.message) }
+  } catch (e) { console.error('[ProcureReturn audit error]', e.message); fail(res, e.message) }
 })
 
 // ═══════════════════════════════════════════════════════════════════════════

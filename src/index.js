@@ -262,12 +262,23 @@ app.use('/adminapi', router)
 // ═══════════════════════════════════════════════════════════════════════════
 
 // ShopGoods
+// 已知字段白名单（防止前端传入非法列名导致 SQL 报错）
+const GOODS_ALLOWED_COLS = new Set([
+  'goods_name','goods_sn','en_name','goods_memo','goods_type',
+  'cate_id','cate_name','unit_id','unit_name','brand_id','brand_name',
+  'spec','sell_price','cost_price','barcode',
+  'safe_min','safe_max','sort','make_time',
+  'can_sale','can_buy','can_make','can_outsource',
+  'multi_unit','multi_spec',
+  'stock','min_stock','max_stock',
+  'remark','status','images',
+])
 router.get('/goods/ShopGoods/index', async (req, res) => {
   try {
     const { page, list_rows, offset } = pageParams(req.query)
     await listQuery(res, 'goods', {
       keyword: req.query.keyword,
-      keywordCols: ['name', 'code'],
+      keywordCols: ['goods_name', 'goods_sn'],
       baseWhere: 'deleted_at IS NULL',
       orderBy: 'id DESC',
       page, list_rows, offset,
@@ -277,7 +288,8 @@ router.get('/goods/ShopGoods/index', async (req, res) => {
 router.post('/goods/ShopGoods/add', async (req, res) => {
   try {
     const body = req.body
-    const cols = Object.keys(body).filter(k => body[k] !== undefined && body[k] !== null)
+    const cols = Object.keys(body).filter(k => GOODS_ALLOWED_COLS.has(k) && body[k] !== undefined && body[k] !== null && body[k] !== '')
+    if (!cols.includes('goods_name') && !body.goods_name) return fail(res, '商品名称不能为空')
     const vals = cols.map(k => body[k])
     const sql = `INSERT INTO goods (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`
     const r = await pool.query(sql, vals)
@@ -288,7 +300,7 @@ router.post('/goods/ShopGoods/edit', async (req, res) => {
   try {
     const { id, ...rest } = req.body
     if (!id) return fail(res, 'id不能为空')
-    const cols = Object.keys(rest).filter(k => rest[k] !== undefined)
+    const cols = Object.keys(rest).filter(k => GOODS_ALLOWED_COLS.has(k) && rest[k] !== undefined)
     if (!cols.length) return fail(res, '无有效字段')
     const sets = cols.map((k,i) => `${k}=$${i+1}`)
     const vals = cols.map(k => rest[k])

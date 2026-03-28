@@ -30,10 +30,23 @@ async function initDb() {
       );
 
       CREATE TABLE IF NOT EXISTS goods (
-        id SERIAL PRIMARY KEY, name VARCHAR(200) NOT NULL, code VARCHAR(100) DEFAULT '',
-        cate_id INT DEFAULT 0, cate_name VARCHAR(100) DEFAULT '', unit_id INT DEFAULT 0,
-        unit_name VARCHAR(50) DEFAULT '', brand_id INT DEFAULT 0, brand_name VARCHAR(100) DEFAULT '',
-        spec TEXT DEFAULT '', price DECIMAL(10,2) DEFAULT 0, cost DECIMAL(10,2) DEFAULT 0,
+        id SERIAL PRIMARY KEY,
+        goods_name VARCHAR(200) NOT NULL DEFAULT '',
+        goods_sn VARCHAR(100) DEFAULT '',
+        en_name VARCHAR(200) DEFAULT '',
+        goods_memo VARCHAR(200) DEFAULT '',
+        goods_type INT DEFAULT 1,
+        cate_id INT DEFAULT 0, cate_name VARCHAR(100) DEFAULT '',
+        unit_id INT DEFAULT 0, unit_name VARCHAR(50) DEFAULT '',
+        brand_id INT DEFAULT 0, brand_name VARCHAR(100) DEFAULT '',
+        spec TEXT DEFAULT '',
+        sell_price DECIMAL(10,2) DEFAULT 0,
+        cost_price DECIMAL(10,2) DEFAULT 0,
+        barcode VARCHAR(100) DEFAULT '',
+        safe_min INT DEFAULT 0, safe_max INT DEFAULT 0,
+        sort INT DEFAULT 0, make_time INT DEFAULT 0,
+        can_sale INT DEFAULT 1, can_buy INT DEFAULT 1, can_make INT DEFAULT 1, can_outsource INT DEFAULT 1,
+        multi_unit BOOLEAN DEFAULT FALSE, multi_spec BOOLEAN DEFAULT FALSE,
         stock INT DEFAULT 0, min_stock INT DEFAULT 0, max_stock INT DEFAULT 0,
         remark TEXT DEFAULT '', status INT DEFAULT 1, images TEXT DEFAULT '',
         create_time TIMESTAMP DEFAULT NOW(), update_time TIMESTAMP DEFAULT NOW(), deleted_at TIMESTAMP
@@ -146,6 +159,30 @@ async function initDb() {
       INSERT INTO admins (name, account, password, role_name) VALUES ('管理员', 'admin', '123456', '超级管理员') ON CONFLICT (account) DO NOTHING;
       INSERT INTO warehouses (name) VALUES ('默认仓库') ON CONFLICT DO NOTHING;
     `)
+    // 兼容旧数据库：补加 goods 表缺失列
+    const goodsAlters = [
+      "ALTER TABLE goods ADD COLUMN IF NOT EXISTS goods_name VARCHAR(200) NOT NULL DEFAULT ''",
+      "ALTER TABLE goods ADD COLUMN IF NOT EXISTS goods_sn VARCHAR(100) DEFAULT ''",
+      "ALTER TABLE goods ADD COLUMN IF NOT EXISTS en_name VARCHAR(200) DEFAULT ''",
+      "ALTER TABLE goods ADD COLUMN IF NOT EXISTS goods_memo VARCHAR(200) DEFAULT ''",
+      "ALTER TABLE goods ADD COLUMN IF NOT EXISTS goods_type INT DEFAULT 1",
+      "ALTER TABLE goods ADD COLUMN IF NOT EXISTS sell_price DECIMAL(10,2) DEFAULT 0",
+      "ALTER TABLE goods ADD COLUMN IF NOT EXISTS cost_price DECIMAL(10,2) DEFAULT 0",
+      "ALTER TABLE goods ADD COLUMN IF NOT EXISTS barcode VARCHAR(100) DEFAULT ''",
+      "ALTER TABLE goods ADD COLUMN IF NOT EXISTS safe_min INT DEFAULT 0",
+      "ALTER TABLE goods ADD COLUMN IF NOT EXISTS safe_max INT DEFAULT 0",
+      "ALTER TABLE goods ADD COLUMN IF NOT EXISTS sort INT DEFAULT 0",
+      "ALTER TABLE goods ADD COLUMN IF NOT EXISTS make_time INT DEFAULT 0",
+      "ALTER TABLE goods ADD COLUMN IF NOT EXISTS can_sale INT DEFAULT 1",
+      "ALTER TABLE goods ADD COLUMN IF NOT EXISTS can_buy INT DEFAULT 1",
+      "ALTER TABLE goods ADD COLUMN IF NOT EXISTS can_make INT DEFAULT 1",
+      "ALTER TABLE goods ADD COLUMN IF NOT EXISTS can_outsource INT DEFAULT 1",
+      "ALTER TABLE goods ADD COLUMN IF NOT EXISTS multi_unit BOOLEAN DEFAULT FALSE",
+      "ALTER TABLE goods ADD COLUMN IF NOT EXISTS multi_spec BOOLEAN DEFAULT FALSE",
+    ]
+    for (const sql of goodsAlters) {
+      await client.query(sql).catch(() => {})
+    }
     console.log('Database initialized successfully')
   } finally {
     client.release()

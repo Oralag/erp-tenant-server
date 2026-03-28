@@ -345,7 +345,8 @@ router.post('/goods/ShopGoodsCate/del', async (req, res) => {
   try {
     const { id } = req.body
     if (!id) return fail(res, 'id不能为空')
-    await pool.query('DELETE FROM goods_cate WHERE id=$1', [id])
+    // 同时删除所有子分类
+    await pool.query('DELETE FROM goods_cate WHERE id=$1 OR parent_id=$1', [id])
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })

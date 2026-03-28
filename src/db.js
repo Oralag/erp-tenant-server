@@ -179,6 +179,9 @@ async function initDb() {
       "ALTER TABLE goods ADD COLUMN IF NOT EXISTS can_outsource INT DEFAULT 1",
       "ALTER TABLE goods ADD COLUMN IF NOT EXISTS multi_unit BOOLEAN DEFAULT FALSE",
       "ALTER TABLE goods ADD COLUMN IF NOT EXISTS multi_spec BOOLEAN DEFAULT FALSE",
+      // 旧表 name/code 列有 NOT NULL 约束，去掉以免 INSERT 报错
+      "ALTER TABLE goods ALTER COLUMN name DROP NOT NULL",
+      "ALTER TABLE goods ALTER COLUMN name SET DEFAULT ''",
     ]
     for (const sql of goodsAlters) {
       await client.query(sql).catch(() => {})

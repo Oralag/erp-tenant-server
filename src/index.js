@@ -329,8 +329,8 @@ router.post('/goods/ShopGoodsCate/add', async (req, res) => {
   try {
     const { name, parent_id = 0, sort = 0, status = 1 } = req.body
     if (!name) return fail(res, '名称不能为空')
-    const dup = await pool.query('SELECT id FROM goods_cate WHERE name=$1 AND parent_id=$2 LIMIT 1', [name, parent_id])
-    if (dup.rows.length) return fail(res, `同级分类"${name}"已存在`)
+    const dup = await pool.query('SELECT * FROM goods_cate WHERE name=$1 AND parent_id=$2 LIMIT 1', [name, parent_id])
+    if (dup.rows.length) return ok(res, dup.rows[0])
     const r = await pool.query('INSERT INTO goods_cate (name,parent_id,sort,status) VALUES ($1,$2,$3,$4) RETURNING *', [name, parent_id, sort, status])
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }

@@ -14,7 +14,20 @@ app.use(cors())
 app.use(express.json())
 app.use(express.urlencoded({ extended: true }))
 
-// ─── helpers ───────────────────────────────────────────────────────────────
+// ─── 表列名缓存（启动后加载，写入时自动过滤非法字段）─────────────────────────
+const tableColsCache = {}
+async function loadTableCols() {
+  const r = await pool.query(`SELECT table_name, column_name FROM information_schema.columns WHERE table_schema='public'`)
+  r.rows.forEach(({ table_name, column_name }) => {
+    if (!tableColsCache[table_name]) tableColsCache[table_name] = new Set()
+    tableColsCache[table_name].add(column_name)
+  })
+}
+function filterBodyCols(table, body) {
+  const allowed = tableColsCache[table]
+  if (!allowed) return body
+  return Object.fromEntries(Object.entries(body).filter(([k]) => allowed.has(k)))
+}
 
 function ok(res, data = {}, message = '') {
   return res.json({ code: 1, data, message })
@@ -472,9 +485,9 @@ router.get('/shop/ShopCustomer/detail', async (req, res) => {
 router.post('/shop/ShopCustomer/add', async (req, res) => {
   try {
     const b = req.body
-    const cols = Object.keys(b).filter(k => b[k] !== undefined && b[k] !== null && b[k] !== '')
+    const filtered = filterBodyCols('sale_customers', b); const cols = Object.keys(filtered).filter(k => filtered[k] !== undefined && filtered[k] !== null && filtered[k] !== '')
     if (!cols.includes('name') && !b.name) return fail(res, '客户名称不能为空')
-    const vals = cols.map(k => b[k])
+    const vals = cols.map(k => filtered[k])
     const r = await pool.query(`INSERT INTO sale_customers (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
@@ -1211,8 +1224,9 @@ router.get('/finance/Expense/index', async (req, res) => {
 })
 router.post('/finance/Expense/add', async (req, res) => {
   try {
+    const ALLOWED = new Set(['expense_no','name','amount','expense_date','fund_id','fund_name','remark','status','contact_name','pay_date'])
     const b = { expense_no: genOrderNo('FY'), ...req.body }
-    const cols = Object.keys(b).filter(k => b[k] !== undefined)
+    const cols = Object.keys(b).filter(k => ALLOWED.has(k) && b[k] !== undefined)
     const vals = cols.map(k => b[k])
     const r = await pool.query(`INSERT INTO finance_expenses (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
     return ok(res, r.rows[0])
@@ -1234,11 +1248,18 @@ router.get('/finance/Fund/index', async (req, res) => {
     await listQuery(res, 'finance_funds', { keyword: req.query.keyword, keywordCols: ['name'], baseWhere: 'deleted_at IS NULL', orderBy: 'id ASC', page, list_rows, offset })
   } catch (e) { fail(res, e.message) }
 })
+const FUND_ALLOWED_COLS = new Set(['name','fund_type','balance','bank_name','bank_account','remark','status'])
+function normalizeFundBody(b) {
+  // 前端传 type，数据库字段是 fund_type
+  if (b.type !== undefined && b.fund_type === undefined) b.fund_type = b.type
+  delete b.type
+  return b
+}
 router.post('/finance/Fund/add', async (req, res) => {
   try {
-    const b = req.body
+    const b = normalizeFundBody({ ...req.body })
     if (!b.name) return fail(res, '账户名称不能为空')
-    const cols = Object.keys(b).filter(k => b[k] !== undefined)
+    const cols = Object.keys(b).filter(k => FUND_ALLOWED_COLS.has(k) && b[k] !== undefined)
     const vals = cols.map(k => b[k])
     const r = await pool.query(`INSERT INTO finance_funds (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
     return ok(res, r.rows[0])
@@ -1248,10 +1269,11 @@ router.post('/finance/Fund/edit', async (req, res) => {
   try {
     const { id, ...rest } = req.body
     if (!id) return fail(res, 'id不能为空')
-    const cols = Object.keys(rest).filter(k => rest[k] !== undefined)
+    const b = normalizeFundBody({ ...rest })
+    const cols = Object.keys(b).filter(k => FUND_ALLOWED_COLS.has(k) && b[k] !== undefined)
     if (!cols.length) return fail(res, '无有效字段')
     const sets = cols.map((k,i) => `${k}=$${i+1}`)
-    const vals = cols.map(k => rest[k])
+    const vals = cols.map(k => b[k])
     const r = await pool.query(`UPDATE finance_funds SET ${sets.join(',')}, update_time=NOW() WHERE id=$${vals.length+1} RETURNING *`, [...vals, id])
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
@@ -1709,6 +1731,7 @@ app.use((req, res) => {
 async function start() {
   try {
     await initDb()
+    await loadTableCols()
     app.listen(PORT, () => {
       console.log(`ERP server running on port ${PORT}`)
     })

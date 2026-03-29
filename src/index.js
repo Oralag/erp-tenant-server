@@ -208,11 +208,7 @@ function makeCRUD(router, path, table, opts = {}) {
 
   router.post(path + '/add', async (req, res) => {
     try {
-      const body = { ...req.body }
-      // auto order_no generation if needed
-      if ('order_no' in (await pool.query(`SELECT column_name FROM information_schema.columns WHERE table_name=$1 AND column_name='order_no'`, [table])).rows[0] === undefined ? {} : {}) {
-        /* skip */
-      }
+      const body = filterBodyCols(table, { ...req.body })
       const cols = Object.keys(body).filter((k) => body[k] !== undefined)
       if (cols.length === 0) {
         return fail(res, '无有效字段')
@@ -229,8 +225,9 @@ function makeCRUD(router, path, table, opts = {}) {
 
   router.post(path + '/edit', async (req, res) => {
     try {
-      const { id, ...rest } = req.body
+      const { id, ...rawRest } = req.body
       if (!id) return fail(res, 'id不能为空')
+      const rest = filterBodyCols(table, rawRest)
       const cols = Object.keys(rest).filter((k) => rest[k] !== undefined)
       if (cols.length === 0) return fail(res, '无有效字段')
       const sets = cols.map((k, i) => `${k}=$${i + 1}`)
@@ -531,7 +528,7 @@ router.get('/shop/ContractOrder/index', async (req, res) => {
 })
 router.post('/shop/ContractOrder/add', async (req, res) => {
   try {
-    const b = { order_no: genOrderNo('XS'), order_sn: genOrderNo('XS'), ...req.body }
+    const b = filterBodyCols('sale_contracts', { order_no: genOrderNo('XS'), order_sn: genOrderNo('XS'), ...req.body })
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
     const vals = cols.map(k => typeof b[k] === 'object' ? JSON.stringify(b[k]) : b[k])
     const r = await pool.query(`INSERT INTO sale_contracts (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
@@ -576,7 +573,7 @@ router.get('/shop/offerOrder/index', async (req, res) => {
 })
 router.post('/shop/offerOrder/add', async (req, res) => {
   try {
-    const b = { order_no: genOrderNo('BJ'), ...req.body }
+    const b = filterBodyCols('sale_offers', { order_no: genOrderNo('BJ'), ...req.body })
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
     const vals = cols.map(k => typeof b[k] === 'object' ? JSON.stringify(b[k]) : b[k])
     const r = await pool.query(`INSERT INTO sale_offers (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
@@ -625,7 +622,7 @@ router.get('/stock/PurchaseOrder/index', async (req, res) => {
 })
 router.post('/stock/PurchaseOrder/add', async (req, res) => {
   try {
-    const b = { order_no: genOrderNo('CG'), order_sn: genOrderNo('CG'), ...req.body }
+    const b = filterBodyCols('purchase_order', { order_no: genOrderNo('CG'), order_sn: genOrderNo('CG'), ...req.body })
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
     const vals = cols.map(k => typeof b[k] === 'object' ? JSON.stringify(b[k]) : b[k])
     const r = await pool.query(`INSERT INTO purchase_order (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
@@ -679,7 +676,7 @@ router.get('/stock/SaleOutOrder/index', async (req, res) => {
 })
 router.post('/stock/SaleOutOrder/add', async (req, res) => {
   try {
-    const b = { order_no: genOrderNo('XC'), order_sn: genOrderNo('XC'), ...req.body }
+    const b = filterBodyCols('sale_out_order', { order_no: genOrderNo('XC'), order_sn: genOrderNo('XC'), ...req.body })
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
     const vals = cols.map(k => typeof b[k] === 'object' ? JSON.stringify(b[k]) : b[k])
     const r = await pool.query(`INSERT INTO sale_out_order (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
@@ -724,7 +721,7 @@ router.get('/stock/SaleReturnOrder/index', async (req, res) => {
 })
 router.post('/stock/SaleReturnOrder/add', async (req, res) => {
   try {
-    const b = { order_no: genOrderNo('TH'), ...req.body }
+    const b = filterBodyCols('sale_return_order', { order_no: genOrderNo('TH'), ...req.body })
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
     const vals = cols.map(k => typeof b[k] === 'object' ? JSON.stringify(b[k]) : b[k])
     const r = await pool.query(`INSERT INTO sale_return_order (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
@@ -832,7 +829,7 @@ router.get('/stock/OtherIn/index', async (req, res) => {
 })
 router.post('/stock/OtherIn/add', async (req, res) => {
   try {
-    const b = { order_no: genOrderNo('RK'), ...req.body }
+    const b = filterBodyCols('stock_other_in', { order_no: genOrderNo('RK'), ...req.body })
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
     const vals = cols.map(k => typeof b[k] === 'object' ? JSON.stringify(b[k]) : b[k])
     const r = await pool.query(`INSERT INTO stock_other_in (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
@@ -857,7 +854,7 @@ router.get('/stock/OtherOut/index', async (req, res) => {
 })
 router.post('/stock/OtherOut/add', async (req, res) => {
   try {
-    const b = { order_no: genOrderNo('CK'), ...req.body }
+    const b = filterBodyCols('stock_other_out', { order_no: genOrderNo('CK'), ...req.body })
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
     const vals = cols.map(k => typeof b[k] === 'object' ? JSON.stringify(b[k]) : b[k])
     const r = await pool.query(`INSERT INTO stock_other_out (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
@@ -882,7 +879,7 @@ router.get('/stock/StockCheck/index', async (req, res) => {
 })
 router.post('/stock/StockCheck/add', async (req, res) => {
   try {
-    const b = { order_no: genOrderNo('PD'), ...req.body }
+    const b = filterBodyCols('stock_checks', { order_no: genOrderNo('PD'), ...req.body })
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
     const vals = cols.map(k => typeof b[k] === 'object' ? JSON.stringify(b[k]) : b[k])
     const r = await pool.query(`INSERT INTO stock_checks (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
@@ -911,7 +908,7 @@ router.get('/procure/supplier/index', async (req, res) => {
 })
 router.post('/procure/supplier/add', async (req, res) => {
   try {
-    const b = req.body
+    const b = filterBodyCols('supplier', req.body)
     const cols = Object.keys(b).filter(k => b[k] !== undefined && b[k] !== null)
     if (!b.name) return fail(res, '供应商名称不能为空')
     const vals = cols.map(k => b[k])
@@ -949,7 +946,7 @@ router.get('/procure/ProcurePlan/index', async (req, res) => {
 })
 router.post('/procure/ProcurePlan/add', async (req, res) => {
   try {
-    const b = { order_no: genOrderNo('JH'), ...req.body }
+    const b = filterBodyCols('procure_plan', { order_no: genOrderNo('JH'), ...req.body })
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
     const vals = cols.map(k => typeof b[k] === 'object' ? JSON.stringify(b[k]) : b[k])
     const r = await pool.query(`INSERT INTO procure_plan (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
@@ -982,7 +979,7 @@ router.get('/procure/ProcureInhouse/index', async (req, res) => {
 })
 router.post('/procure/ProcureInhouse/add', async (req, res) => {
   try {
-    const b = { order_no: genOrderNo('CGRK'), ...req.body }
+    const b = filterBodyCols('procure_inhouse', { order_no: genOrderNo('CGRK'), ...req.body })
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
     const vals = cols.map(k => typeof b[k] === 'object' ? JSON.stringify(b[k]) : b[k])
     const r = await pool.query(`INSERT INTO procure_inhouse (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
@@ -1015,7 +1012,7 @@ router.get('/procure/ProcureReturn/index', async (req, res) => {
 })
 router.post('/procure/ProcureReturn/add', async (req, res) => {
   try {
-    const b = { order_no: genOrderNo('CGTH'), ...req.body }
+    const b = filterBodyCols('procure_return', { order_no: genOrderNo('CGTH'), ...req.body })
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
     const vals = cols.map(k => typeof b[k] === 'object' ? JSON.stringify(b[k]) : b[k])
     const r = await pool.query(`INSERT INTO procure_return (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
@@ -1124,7 +1121,7 @@ router.get('/finance/CollectReceipt/index', async (req, res) => {
 })
 router.post('/finance/CollectReceipt/add', async (req, res) => {
   try {
-    const b = { receipt_no: genOrderNo('SK'), ...req.body }
+    const b = filterBodyCols('collect_receipt', { receipt_no: genOrderNo('SK'), ...req.body })
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
     const vals = cols.map(k => b[k])
     const r = await pool.query(`INSERT INTO collect_receipt (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
@@ -1149,7 +1146,7 @@ router.get('/finance/PayReceipt/index', async (req, res) => {
 })
 router.post('/finance/PayReceipt/add', async (req, res) => {
   try {
-    const b = { receipt_no: genOrderNo('FK'), ...req.body }
+    const b = filterBodyCols('pay_receipt', { receipt_no: genOrderNo('FK'), ...req.body })
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
     const vals = cols.map(k => b[k])
     const r = await pool.query(`INSERT INTO pay_receipt (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
@@ -1174,7 +1171,7 @@ router.get('/finance/Invoice/index', async (req, res) => {
 })
 router.post('/finance/Invoice/add', async (req, res) => {
   try {
-    const b = { invoice_no: genOrderNo('FP'), ...req.body }
+    const b = filterBodyCols('finance_invoices', { invoice_no: genOrderNo('FP'), ...req.body })
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
     const vals = cols.map(k => b[k])
     const r = await pool.query(`INSERT INTO finance_invoices (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
@@ -1199,7 +1196,7 @@ router.get('/finance/Statement/index', async (req, res) => {
 })
 router.post('/finance/Statement/add', async (req, res) => {
   try {
-    const b = { statement_no: genOrderNo('DZ'), ...req.body }
+    const b = filterBodyCols('finance_statements', { statement_no: genOrderNo('DZ'), ...req.body })
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
     const vals = cols.map(k => b[k])
     const r = await pool.query(`INSERT INTO finance_statements (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
@@ -1331,7 +1328,7 @@ router.get('/finance/Cost/index', async (req, res) => {
 })
 router.post('/finance/Cost/add', async (req, res) => {
   try {
-    const b = { cost_no: genOrderNo('CB'), ...req.body }
+    const b = filterBodyCols('finance_costs', { cost_no: genOrderNo('CB'), ...req.body })
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
     const vals = cols.map(k => b[k])
     const r = await pool.query(`INSERT INTO finance_costs (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
@@ -1356,7 +1353,7 @@ router.get('/finance/Prepay/index', async (req, res) => {
 })
 router.post('/finance/Prepay/create', async (req, res) => {
   try {
-    const b = { order_sn: genOrderNo('YF'), ...req.body }
+    const b = filterBodyCols('prepay_record', { order_sn: genOrderNo('YF'), ...req.body })
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
     const vals = cols.map(k => b[k])
     const r = await pool.query(`INSERT INTO prepay_record (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
@@ -1385,7 +1382,7 @@ router.get('/retail/order/index', async (req, res) => {
 })
 router.post('/retail/order/add', async (req, res) => {
   try {
-    const b = { order_sn: genOrderNo('LS'), ...req.body }
+    const b = filterBodyCols('retail_orders', { order_sn: genOrderNo('LS'), ...req.body })
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
     const vals = cols.map(k => typeof b[k] === 'object' ? JSON.stringify(b[k]) : b[k])
     const r = await pool.query(`INSERT INTO retail_orders (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
@@ -1419,7 +1416,7 @@ router.get('/retail/member/index', async (req, res) => {
 })
 router.post('/retail/member/add', async (req, res) => {
   try {
-    const b = req.body
+    const b = filterBodyCols('retail_members', req.body)
     if (!b.name && !b.mobile) return fail(res, '姓名或手机号不能为空')
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
     const vals = cols.map(k => b[k])
@@ -1457,7 +1454,7 @@ router.get('/retail/recharge/index', async (req, res) => {
 })
 router.post('/retail/recharge/add', async (req, res) => {
   try {
-    const b = { recharge_no: genOrderNo('CZ'), ...req.body }
+    const b = filterBodyCols('retail_recharge', { recharge_no: genOrderNo('CZ'), ...req.body })
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
     const vals = cols.map(k => b[k])
     const r = await pool.query(`INSERT INTO retail_recharge (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)

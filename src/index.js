@@ -1125,6 +1125,10 @@ router.post('/finance/CollectReceipt/add', async (req, res) => {
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
     const vals = cols.map(k => b[k])
     const r = await pool.query(`INSERT INTO collect_receipt (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
+    // 同步资金账户余额
+    if (b.fund_id && Number(b.amount)) {
+      await pool.query('UPDATE finance_funds SET balance=balance+$1, update_time=NOW() WHERE id=$2', [Number(b.amount), b.fund_id])
+    }
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })
@@ -1132,7 +1136,11 @@ router.post('/finance/CollectReceipt/del', async (req, res) => {
   try {
     const { id } = req.body
     if (!id) return fail(res, 'id不能为空')
+    const r = await pool.query('SELECT fund_id, amount FROM collect_receipt WHERE id=$1', [id])
     await pool.query('UPDATE collect_receipt SET deleted_at=NOW() WHERE id=$1', [id])
+    if (r.rows[0]?.fund_id && Number(r.rows[0]?.amount)) {
+      await pool.query('UPDATE finance_funds SET balance=GREATEST(0,balance-$1), update_time=NOW() WHERE id=$2', [Number(r.rows[0].amount), r.rows[0].fund_id])
+    }
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
@@ -1150,6 +1158,10 @@ router.post('/finance/PayReceipt/add', async (req, res) => {
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
     const vals = cols.map(k => b[k])
     const r = await pool.query(`INSERT INTO pay_receipt (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
+    // 同步资金账户余额
+    if (b.fund_id && Number(b.amount)) {
+      await pool.query('UPDATE finance_funds SET balance=GREATEST(0,balance-$1), update_time=NOW() WHERE id=$2', [Number(b.amount), b.fund_id])
+    }
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })
@@ -1157,7 +1169,11 @@ router.post('/finance/PayReceipt/del', async (req, res) => {
   try {
     const { id } = req.body
     if (!id) return fail(res, 'id不能为空')
+    const r = await pool.query('SELECT fund_id, amount FROM pay_receipt WHERE id=$1', [id])
     await pool.query('UPDATE pay_receipt SET deleted_at=NOW() WHERE id=$1', [id])
+    if (r.rows[0]?.fund_id && Number(r.rows[0]?.amount)) {
+      await pool.query('UPDATE finance_funds SET balance=balance+$1, update_time=NOW() WHERE id=$2', [Number(r.rows[0].amount), r.rows[0].fund_id])
+    }
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })

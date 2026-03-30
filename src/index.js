@@ -1816,6 +1816,73 @@ router.post('/video/render', async (req, res) => {
   }
 })
 
+// ─── image/render ───────────────────────────────────────────────────────────
+
+router.post('/image/render', async (req, res) => {
+  const {
+    root_code,
+    component_code,
+    composition_id = 'Poster',
+    width = 1080,
+    height = 1080,
+  } = req.body
+  if (!root_code || !component_code) return fail(res, '缺少 root_code 或 component_code')
+
+  const id = crypto.randomUUID()
+  const tmpDir = path.join(os.tmpdir(), `remotion-img-${id}`)
+  const srcDir = path.join(tmpDir, 'src')
+  const outFile = path.join(tmpDir, 'out', 'image.png')
+
+  try {
+    fs.mkdirSync(srcDir, { recursive: true })
+    fs.mkdirSync(path.join(tmpDir, 'out'), { recursive: true })
+
+    fs.writeFileSync(path.join(tmpDir, 'package.json'), JSON.stringify({
+      name: 'remotion-render',
+      version: '1.0.0',
+      type: 'module',
+      dependencies: {
+        remotion: '^4.0.441',
+        '@remotion/cli': '^4.0.441',
+        '@remotion/transitions': '^4.0.441',
+        react: '^19.0.0',
+        'react-dom': '^19.0.0',
+      },
+    }, null, 2))
+
+    fs.writeFileSync(path.join(tmpDir, 'tsconfig.json'), JSON.stringify({
+      compilerOptions: {
+        target: 'ES2022',
+        module: 'ESNext',
+        moduleResolution: 'bundler',
+        jsx: 'react-jsx',
+        strict: false,
+      },
+    }, null, 2))
+
+    fs.writeFileSync(path.join(srcDir, 'index.ts'),
+      `import { registerRoot } from 'remotion';\nimport { RemotionRoot } from './Root';\nregisterRoot(RemotionRoot);\n`
+    )
+    fs.writeFileSync(path.join(srcDir, 'Root.tsx'), root_code)
+    fs.writeFileSync(path.join(srcDir, 'Poster.tsx'), component_code)
+
+    execSync('npm install --prefer-offline 2>&1', { cwd: tmpDir, timeout: 180000, stdio: 'pipe' })
+
+    execSync(
+      `npx remotion still src/index.ts ${composition_id} out/image.png --width=${width} --height=${height}`,
+      { cwd: tmpDir, timeout: 300000, stdio: 'pipe' }
+    )
+
+    const imgBuffer = fs.readFileSync(outFile)
+    const base64 = imgBuffer.toString('base64')
+    return ok(res, { base64, mimeType: 'image/png', size: imgBuffer.length })
+  } catch (e) {
+    return fail(res, `图片渲染失败：${e.message || String(e)}`)
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }) } catch (_) {}
+  }
+})
+
 // ─── 404 fallback ───────────────────────────────────────────────────────────
 
 app.use((req, res) => {

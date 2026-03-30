@@ -5,6 +5,11 @@ const cors = require('cors')
 const jwt = require('jsonwebtoken')
 const bcrypt = require('bcryptjs')
 const { pool, initDb } = require('./db')
+const { execSync } = require('child_process')
+const fs = require('fs')
+const path = require('path')
+const crypto = require('crypto')
+const os = require('os')
 
 const app = express()
 const PORT = process.env.PORT || 8888
@@ -1731,6 +1736,84 @@ router.post('/setting/params/edit', async (req, res) => {
     await pool.query('INSERT INTO sys_params (key,value) VALUES ($1,$2) ON CONFLICT (key) DO UPDATE SET value=$2', [key, value])
     return ok(res)
   } catch (e) { fail(res, e.message) }
+})
+
+// ─── video/render ───────────────────────────────────────────────────────────
+
+router.post('/video/render', async (req, res) => {
+  const {
+    root_code,
+    component_code,
+    composition_id = 'MyVideo',
+    width = 1080,
+    height = 1920,
+    fps = 30,
+    duration_frames = 900,
+  } = req.body
+  if (!root_code || !component_code) return fail(res, '缺少 root_code 或 component_code')
+
+  const id = crypto.randomUUID()
+  const tmpDir = path.join(os.tmpdir(), `remotion-${id}`)
+  const srcDir = path.join(tmpDir, 'src')
+  const outFile = path.join(tmpDir, 'out', 'video.mp4')
+
+  try {
+    fs.mkdirSync(srcDir, { recursive: true })
+    fs.mkdirSync(path.join(tmpDir, 'out'), { recursive: true })
+
+    // package.json — ESM project, pin remotion version same as backend
+    fs.writeFileSync(path.join(tmpDir, 'package.json'), JSON.stringify({
+      name: 'remotion-render',
+      version: '1.0.0',
+      type: 'module',
+      dependencies: {
+        remotion: '^4.0.441',
+        '@remotion/cli': '^4.0.441',
+        '@remotion/transitions': '^4.0.441',
+        react: '^19.0.0',
+        'react-dom': '^19.0.0',
+      },
+    }, null, 2))
+
+    // tsconfig
+    fs.writeFileSync(path.join(tmpDir, 'tsconfig.json'), JSON.stringify({
+      compilerOptions: {
+        target: 'ES2022',
+        module: 'ESNext',
+        moduleResolution: 'bundler',
+        jsx: 'react-jsx',
+        strict: false,
+      },
+    }, null, 2))
+
+    // src/index.ts — entry point
+    fs.writeFileSync(path.join(srcDir, 'index.ts'),
+      `import { registerRoot } from 'remotion';\nimport { RemotionRoot } from './Root';\nregisterRoot(RemotionRoot);\n`
+    )
+
+    // src/Root.tsx
+    fs.writeFileSync(path.join(srcDir, 'Root.tsx'), root_code)
+
+    // src/Video.tsx — main component
+    fs.writeFileSync(path.join(srcDir, 'Video.tsx'), component_code)
+
+    // npm install (downloads remotion + chrome headless shell, cached after first run)
+    execSync('npm install --prefer-offline 2>&1', { cwd: tmpDir, timeout: 180000, stdio: 'pipe' })
+
+    // render
+    execSync(
+      `npx remotion render src/index.ts ${composition_id} out/video.mp4 --width=${width} --height=${height} --fps=${fps}`,
+      { cwd: tmpDir, timeout: 600000, stdio: 'pipe' }
+    )
+
+    const videoBuffer = fs.readFileSync(outFile)
+    const base64 = videoBuffer.toString('base64')
+    return ok(res, { base64, mimeType: 'video/mp4', size: videoBuffer.length })
+  } catch (e) {
+    return fail(res, `渲染失败：${e.message || String(e)}`)
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }) } catch (_) {}
+  }
 })
 
 // ─── 404 fallback ───────────────────────────────────────────────────────────

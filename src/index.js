@@ -661,22 +661,52 @@ router.post('/stock/PurchaseOrder/audit', async (req, res) => {
     const newStatus = status ?? 1
     const isAudit = newStatus === 1
 
-    // 查采购单，获取 fund_id 和 total_amount
+    // 查采购单
     const poR = await pool.query('SELECT * FROM purchase_order WHERE id=$1', [id])
     const po = poR.rows[0]
     if (!po) return fail(res, '采购单不存在')
 
-    // 如果有付款账户，审核时扣款，反审核时加回
-    const fundId = po.fund_id ? parseInt(po.fund_id) : 0
     const totalAmount = parseFloat(po.total_amount || 0)
-    if (fundId && totalAmount > 0) {
-      const fundR = await pool.query('SELECT * FROM fund WHERE id=$1', [fundId])
-      const fund = fundR.rows[0]
-      if (!fund) return fail(res, '资金账户不存在')
-      if (isAudit) {
-        await pool.query('UPDATE fund SET balance=balance-$1 WHERE id=$2', [totalAmount, fundId])
+    const supplierName = po.supplier_name || '未知供应商'
+    const orderNo = po.order_no || ''
+    const orderDate = po.order_date || new Date()
+
+    // 确定资金账户：有fund_id用现有账户，没有则按供应商名查找或自动创建
+    let fundId = po.fund_id ? parseInt(po.fund_id) : 0
+    let fundName = po.fund_name || ''
+    if (!fundId && totalAmount > 0) {
+      // 按供应商名查找资金账户
+      const existR = await pool.query('SELECT id, name FROM fund WHERE name=$1 AND deleted_at IS NULL LIMIT 1', [supplierName])
+      if (existR.rows.length > 0) {
+        fundId = existR.rows[0].id
+        fundName = existR.rows[0].name
       } else {
+        // 自动创建资金账户
+        const newFund = await pool.query(
+          'INSERT INTO fund (name, fund_type, balance, status) VALUES ($1, 2, 0, 1) RETURNING id, name',
+          [supplierName]
+        )
+        fundId = newFund.rows[0].id
+        fundName = newFund.rows[0].name
+      }
+      // 回填采购单的fund_id
+      await pool.query('UPDATE purchase_order SET fund_id=$1, fund_name=$2 WHERE id=$3', [fundId, fundName, id])
+    }
+
+    if (totalAmount > 0) {
+      if (isAudit) {
+        // 审核：扣减资金账户余额，生成付款单
+        await pool.query('UPDATE fund SET balance=balance-$1 WHERE id=$2', [totalAmount, fundId])
+        const receiptNo = genOrderNo('FK')
+        await pool.query(
+          `INSERT INTO pay_receipt (receipt_no, order_sn, contact_type, contact_name, amount, pay_date, fund_id, fund_name, remark, status)
+           VALUES ($1,$2,'supplier',$3,$4,$5,$6,$7,$8,1)`,
+          [receiptNo, orderNo, supplierName, totalAmount, orderDate, fundId, fundName, `采购单${orderNo}审核自动生成`]
+        )
+      } else {
+        // 反审核：加回余额，删除对应付款单
         await pool.query('UPDATE fund SET balance=balance+$1 WHERE id=$2', [totalAmount, fundId])
+        await pool.query('UPDATE pay_receipt SET deleted_at=NOW() WHERE order_sn=$1 AND deleted_at IS NULL', [orderNo])
       }
     }
 

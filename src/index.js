@@ -658,7 +658,29 @@ router.post('/stock/PurchaseOrder/audit', async (req, res) => {
   try {
     const { id, status } = req.body
     if (!id) return fail(res, 'id不能为空')
-    await pool.query('UPDATE purchase_order SET status=$1 WHERE id=$2', [status ?? 1, id])
+    const newStatus = status ?? 1
+    const isAudit = newStatus === 1
+
+    // 查采购单，获取 fund_id 和 total_amount
+    const poR = await pool.query('SELECT * FROM purchase_order WHERE id=$1', [id])
+    const po = poR.rows[0]
+    if (!po) return fail(res, '采购单不存在')
+
+    // 如果有付款账户，审核时扣款，反审核时加回
+    const fundId = po.fund_id ? parseInt(po.fund_id) : 0
+    const totalAmount = parseFloat(po.total_amount || 0)
+    if (fundId && totalAmount > 0) {
+      const fundR = await pool.query('SELECT * FROM fund WHERE id=$1', [fundId])
+      const fund = fundR.rows[0]
+      if (!fund) return fail(res, '资金账户不存在')
+      if (isAudit) {
+        await pool.query('UPDATE fund SET balance=balance-$1 WHERE id=$2', [totalAmount, fundId])
+      } else {
+        await pool.query('UPDATE fund SET balance=balance+$1 WHERE id=$2', [totalAmount, fundId])
+      }
+    }
+
+    await pool.query('UPDATE purchase_order SET status=$1 WHERE id=$2', [newStatus, id])
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })

@@ -979,12 +979,19 @@ router.post('/procure/ProcurePlan/audit', async (req, res) => {
 router.get('/procure/ProcureInhouse/index', async (req, res) => {
   try {
     const { page, list_rows, offset } = pageParams(req.query)
-    await listQuery(res, 'procure_inhouse', { keyword: req.query.keyword, keywordCols: ['order_no','supplier_name'], baseWhere: 'deleted_at IS NULL', orderBy: 'id DESC', page, list_rows, offset })
+    // 支持按 purchase_order_id 或 order_id 过滤
+    const orderId = req.query.purchase_order_id || req.query.order_id
+    const extraWhere = orderId ? ` AND purchase_order_id=$1` : ''
+    const extraParams = orderId ? [parseInt(orderId)] : []
+    await listQuery(res, 'procure_inhouse', { keyword: req.query.keyword, keywordCols: ['order_no','supplier_name'], baseWhere: `deleted_at IS NULL${extraWhere}`, extraParams, orderBy: 'id DESC', page, list_rows, offset })
   } catch (e) { fail(res, e.message) }
 })
 router.post('/procure/ProcureInhouse/add', async (req, res) => {
   try {
-    const b = filterBodyCols('procure_inhouse', { order_no: genOrderNo('CGRK'), ...req.body })
+    // 前端传 order_id，表字段是 purchase_order_id，做映射
+    const body = { ...req.body }
+    if (body.order_id && !body.purchase_order_id) { body.purchase_order_id = body.order_id; delete body.order_id }
+    const b = filterBodyCols('procure_inhouse', { order_no: genOrderNo('CGRK'), ...body })
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
     const vals = cols.map(k => typeof b[k] === 'object' ? JSON.stringify(b[k]) : b[k])
     const r = await pool.query(`INSERT INTO procure_inhouse (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)

@@ -1003,9 +1003,58 @@ router.post('/procure/ProcureInhouse/audit', async (req, res) => {
   try {
     const { id, status } = req.body
     if (!id) return fail(res, 'id不能为空')
-    await pool.query('UPDATE procure_inhouse SET status=$1 WHERE id=$2', [status ?? 1, id])
+    const newStatus = status ?? 1
+
+    // 查入库单
+    const inhouseR = await pool.query('SELECT * FROM procure_inhouse WHERE id=$1', [id])
+    const inhouse = inhouseR.rows[0]
+    if (!inhouse) return fail(res, '入库单不存在')
+
+    const prevStatus = inhouse.status
+    // 状态无变化，直接返回
+    if (prevStatus === newStatus) { await pool.query('UPDATE procure_inhouse SET status=$1 WHERE id=$2', [newStatus, id]); return ok(res) }
+
+    let goodsInfo = []
+    try { goodsInfo = typeof inhouse.goods_info === 'string' ? JSON.parse(inhouse.goods_info) : (inhouse.goods_info || []) } catch {}
+
+    const warehouseId = inhouse.warehouse_id || 0
+    const warehouseName = inhouse.warehouse_name || ''
+    const orderNo = inhouse.order_no || ''
+
+    // 审核通过(1)：库存增加；反审核(0)：库存减少
+    const isAudit = newStatus === 1
+    const delta = isAudit ? 1 : -1
+
+    for (const item of goodsInfo) {
+      const goodsId = item.goods_id || 0
+      if (!goodsId) continue
+      const num = parseFloat(item.num) || 0
+      if (num <= 0) continue
+      const change = num * delta
+
+      // upsert stock_inventory
+      const existing = await pool.query('SELECT * FROM stock_inventory WHERE goods_id=$1 AND warehouse_id=$2', [goodsId, warehouseId])
+      let beforeQty = 0
+      if (existing.rows.length > 0) {
+        beforeQty = parseFloat(existing.rows[0].qty) || 0
+        const afterQty = beforeQty + change
+        await pool.query('UPDATE stock_inventory SET qty=$1, goods_name=$2, unit_name=$3, update_time=NOW() WHERE goods_id=$4 AND warehouse_id=$5',
+          [afterQty, item.goods_name || '', item.unit_name || '', goodsId, warehouseId])
+      } else if (isAudit) {
+        await pool.query('INSERT INTO stock_inventory (goods_id, goods_name, goods_code, unit_name, warehouse_id, warehouse_name, qty) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+          [goodsId, item.goods_name || '', item.goods_sn || '', item.unit_name || '', warehouseId, warehouseName, change])
+      }
+
+      // 写 stock_flow 流水
+      const afterQty2R = await pool.query('SELECT qty FROM stock_inventory WHERE goods_id=$1 AND warehouse_id=$2', [goodsId, warehouseId])
+      const afterQty2 = afterQty2R.rows[0] ? parseFloat(afterQty2R.rows[0].qty) : 0
+      await pool.query('INSERT INTO stock_flow (goods_id, goods_name, warehouse_id, warehouse_name, type, qty, before_qty, after_qty, order_no, remark) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)',
+        [goodsId, item.goods_name || '', warehouseId, warehouseName, isAudit ? 'procure_in' : 'procure_in_reverse', change, beforeQty, afterQty2, orderNo, isAudit ? '采购入库审核' : '采购入库反审核'])
+    }
+
+    await pool.query('UPDATE procure_inhouse SET status=$1 WHERE id=$2', [newStatus, id])
     return ok(res)
-  } catch (e) { fail(res, e.message) }
+  } catch (e) { console.error('[ProcureInhouse audit error]', e.message); fail(res, e.message) }
 })
 
 // ProcureReturn (采购退货)

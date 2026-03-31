@@ -1035,7 +1035,7 @@ router.post('/procure/ProcureInhouse/audit', async (req, res) => {
     for (const item of goodsInfo) {
       const goodsId = item.goods_id || 0
       if (!goodsId) continue
-      const num = parseFloat(item.num) || 0
+      const num = Math.round(parseFloat(item.num) || 0)
       if (num <= 0) continue
       const change = num * delta
 
@@ -1043,8 +1043,8 @@ router.post('/procure/ProcureInhouse/audit', async (req, res) => {
       const existing = await pool.query('SELECT * FROM stock_inventory WHERE goods_id=$1 AND warehouse_id=$2', [goodsId, warehouseId])
       let beforeQty = 0
       if (existing.rows.length > 0) {
-        beforeQty = parseFloat(existing.rows[0].qty) || 0
-        const afterQty = beforeQty + change
+        beforeQty = Math.round(parseFloat(existing.rows[0].qty) || 0)
+        const afterQty = Math.round(beforeQty + change)
         await pool.query('UPDATE stock_inventory SET qty=$1, goods_name=$2, unit_name=$3, update_time=NOW() WHERE goods_id=$4 AND warehouse_id=$5',
           [afterQty, item.goods_name || '', item.unit_name || '', goodsId, warehouseId])
       } else if (isAudit) {

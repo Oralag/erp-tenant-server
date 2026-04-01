@@ -400,6 +400,33 @@ router.post('/goods/ShopUnit/del', async (req, res) => {
   } catch (e) { fail(res, e.message) }
 })
 
+// GoodsUnitConvert — 商品多单位换算
+router.get('/goods/GoodsUnitConvert/index', async (req, res) => {
+  try {
+    const { goods_id } = req.query
+    if (!goods_id) return ok(res, { rows: [], total: 0 })
+    const r = await pool.query('SELECT * FROM goods_unit_convert WHERE goods_id=$1 ORDER BY id ASC', [goods_id])
+    return ok(res, { rows: r.rows, total: r.rows.length })
+  } catch (e) { fail(res, e.message) }
+})
+router.post('/goods/GoodsUnitConvert/save', async (req, res) => {
+  // 传入 goods_id + units 数组 [{unit_name, ratio}]，整体覆盖保存
+  try {
+    const { goods_id, units } = req.body
+    if (!goods_id) return fail(res, 'goods_id不能为空')
+    await pool.query('DELETE FROM goods_unit_convert WHERE goods_id=$1', [goods_id])
+    if (Array.isArray(units) && units.length) {
+      for (const u of units) {
+        if (u.unit_name && u.ratio > 0) {
+          await pool.query('INSERT INTO goods_unit_convert (goods_id,unit_name,ratio) VALUES ($1,$2,$3)', [goods_id, u.unit_name, u.ratio])
+        }
+      }
+    }
+    const r = await pool.query('SELECT * FROM goods_unit_convert WHERE goods_id=$1 ORDER BY id ASC', [goods_id])
+    return ok(res, { rows: r.rows })
+  } catch (e) { fail(res, e.message) }
+})
+
 // ShopBrand
 router.get('/goods/ShopBrand/index', async (req, res) => {
   try {

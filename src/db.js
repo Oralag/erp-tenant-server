@@ -159,6 +159,34 @@ async function initDb() {
 
       INSERT INTO admins (name, account, password, role_name) VALUES ('管理员', 'admin', '123456', '超级管理员') ON CONFLICT (account) DO NOTHING;
       INSERT INTO warehouses (name) VALUES ('默认仓库') ON CONFLICT DO NOTHING;
+
+      CREATE TABLE IF NOT EXISTS bom_order (
+        id SERIAL PRIMARY KEY,
+        bom_code VARCHAR(50) DEFAULT '',
+        goods_id INT DEFAULT 0,
+        goods_name VARCHAR(200) DEFAULT '',
+        goods_sn VARCHAR(100) DEFAULT '',
+        spec VARCHAR(200) DEFAULT '',
+        unit_name VARCHAR(50) DEFAULT '',
+        remark TEXT DEFAULT '',
+        status INT DEFAULT 1,
+        create_time TIMESTAMP DEFAULT NOW(),
+        update_time TIMESTAMP DEFAULT NOW(),
+        deleted_at TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS bom_items (
+        id SERIAL PRIMARY KEY,
+        bom_id INT NOT NULL,
+        goods_id INT DEFAULT 0,
+        goods_name VARCHAR(200) DEFAULT '',
+        goods_sn VARCHAR(100) DEFAULT '',
+        num DECIMAL(10,4) DEFAULT 1,
+        unit_name VARCHAR(50) DEFAULT '',
+        price DECIMAL(10,5) DEFAULT 0,
+        remark TEXT DEFAULT '',
+        create_time TIMESTAMP DEFAULT NOW()
+      );
     `)
     // 兼容旧数据库：补加 goods 表缺失列
     const goodsAlters = [

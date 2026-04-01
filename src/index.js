@@ -2039,5 +2039,89 @@ async function start() {
   }
 }
 
+// ─── BOM 物料清单 ───────────────────────────────────────────────────────────
+router.get('/goods/BomGoods/index', async (req, res) => {
+  try {
+    const { page, list_rows, offset } = pageParams(req.query)
+    const keyword = req.query.keyword || ''
+    const where = keyword
+      ? `deleted_at IS NULL AND (goods_name ILIKE $1 OR goods_sn ILIKE $1 OR bom_code ILIKE $1)`
+      : `deleted_at IS NULL`
+    const params = keyword ? [`%${keyword}%`] : []
+    const count = await pool.query(`SELECT COUNT(*) FROM bom_order WHERE ${where}`, params)
+    const rows = await pool.query(
+      `SELECT * FROM bom_order WHERE ${where} ORDER BY id DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+      [...params, list_rows, offset]
+    )
+    return ok(res, { list: rows.rows, total: parseInt(count.rows[0].count), page, list_rows })
+  } catch (e) { fail(res, e.message) }
+})
+
+router.get('/goods/BomGoods/detail', async (req, res) => {
+  try {
+    const { id } = req.query
+    if (!id) return fail(res, 'id不能为空')
+    const bom = await pool.query('SELECT * FROM bom_order WHERE id=$1 AND deleted_at IS NULL', [id])
+    if (!bom.rows.length) return fail(res, 'BOM不存在')
+    const items = await pool.query('SELECT * FROM bom_items WHERE bom_id=$1 ORDER BY id ASC', [id])
+    return ok(res, { ...bom.rows[0], items: items.rows })
+  } catch (e) { fail(res, e.message) }
+})
+
+router.post('/goods/BomGoods/add', async (req, res) => {
+  try {
+    const { goods_name, goods_sn, spec, unit_name, remark, items = [] } = req.body
+    if (!goods_name) return fail(res, '商品名称不能为空')
+    const countR = await pool.query('SELECT COUNT(*) FROM bom_order WHERE deleted_at IS NULL')
+    const sn = parseInt(countR.rows[0].count) + 1
+    const bomCode = 'BOM' + String(sn).padStart(6, '0')
+    const r = await pool.query(
+      `INSERT INTO bom_order (bom_code, goods_name, goods_sn, spec, unit_name, remark)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [bomCode, goods_name, goods_sn || '', spec || '', unit_name || '', remark || '']
+    )
+    const bomId = r.rows[0].id
+    for (const item of items) {
+      await pool.query(
+        `INSERT INTO bom_items (bom_id, goods_name, goods_sn, num, unit_name, price)
+         VALUES ($1,$2,$3,$4,$5,$6)`,
+        [bomId, item.goods_name || '', item.goods_sn || '', item.num || 1, item.unit_name || '', item.price || 0]
+      )
+    }
+    return ok(res, r.rows[0])
+  } catch (e) { fail(res, e.message) }
+})
+
+router.post('/goods/BomGoods/edit', async (req, res) => {
+  try {
+    const { id, goods_name, goods_sn, spec, unit_name, remark, items } = req.body
+    if (!id) return fail(res, 'id不能为空')
+    await pool.query(
+      `UPDATE bom_order SET goods_name=$1, goods_sn=$2, spec=$3, unit_name=$4, remark=$5, update_time=NOW() WHERE id=$6`,
+      [goods_name || '', goods_sn || '', spec || '', unit_name || '', remark || '', id]
+    )
+    if (Array.isArray(items)) {
+      await pool.query('DELETE FROM bom_items WHERE bom_id=$1', [id])
+      for (const item of items) {
+        await pool.query(
+          `INSERT INTO bom_items (bom_id, goods_name, goods_sn, num, unit_name, price)
+           VALUES ($1,$2,$3,$4,$5,$6)`,
+          [id, item.goods_name || '', item.goods_sn || '', item.num || 1, item.unit_name || '', item.price || 0]
+        )
+      }
+    }
+    return ok(res)
+  } catch (e) { fail(res, e.message) }
+})
+
+router.post('/goods/BomGoods/del', async (req, res) => {
+  try {
+    const { id } = req.body
+    if (!id) return fail(res, 'id不能为空')
+    await pool.query('UPDATE bom_order SET deleted_at=NOW() WHERE id=$1', [id])
+    return ok(res)
+  } catch (e) { fail(res, e.message) }
+})
+
 start()
 

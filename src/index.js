@@ -698,29 +698,11 @@ router.post('/stock/PurchaseOrder/audit', async (req, res) => {
     const orderNo = po.order_no || ''
     const orderDate = po.order_date || new Date()
 
-    // 确定资金账户：有fund_id用现有账户，没有则按供应商名查找或自动创建
-    let fundId = po.fund_id ? parseInt(po.fund_id) : 0
-    let fundName = po.fund_name || ''
-    if (!fundId && totalAmount > 0) {
-      // 按供应商名查找资金账户
-      const existR = await pool.query('SELECT id, name FROM finance_funds WHERE name=$1 AND deleted_at IS NULL LIMIT 1', [supplierName])
-      if (existR.rows.length > 0) {
-        fundId = existR.rows[0].id
-        fundName = existR.rows[0].name
-      } else {
-        // 自动创建资金账户
-        const newFund = await pool.query(
-          'INSERT INTO finance_funds (name, fund_type, balance, status) VALUES ($1, 2, 0, 1) RETURNING id, name',
-          [supplierName]
-        )
-        fundId = newFund.rows[0].id
-        fundName = newFund.rows[0].name
-      }
-      // 回填采购单的fund_id
-      await pool.query('UPDATE purchase_order SET fund_id=$1, fund_name=$2 WHERE id=$3', [fundId, fundName, id])
-    }
+    // 确定资金账户：只用采购单已有的fund_id，不自动创建
+    const fundId = po.fund_id ? parseInt(po.fund_id) : 0
+    const fundName = po.fund_name || ''
 
-    if (totalAmount > 0) {
+    if (fundId && totalAmount > 0) {
       if (isAudit) {
         // 审核：扣减资金账户余额，生成付款单
         await pool.query('UPDATE finance_funds SET balance=balance-$1 WHERE id=$2', [totalAmount, fundId])

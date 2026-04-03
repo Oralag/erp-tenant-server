@@ -215,6 +215,9 @@ async function initDb() {
     for (const sql of goodsAlters) {
       await client.query(sql).catch(() => {})
     }
+    // 补加 category 字段（幂等）
+    await client.query("ALTER TABLE pay_receipt ADD COLUMN IF NOT EXISTS category VARCHAR(50) DEFAULT ''").catch(() => {})
+    await client.query("ALTER TABLE collect_receipt ADD COLUMN IF NOT EXISTS category VARCHAR(50) DEFAULT ''").catch(() => {})
     console.log('Database initialized successfully')
   } finally {
     client.release()

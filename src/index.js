@@ -713,8 +713,8 @@ router.post('/stock/PurchaseOrder/audit', async (req, res) => {
         await pool.query('UPDATE finance_funds SET balance=balance-$1 WHERE id=$2', [totalAmount, fundId])
         const receiptNo = genOrderNo('FK')
         await pool.query(
-          `INSERT INTO pay_receipt (receipt_no, order_sn, contact_type, contact_name, amount, pay_date, fund_id, fund_name, remark, status)
-           VALUES ($1,$2,'supplier',$3,$4,$5,$6,$7,$8,1)`,
+          `INSERT INTO pay_receipt (receipt_no, order_sn, contact_type, contact_name, amount, pay_date, fund_id, fund_name, remark, status, category)
+           VALUES ($1,$2,'supplier',$3,$4,$5,$6,$7,$8,1,'purchase')`,
           [receiptNo, orderNo, supplierName, totalAmount, orderDate, fundId, fundName, `采购单${orderNo}审核自动生成`]
         )
       } else {

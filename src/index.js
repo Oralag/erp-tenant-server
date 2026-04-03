@@ -702,6 +702,11 @@ router.post('/stock/PurchaseOrder/audit', async (req, res) => {
     const fundId = po.fund_id ? parseInt(po.fund_id) : 0
     const fundName = po.fund_name || ''
 
+    // 审核时若有金额但没有资金账户，拒绝操作
+    if (isAudit && totalAmount > 0 && !fundId) {
+      return fail(res, '请先在采购单中选择资金账户再审核')
+    }
+
     if (fundId && totalAmount > 0) {
       if (isAudit) {
         // 审核：扣减资金账户余额，生成付款单

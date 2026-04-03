@@ -591,6 +591,57 @@ router.post('/shop/ContractOrder/audit', async (req, res) => {
   try {
     const { id, status } = req.body
     if (!id) return fail(res, 'id不能为空')
+    const isAudit = Number(status ?? 1) === 1
+
+    const contractR = await pool.query('SELECT * FROM sale_contracts WHERE id=$1', [id])
+    const contract = contractR.rows[0]
+    if (!contract) return fail(res, '合同不存在')
+
+    const totalAmount = parseFloat(contract.after_discount || contract.total_amount || 0)
+    const receiveAmount = parseFloat(contract.receive_amount || 0)
+    const receiveAccount = (contract.receive_account || '').trim()
+    const customerName = contract.customer_name || ''
+    const orderSn = contract.order_sn || contract.order_no || ''
+    const signDate = contract.sign_date || contract.create_time || new Date()
+
+    // 审核时必须选收款账户
+    if (isAudit && receiveAmount > 0 && !receiveAccount) {
+      return fail(res, '请先在合同中选择收款账户再审核')
+    }
+
+    // 查找资金账户
+    let fundId = 0, fundName = receiveAccount
+    if (receiveAccount) {
+      const fundR = await pool.query(`SELECT id, name FROM finance_funds WHERE name=$1 AND deleted_at IS NULL LIMIT 1`, [receiveAccount])
+      if (fundR.rows[0]) { fundId = fundR.rows[0].id; fundName = fundR.rows[0].name }
+    }
+
+    if (isAudit) {
+      // 审核：生成收款记录，加余额
+      if (receiveAmount > 0) {
+        const receiptNo = genOrderNo('SK')
+        await pool.query(
+          `INSERT INTO collect_receipt (receipt_no, order_sn, contact_type, contact_name, amount, receipt_date, fund_id, fund_name, remark, status, category)
+           VALUES ($1,$2,'customer',$3,$4,$5,$6,$7,$8,1,'sale')`,
+          [receiptNo, orderSn, customerName, receiveAmount, signDate, fundId, fundName, `合同${orderSn}审核自动生成`]
+        )
+        if (fundId) {
+          await pool.query('UPDATE finance_funds SET balance=balance+$1 WHERE id=$2', [receiveAmount, fundId])
+        }
+      }
+    } else {
+      // 反审核：删收款记录，扣余额
+      const delR = await pool.query(
+        `UPDATE collect_receipt SET deleted_at=NOW() WHERE order_sn=$1 AND deleted_at IS NULL AND remark LIKE '%审核自动生成%' RETURNING amount, fund_id`,
+        [orderSn]
+      )
+      for (const r of delR.rows) {
+        if (r.fund_id) {
+          await pool.query('UPDATE finance_funds SET balance=balance-$1 WHERE id=$2', [r.amount, r.fund_id])
+        }
+      }
+    }
+
     await pool.query('UPDATE sale_contracts SET status=$1 WHERE id=$2', [status ?? 1, id])
     return ok(res)
   } catch (e) { fail(res, e.message) }

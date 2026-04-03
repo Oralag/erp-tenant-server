@@ -702,20 +702,25 @@ router.post('/stock/PurchaseOrder/audit', async (req, res) => {
     const fundId = po.fund_id ? parseInt(po.fund_id) : 0
     const fundName = po.fund_name || ''
 
-    if (fundId && totalAmount > 0) {
+    if (totalAmount > 0) {
       if (isAudit) {
-        // 审核：扣减资金账户余额，生成付款单
-        await pool.query('UPDATE finance_funds SET balance=balance-$1 WHERE id=$2', [totalAmount, fundId])
+        // 审核：生成付款单（不管有没有资金账户都记录）
         const receiptNo = genOrderNo('FK')
         await pool.query(
           `INSERT INTO pay_receipt (receipt_no, order_sn, contact_type, contact_name, amount, pay_date, fund_id, fund_name, remark, status, category)
            VALUES ($1,$2,'supplier',$3,$4,$5,$6,$7,$8,1,'purchase')`,
           [receiptNo, orderNo, supplierName, totalAmount, orderDate, fundId, fundName, `采购单${orderNo}审核自动生成`]
         )
+        // 有资金账户时才扣减余额
+        if (fundId) {
+          await pool.query('UPDATE finance_funds SET balance=balance-$1 WHERE id=$2', [totalAmount, fundId])
+        }
       } else {
-        // 反审核：加回余额，删除对应付款单
-        await pool.query('UPDATE finance_funds SET balance=balance+$1 WHERE id=$2', [totalAmount, fundId])
+        // 反审核：删除对应付款单，如有资金账户则加回余额
         await pool.query('UPDATE pay_receipt SET deleted_at=NOW() WHERE order_sn=$1 AND deleted_at IS NULL', [orderNo])
+        if (fundId) {
+          await pool.query('UPDATE finance_funds SET balance=balance+$1 WHERE id=$2', [totalAmount, fundId])
+        }
       }
     }
 

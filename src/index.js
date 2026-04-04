@@ -2086,10 +2086,9 @@ app.use((req, res) => {
   res.status(404).json({ code: 0, message: `路由不存在: ${req.method} ${req.path}` })
 })
 
-// ─── 浏览器操作路由（给亚当用）──────────────────────────────────────────────
+// ─── 浏览器操作路由（给亚当用，使用 Browserless REST API）──────────────────
 
-const { chromium } = require('playwright-core')
-const BROWSERLESS_WS = `wss://production-sfo.browserless.io?token=${process.env.BROWSERLESS_API_KEY || ''}`
+const BROWSERLESS_TOKEN = process.env.BROWSERLESS_API_KEY || ''
 const BROWSER_AUTH = process.env.BROWSER_AUTH_TOKEN || 'adam-browser-secret'
 
 app.post('/browser', async (req, res) => {
@@ -2099,48 +2098,55 @@ app.post('/browser', async (req, res) => {
   const { action, params, cookies } = req.body
   if (!action) return res.status(400).json({ ok: false, error: 'action required' })
 
-  let browser = null
   try {
-    browser = await chromium.connectOverCDP(BROWSERLESS_WS)
-    const context = await browser.newContext({
-      viewport: { width: 1280, height: 800 },
-      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    })
-    if (Array.isArray(cookies) && cookies.length > 0) {
-      await context.addCookies(cookies)
-    }
-    const page = await context.newPage()
-    let result = {}
+    // 构建注入 Cookie 的脚本
+    const cookieScript = Array.isArray(cookies) && cookies.length > 0
+      ? cookies.map(c => `document.cookie = ${JSON.stringify(`${c.name}=${c.value}; domain=${c.domain}; path=${c.path || '/'}`)}; `).join('')
+      : ''
 
     if (action === 'get_content') {
-      await page.goto(params.url, { waitUntil: 'domcontentloaded', timeout: 30000 })
-      await page.waitForTimeout(2000)
-      const text = await page.evaluate(() => document.body.innerText)
-      result = { url: page.url(), title: await page.title(), content: text.slice(0, 5000) }
-    } else if (action === 'screenshot') {
-      if (params.url) {
-        await page.goto(params.url, { waitUntil: 'domcontentloaded', timeout: 30000 })
-        await page.waitForTimeout(2000)
+      const script = `
+        export default async function ({ page }) {
+          ${cookieScript ? `await page.goto('${params.url}'); ${cookieScript}` : ''}
+          await page.goto('${params.url}', { waitUntil: 'domcontentloaded' });
+          await page.waitForTimeout(2000);
+          const text = await page.evaluate(() => document.body.innerText);
+          const title = await page.title();
+          const url = page.url();
+          return { url, title, content: text.slice(0, 5000) };
+        }
+      `
+      const resp = await fetch(`https://production-sfo.browserless.io/function?token=${BROWSERLESS_TOKEN}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/javascript' },
+        body: script,
+      })
+      if (!resp.ok) {
+        const errText = await resp.text()
+        return res.status(500).json({ ok: false, error: `Browserless error: ${errText.slice(0, 200)}` })
       }
-      const buf = await page.screenshot({ type: 'jpeg', quality: 70 })
-      result = { url: page.url(), title: await page.title(), screenshot_base64: buf.toString('base64') }
-    } else if (action === 'click') {
-      if (params.url) await page.goto(params.url, { waitUntil: 'domcontentloaded', timeout: 30000 })
-      if (params.selector) await page.click(params.selector, { timeout: 10000 })
-      else if (params.text) await page.getByText(params.text, { exact: false }).first().click()
-      result = { status: 'clicked' }
-    } else if (action === 'type') {
-      if (params.selector) await page.fill(params.selector, params.text || '')
-      else if (params.placeholder) await page.getByPlaceholder(params.placeholder).fill(params.text || '')
-      result = { status: 'typed' }
-    } else {
-      result = { error: `未知 action: ${action}` }
+      const result = await resp.json()
+      return res.json({ ok: true, result })
     }
 
-    await browser.close()
-    res.json({ ok: true, result })
+    if (action === 'screenshot') {
+      // Browserless screenshot API
+      const body = { url: params.url, options: { type: 'jpeg', quality: 70 } }
+      const resp = await fetch(`https://production-sfo.browserless.io/screenshot?token=${BROWSERLESS_TOKEN}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      if (!resp.ok) {
+        const errText = await resp.text()
+        return res.status(500).json({ ok: false, error: `Browserless error: ${errText.slice(0, 200)}` })
+      }
+      const buf = Buffer.from(await resp.arrayBuffer())
+      return res.json({ ok: true, result: { url: params.url, screenshot_base64: buf.toString('base64') } })
+    }
+
+    return res.status(400).json({ ok: false, error: `未知 action: ${action}` })
   } catch (e) {
-    if (browser) await browser.close().catch(() => {})
     res.status(500).json({ ok: false, error: e.message })
   }
 })

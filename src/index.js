@@ -702,7 +702,9 @@ router.post('/shop/offerOrder/audit', async (req, res) => {
 router.get('/stock/PurchaseOrder/index', async (req, res) => {
   try {
     const { page, list_rows, offset } = pageParams(req.query)
-    await listQuery(res, 'purchase_order', { keyword: req.query.keyword, keywordCols: ['order_no','supplier_name'], baseWhere: 'deleted_at IS NULL', orderBy: 'id DESC', page, list_rows, offset })
+    const extraWhere = req.query.status !== undefined && req.query.status !== '' ? `status=${parseInt(req.query.status)}` : null
+    const baseWhere = ['deleted_at IS NULL', extraWhere].filter(Boolean).join(' AND ')
+    await listQuery(res, 'purchase_order', { keyword: req.query.keyword, keywordCols: ['order_no','supplier_name'], baseWhere, orderBy: 'id DESC', page, list_rows, offset })
   } catch (e) { fail(res, e.message) }
 })
 router.post('/stock/PurchaseOrder/add', async (req, res) => {

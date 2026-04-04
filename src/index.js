@@ -1579,11 +1579,25 @@ router.get('/retail/order/index', async (req, res) => {
 })
 router.post('/retail/order/add', async (req, res) => {
   try {
+    await pool.query(`ALTER TABLE retail_orders ADD COLUMN IF NOT EXISTS discount_amount NUMERIC(12,2) DEFAULT 0`)
+    await pool.query(`ALTER TABLE retail_orders ADD COLUMN IF NOT EXISTS store_id INT DEFAULT 0`)
+    await pool.query(`ALTER TABLE retail_orders ADD COLUMN IF NOT EXISTS store_name VARCHAR(100) DEFAULT ''`)
+    await loadTableCols()
     const b = filterBodyCols('retail_orders', { order_sn: genOrderNo('LS'), ...req.body })
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
     const vals = cols.map(k => typeof b[k] === 'object' ? JSON.stringify(b[k]) : b[k])
     const r = await pool.query(`INSERT INTO retail_orders (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
     return ok(res, r.rows[0])
+  } catch (e) { fail(res, e.message) }
+})
+router.post('/retail/order/audit', async (req, res) => {
+  try {
+    const { id, status } = req.body
+    if (!id) return fail(res, 'id不能为空')
+    const s = parseInt(status)
+    if (s !== 0 && s !== 1) return fail(res, 'status必须是0或1')
+    await pool.query('UPDATE retail_orders SET status=$1 WHERE id=$2', [s, id])
+    return ok(res)
   } catch (e) { fail(res, e.message) }
 })
 router.post('/retail/order/del', async (req, res) => {

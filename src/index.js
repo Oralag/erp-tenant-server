@@ -555,7 +555,9 @@ router.post('/shop/ShopCustomer/batchDel', async (req, res) => {
 router.get('/shop/ContractOrder/index', async (req, res) => {
   try {
     const { page, list_rows, offset } = pageParams(req.query)
-    await listQuery(res, 'sale_contracts', { keyword: req.query.keyword, keywordCols: ['order_no','customer_name'], baseWhere: 'deleted_at IS NULL', orderBy: 'id DESC', page, list_rows, offset })
+    const conditions = ['deleted_at IS NULL']
+    if (req.query.status !== undefined && req.query.status !== '') conditions.push(`status=${parseInt(req.query.status)}`)
+    await listQuery(res, 'sale_contracts', { keyword: req.query.keyword, keywordCols: ['order_no','customer_name'], baseWhere: conditions.join(' AND '), orderBy: 'id DESC', page, list_rows, offset })
   } catch (e) { fail(res, e.message) }
 })
 router.post('/shop/ContractOrder/add', async (req, res) => {

@@ -2086,6 +2086,65 @@ app.use((req, res) => {
   res.status(404).json({ code: 0, message: `路由不存在: ${req.method} ${req.path}` })
 })
 
+// ─── 浏览器操作路由（给亚当用）──────────────────────────────────────────────
+
+const { chromium } = require('playwright-core')
+const BROWSERLESS_WS = `wss://production-sfo.browserless.io?token=${process.env.BROWSERLESS_API_KEY || ''}`
+const BROWSER_AUTH = process.env.BROWSER_AUTH_TOKEN || 'adam-browser-secret'
+
+app.post('/browser', async (req, res) => {
+  const token = req.headers['x-auth-token']
+  if (token !== BROWSER_AUTH) return res.status(401).json({ ok: false, error: 'Unauthorized' })
+
+  const { action, params, cookies } = req.body
+  if (!action) return res.status(400).json({ ok: false, error: 'action required' })
+
+  let browser = null
+  try {
+    browser = await chromium.connectOverCDP(BROWSERLESS_WS)
+    const context = await browser.newContext({
+      viewport: { width: 1280, height: 800 },
+      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    })
+    if (Array.isArray(cookies) && cookies.length > 0) {
+      await context.addCookies(cookies)
+    }
+    const page = await context.newPage()
+    let result = {}
+
+    if (action === 'get_content') {
+      await page.goto(params.url, { waitUntil: 'domcontentloaded', timeout: 30000 })
+      await page.waitForTimeout(2000)
+      const text = await page.evaluate(() => document.body.innerText)
+      result = { url: page.url(), title: await page.title(), content: text.slice(0, 5000) }
+    } else if (action === 'screenshot') {
+      if (params.url) {
+        await page.goto(params.url, { waitUntil: 'domcontentloaded', timeout: 30000 })
+        await page.waitForTimeout(2000)
+      }
+      const buf = await page.screenshot({ type: 'jpeg', quality: 70 })
+      result = { url: page.url(), title: await page.title(), screenshot_base64: buf.toString('base64') }
+    } else if (action === 'click') {
+      if (params.url) await page.goto(params.url, { waitUntil: 'domcontentloaded', timeout: 30000 })
+      if (params.selector) await page.click(params.selector, { timeout: 10000 })
+      else if (params.text) await page.getByText(params.text, { exact: false }).first().click()
+      result = { status: 'clicked' }
+    } else if (action === 'type') {
+      if (params.selector) await page.fill(params.selector, params.text || '')
+      else if (params.placeholder) await page.getByPlaceholder(params.placeholder).fill(params.text || '')
+      result = { status: 'typed' }
+    } else {
+      result = { error: `未知 action: ${action}` }
+    }
+
+    await browser.close()
+    res.json({ ok: true, result })
+  } catch (e) {
+    if (browser) await browser.close().catch(() => {})
+    res.status(500).json({ ok: false, error: e.message })
+  }
+})
+
 // ─── start ──────────────────────────────────────────────────────────────────
 
 async function start() {

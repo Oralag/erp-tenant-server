@@ -557,7 +557,8 @@ router.get('/shop/ContractOrder/index', async (req, res) => {
     const { page, list_rows, offset } = pageParams(req.query)
     const conditions = ['deleted_at IS NULL']
     if (req.query.status !== undefined && req.query.status !== '') conditions.push(`status=${parseInt(req.query.status)}`)
-    await listQuery(res, 'sale_contracts', { keyword: req.query.keyword, keywordCols: ['order_no','customer_name'], baseWhere: conditions.join(' AND '), orderBy: 'id DESC', page, list_rows, offset })
+    if (req.query.customer_name) conditions.push(`customer_name ILIKE '%${req.query.customer_name.replace(/'/g,"''")}%'`)
+    await listQuery(res, 'sale_contracts', { keyword: req.query.keyword, keywordCols: ['order_no'], baseWhere: conditions.join(' AND '), orderBy: 'id DESC', page, list_rows, offset })
   } catch (e) { fail(res, e.message) }
 })
 router.post('/shop/ContractOrder/add', async (req, res) => {
@@ -799,7 +800,10 @@ router.post('/stock/PurchaseOrder/batchDel', async (req, res) => {
 router.get('/stock/SaleOutOrder/index', async (req, res) => {
   try {
     const { page, list_rows, offset } = pageParams(req.query)
-    await listQuery(res, 'sale_out_order', { keyword: req.query.keyword, keywordCols: ['order_no','customer_name'], baseWhere: 'deleted_at IS NULL', orderBy: 'id DESC', page, list_rows, offset })
+    const conditions = ['deleted_at IS NULL']
+    if (req.query.status !== undefined && req.query.status !== '') conditions.push(`status=${parseInt(req.query.status)}`)
+    if (req.query.customer_name) conditions.push(`customer_name ILIKE '%${req.query.customer_name.replace(/'/g,"''")}%'`)
+    await listQuery(res, 'sale_out_order', { keyword: req.query.keyword, keywordCols: ['order_no'], baseWhere: conditions.join(' AND '), orderBy: 'id DESC', page, list_rows, offset })
   } catch (e) { fail(res, e.message) }
 })
 router.post('/stock/SaleOutOrder/add', async (req, res) => {

@@ -751,6 +751,7 @@ router.post('/stock/PurchaseOrder/audit', async (req, res) => {
     if (!po) return fail(res, '采购单不存在')
 
     const totalAmount = parseFloat(po.total_amount || 0)
+    const payAmount = parseFloat(po.pay_amount || 0)
     const supplierName = po.supplier_name || '未知供应商'
     const orderNo = po.order_no || ''
     const orderDate = po.order_date || new Date()
@@ -759,27 +760,27 @@ router.post('/stock/PurchaseOrder/audit', async (req, res) => {
     const fundName = po.fund_name || ''
 
     // 审核时必须选择资金账户
-    if (isAudit && totalAmount > 0 && !fundId) {
+    if (isAudit && payAmount > 0 && !fundId) {
       return fail(res, '请先在采购单中选择资金账户再审核')
     }
 
-    if (totalAmount > 0) {
+    if (payAmount > 0) {
       if (isAudit) {
         // 审核：扣减账户余额，生成付款单（先检查是否已存在，防止重复）
         const existCheck = await pool.query('SELECT id FROM pay_receipt WHERE order_sn=$1 AND deleted_at IS NULL LIMIT 1', [orderNo])
         if (existCheck.rows.length === 0) {
-          await pool.query('UPDATE finance_funds SET balance=balance-$1 WHERE id=$2', [totalAmount, fundId])
+          await pool.query('UPDATE finance_funds SET balance=balance-$1 WHERE id=$2', [payAmount, fundId])
           const receiptNo = genOrderNo('FK')
           await pool.query(
             `INSERT INTO pay_receipt (receipt_no, order_sn, contact_type, contact_name, amount, pay_date, fund_id, fund_name, remark, status, category)
              VALUES ($1,$2,'supplier',$3,$4,$5,$6,$7,$8,1,'purchase')`,
-            [receiptNo, orderNo, supplierName, totalAmount, orderDate, fundId, fundName, `采购单${orderNo}审核自动生成`]
+            [receiptNo, orderNo, supplierName, payAmount, orderDate, fundId, fundName, `采购单${orderNo}审核自动生成`]
           )
         }
       } else {
         // 反审核：加回余额，删除对应付款单
         if (fundId) {
-          await pool.query('UPDATE finance_funds SET balance=balance+$1 WHERE id=$2', [totalAmount, fundId])
+          await pool.query('UPDATE finance_funds SET balance=balance+$1 WHERE id=$2', [payAmount, fundId])
         }
         await pool.query('UPDATE pay_receipt SET deleted_at=NOW() WHERE order_sn=$1 AND deleted_at IS NULL', [orderNo])
       }

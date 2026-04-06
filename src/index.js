@@ -786,6 +786,20 @@ router.post('/stock/PurchaseOrder/audit', async (req, res) => {
       }
     }
 
+    // 反审核时：额外找出 remark 含 #id 的手动付款单，全部撤销并还款到对应资金账户
+    if (!isAudit) {
+      const manualReceipts = await pool.query(
+        `SELECT id, fund_id, amount FROM pay_receipt WHERE remark LIKE $1 AND deleted_at IS NULL`,
+        [`%#${id}%`]
+      )
+      for (const mr of manualReceipts.rows) {
+        await pool.query('UPDATE pay_receipt SET deleted_at=NOW() WHERE id=$1', [mr.id])
+        if (mr.fund_id && Number(mr.amount)) {
+          await pool.query('UPDATE finance_funds SET balance=balance+$1 WHERE id=$2', [Number(mr.amount), mr.fund_id])
+        }
+      }
+    }
+
     await pool.query('UPDATE purchase_order SET status=$1 WHERE id=$2', [newStatus, id])
     return ok(res)
   } catch (e) { fail(res, e.message) }

@@ -586,6 +586,35 @@ router.post('/shop/ContractOrder/del', async (req, res) => {
   try {
     const { id } = req.body
     if (!id) return fail(res, 'id不能为空')
+    // 已审核的合同删除时，同步撤销关联收款单并扣余额（同反审核逻辑）
+    const cR = await pool.query('SELECT * FROM sale_contracts WHERE id=$1', [id])
+    const contract = cR.rows[0]
+    if (contract && Number(contract.status) === 1) {
+      const orderSn = contract.order_sn || contract.order_no || ''
+      // 删审核自动生成的收款单并扣余额
+      if (orderSn) {
+        const delR = await pool.query(
+          `UPDATE collect_receipt SET deleted_at=NOW() WHERE order_sn=$1 AND deleted_at IS NULL AND remark LIKE '%审核自动生成%' RETURNING amount, fund_id`,
+          [orderSn]
+        )
+        for (const r of delR.rows) {
+          if (r.fund_id) {
+            await pool.query('UPDATE finance_funds SET balance=balance-$1 WHERE id=$2', [r.amount, r.fund_id])
+          }
+        }
+      }
+      // 删 remark 含 #id 的手动收款单并扣余额
+      const manualReceipts = await pool.query(
+        `SELECT id, fund_id, amount FROM collect_receipt WHERE remark LIKE $1 AND deleted_at IS NULL`,
+        [`%#${id}%`]
+      )
+      for (const mr of manualReceipts.rows) {
+        await pool.query('UPDATE collect_receipt SET deleted_at=NOW() WHERE id=$1', [mr.id])
+        if (mr.fund_id && Number(mr.amount)) {
+          await pool.query('UPDATE finance_funds SET balance=balance-$1 WHERE id=$2', [Number(mr.amount), mr.fund_id])
+        }
+      }
+    }
     await pool.query('UPDATE sale_contracts SET deleted_at=NOW() WHERE id=$1', [id])
     return ok(res)
   } catch (e) { fail(res, e.message) }
@@ -641,6 +670,17 @@ router.post('/shop/ContractOrder/audit', async (req, res) => {
       for (const r of delR.rows) {
         if (r.fund_id) {
           await pool.query('UPDATE finance_funds SET balance=balance-$1 WHERE id=$2', [r.amount, r.fund_id])
+        }
+      }
+      // 额外找出 remark 含 #id 的手动收款单，全部撤销并扣减对应资金账户
+      const manualReceipts = await pool.query(
+        `SELECT id, fund_id, amount FROM collect_receipt WHERE remark LIKE $1 AND deleted_at IS NULL`,
+        [`%#${id}%`]
+      )
+      for (const mr of manualReceipts.rows) {
+        await pool.query('UPDATE collect_receipt SET deleted_at=NOW() WHERE id=$1', [mr.id])
+        if (mr.fund_id && Number(mr.amount)) {
+          await pool.query('UPDATE finance_funds SET balance=balance-$1 WHERE id=$2', [Number(mr.amount), mr.fund_id])
         }
       }
     }
@@ -734,6 +774,33 @@ router.post('/stock/PurchaseOrder/del', async (req, res) => {
   try {
     const { id } = req.body
     if (!id) return fail(res, 'id不能为空')
+    // 已审核的单据删除时，同步撤销关联付款单并还余额（同反审核逻辑）
+    const poR = await pool.query('SELECT * FROM purchase_order WHERE id=$1', [id])
+    const po = poR.rows[0]
+    if (po && Number(po.status) === 1) {
+      const orderNo = po.order_no || ''
+      const fundId = po.fund_id ? parseInt(po.fund_id) : 0
+      const payAmount = parseFloat(po.pay_amount || 0)
+      // 还审核自动生成的付款单余额
+      if (fundId && payAmount > 0) {
+        await pool.query('UPDATE finance_funds SET balance=balance+$1 WHERE id=$2', [payAmount, fundId])
+      }
+      // 软删 order_sn 匹配的付款单
+      if (orderNo) {
+        await pool.query('UPDATE pay_receipt SET deleted_at=NOW() WHERE order_sn=$1 AND deleted_at IS NULL', [orderNo])
+      }
+      // 软删 remark 含 #id 的手动付款单并还余额
+      const manualReceipts = await pool.query(
+        `SELECT id, fund_id, amount FROM pay_receipt WHERE remark LIKE $1 AND deleted_at IS NULL`,
+        [`%#${id}%`]
+      )
+      for (const mr of manualReceipts.rows) {
+        await pool.query('UPDATE pay_receipt SET deleted_at=NOW() WHERE id=$1', [mr.id])
+        if (mr.fund_id && Number(mr.amount)) {
+          await pool.query('UPDATE finance_funds SET balance=balance+$1 WHERE id=$2', [Number(mr.amount), mr.fund_id])
+        }
+      }
+    }
     await pool.query('UPDATE purchase_order SET deleted_at=NOW() WHERE id=$1', [id])
     return ok(res)
   } catch (e) { fail(res, e.message) }
@@ -809,6 +876,32 @@ router.post('/stock/PurchaseOrder/batchDel', async (req, res) => {
     const { ids } = req.body
     if (!ids || !ids.length) return fail(res, 'ids不能为空')
     const idArr = Array.isArray(ids) ? ids : ids.split(',').map(Number)
+    // 对每条已审核的采购单，撤销关联付款单并还余额
+    for (const id of idArr) {
+      const poR = await pool.query('SELECT * FROM purchase_order WHERE id=$1', [id])
+      const po = poR.rows[0]
+      if (po && Number(po.status) === 1) {
+        const orderNo = po.order_no || ''
+        const fundId = po.fund_id ? parseInt(po.fund_id) : 0
+        const payAmount = parseFloat(po.pay_amount || 0)
+        if (fundId && payAmount > 0) {
+          await pool.query('UPDATE finance_funds SET balance=balance+$1 WHERE id=$2', [payAmount, fundId])
+        }
+        if (orderNo) {
+          await pool.query('UPDATE pay_receipt SET deleted_at=NOW() WHERE order_sn=$1 AND deleted_at IS NULL', [orderNo])
+        }
+        const manualReceipts = await pool.query(
+          `SELECT id, fund_id, amount FROM pay_receipt WHERE remark LIKE $1 AND deleted_at IS NULL`,
+          [`%#${id}%`]
+        )
+        for (const mr of manualReceipts.rows) {
+          await pool.query('UPDATE pay_receipt SET deleted_at=NOW() WHERE id=$1', [mr.id])
+          if (mr.fund_id && Number(mr.amount)) {
+            await pool.query('UPDATE finance_funds SET balance=balance+$1 WHERE id=$2', [Number(mr.amount), mr.fund_id])
+          }
+        }
+      }
+    }
     await pool.query(`UPDATE purchase_order SET deleted_at=NOW() WHERE id=ANY($1)`, [idArr])
     return ok(res)
   } catch (e) { fail(res, e.message) }
@@ -1229,6 +1322,32 @@ router.post('/procure/ProcureReturn/del', async (req, res) => {
   try {
     const { id } = req.body
     if (!id) return fail(res, 'id不能为空')
+    // 已审核的退货单删除时，撤销库存和资金变动
+    const retR = await pool.query('SELECT * FROM procure_return WHERE id=$1', [id])
+    const ret = retR.rows[0]
+    if (ret && Number(ret.status) === 1) {
+      let goodsInfo = []
+      try { goodsInfo = typeof ret.goods_info === 'string' ? JSON.parse(ret.goods_info) : (ret.goods_info || []) } catch {}
+      const meta = goodsInfo.find(i => i._meta) || {}
+      const items = goodsInfo.filter(i => !i._meta)
+      const fundId = meta.fund_id || ret.fund_id || 0
+      const totalAmount = parseFloat(meta.total_amount || ret.total_amount || 0)
+      const orderTotalAmount = parseFloat(meta.order_total_amount || 0)
+      const orderPayAmount = parseFloat(meta.order_pay_amount || 0)
+      // 加回库存
+      for (const item of items) {
+        if (!item.goods_id || !item.num) continue
+        await pool.query('UPDATE stock_inventory SET qty=qty+$1, update_time=NOW() WHERE goods_id=$2', [parseFloat(item.num), item.goods_id])
+      }
+      // 扣回已退款到账户的金额
+      if (fundId && totalAmount > 0) {
+        const unpaid = Math.max(0, orderTotalAmount - orderPayAmount)
+        const refund = Math.max(0, totalAmount - unpaid)
+        if (refund > 0) {
+          await pool.query('UPDATE finance_funds SET balance=balance-$1, update_time=NOW() WHERE id=$2', [refund, fundId])
+        }
+      }
+    }
     await pool.query('DELETE FROM procure_return WHERE id=$1', [id])
     return ok(res)
   } catch (e) { fail(res, e.message) }
@@ -1473,6 +1592,10 @@ router.post('/finance/Expense/add', async (req, res) => {
     const cols = Object.keys(b).filter(k => ALLOWED.has(k) && b[k] !== undefined)
     const vals = cols.map(k => b[k])
     const r = await pool.query(`INSERT INTO finance_expenses (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
+    // 同步扣减资金账户余额
+    if (b.fund_id && Number(b.amount)) {
+      await pool.query('UPDATE finance_funds SET balance=balance-$1, update_time=NOW() WHERE id=$2', [Number(b.amount), b.fund_id])
+    }
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })
@@ -1480,6 +1603,11 @@ router.post('/finance/Expense/del', async (req, res) => {
   try {
     const { id } = req.body
     if (!id) return fail(res, 'id不能为空')
+    // 还余额
+    const r = await pool.query('SELECT fund_id, amount FROM finance_expenses WHERE id=$1', [id])
+    if (r.rows[0]?.fund_id && Number(r.rows[0]?.amount)) {
+      await pool.query('UPDATE finance_funds SET balance=balance+$1, update_time=NOW() WHERE id=$2', [Number(r.rows[0].amount), r.rows[0].fund_id])
+    }
     await pool.query('DELETE FROM finance_expenses WHERE id=$1', [id])
     return ok(res)
   } catch (e) { fail(res, e.message) }
@@ -1604,6 +1732,10 @@ router.post('/finance/Prepay/create', async (req, res) => {
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
     const vals = cols.map(k => b[k])
     const r = await pool.query(`INSERT INTO prepay_record (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
+    // 同步扣减资金账户余额
+    if (b.fund_id && Number(b.amount)) {
+      await pool.query('UPDATE finance_funds SET balance=balance-$1, update_time=NOW() WHERE id=$2', [Number(b.amount), b.fund_id])
+    }
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })
@@ -1611,6 +1743,11 @@ router.post('/finance/Prepay/del', async (req, res) => {
   try {
     const { id } = req.body
     if (!id) return fail(res, 'id不能为空')
+    // 还余额
+    const r = await pool.query('SELECT fund_id, amount FROM prepay_record WHERE id=$1', [id])
+    if (r.rows[0]?.fund_id && Number(r.rows[0]?.amount)) {
+      await pool.query('UPDATE finance_funds SET balance=balance+$1, update_time=NOW() WHERE id=$2', [Number(r.rows[0].amount), r.rows[0].fund_id])
+    }
     await pool.query('DELETE FROM prepay_record WHERE id=$1', [id])
     return ok(res)
   } catch (e) { fail(res, e.message) }

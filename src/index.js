@@ -1304,6 +1304,18 @@ router.get('/finance/PayAccounts/index', async (req, res) => {
 })
 
 // CollectReceipt (收款单)
+router.post('/finance/CollectReceipt/edit', async (req, res) => {
+  try {
+    const { id, ...fields } = req.body
+    if (!id) return fail(res, 'id不能为空')
+    const cols = Object.keys(fields)
+    if (!cols.length) return fail(res, '无更新字段')
+    const sets = cols.map((k, i) => `${k}=$${i + 2}`).join(',')
+    const vals = [id, ...cols.map(k => fields[k])]
+    const r = await pool.query(`UPDATE collect_receipt SET ${sets} WHERE id=$1 RETURNING *`, vals)
+    ok(res, r.rows[0])
+  } catch (e) { fail(res, e.message) }
+})
 router.get('/finance/CollectReceipt/index', async (req, res) => {
   try {
     const { page, list_rows, offset } = pageParams(req.query)

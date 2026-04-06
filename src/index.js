@@ -2250,5 +2250,62 @@ router.post('/goods/BomGoods/del', async (req, res) => {
   } catch (e) { fail(res, e.message) }
 })
 
+// ── 页面截图接口（供会议室设计专员使用）──
+app.post('/screenshot', async (req, res) => {
+  const { url, selector, token } = req.body
+  if (!url) return res.status(400).json({ code: 0, message: '缺少 url' })
+
+  let puppeteer, browser
+  try {
+    puppeteer = require('puppeteer-core')
+  } catch {
+    return res.status(500).json({ code: 0, message: '截图服务未安装，请联系管理员' })
+  }
+
+  try {
+    const chromiumPath = process.env.CHROMIUM_PATH
+      || process.env.REMOTION_CHROME_PATH
+      || '/usr/bin/chromium-browser'
+      || '/usr/bin/chromium'
+
+    browser = await puppeteer.launch({
+      executablePath: chromiumPath,
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+      headless: true,
+    })
+
+    const page = await browser.newPage()
+    await page.setViewport({ width: 1280, height: 800 })
+
+    // 如果有 token，设置 localStorage（ERP 登录态）
+    if (token) {
+      await page.evaluateOnNewDocument((t) => {
+        localStorage.setItem('erp_token', t)
+      }, token)
+    }
+
+    await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 })
+    await new Promise(r => setTimeout(r, 2000))
+
+    let imageBase64
+    if (selector) {
+      const el = await page.$(selector)
+      if (el) {
+        imageBase64 = (await el.screenshot({ type: 'jpeg', quality: 85 })).toString('base64')
+      } else {
+        imageBase64 = (await page.screenshot({ type: 'jpeg', quality: 80, fullPage: false })).toString('base64')
+      }
+    } else {
+      imageBase64 = (await page.screenshot({ type: 'jpeg', quality: 80, fullPage: false })).toString('base64')
+    }
+
+    await browser.close()
+    return res.json({ code: 1, data: { image: `data:image/jpeg;base64,${imageBase64}` } })
+  } catch (e) {
+    if (browser) await browser.close().catch(() => {})
+    return res.status(500).json({ code: 0, message: e.message })
+  }
+})
+
 start()
 

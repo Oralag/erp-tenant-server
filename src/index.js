@@ -1359,6 +1359,19 @@ router.get('/finance/PayReceipt/index', async (req, res) => {
 router.post('/finance/PayReceipt/add', async (req, res) => {
   try {
     const b = filterBodyCols('pay_receipt', { receipt_no: genOrderNo('FK'), ...req.body })
+    // 防重复：同一供应商+同一金额+同一天已存在则拒绝
+    const supName = b.supplier_name || b.contact_name || ''
+    const payDate = b.pay_date ? String(b.pay_date).slice(0, 10) : new Date().toISOString().slice(0, 10)
+    const amount = Number(b.amount || 0)
+    if (supName && amount > 0) {
+      const dupCheck = await pool.query(
+        `SELECT id, receipt_no FROM pay_receipt WHERE (supplier_name=$1 OR contact_name=$1) AND amount=$2 AND DATE(pay_date)=$3 AND deleted_at IS NULL LIMIT 1`,
+        [supName, amount, payDate]
+      )
+      if (dupCheck.rows.length > 0) {
+        return fail(res, `重复付款：该供应商"${supName}"在${payDate}已有一笔相同金额¥${amount}的付款单（单号${dupCheck.rows[0].receipt_no}），请勿重复提交`)
+      }
+    }
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
     const vals = cols.map(k => b[k])
     const r = await pool.query(`INSERT INTO pay_receipt (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)

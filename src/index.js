@@ -1379,7 +1379,7 @@ router.post('/finance/PayReceipt/add', async (req, res) => {
     const amount = Number(b.amount || 0)
     if (supName && amount > 0) {
       const dupCheck = await pool.query(
-        `SELECT id, receipt_no FROM pay_receipt WHERE (supplier_name=$1 OR contact_name=$1) AND amount=$2 AND DATE(pay_date)=$3 AND deleted_at IS NULL LIMIT 1`,
+        `SELECT id, receipt_no FROM pay_receipt WHERE contact_name=$1 AND amount=$2 AND DATE(pay_date)=$3 AND deleted_at IS NULL LIMIT 1`,
         [supName, amount, payDate]
       )
       if (dupCheck.rows.length > 0) {

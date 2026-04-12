@@ -1641,10 +1641,15 @@ router.post('/procure/ProcureReturn/audit', async (req, res) => {
       // 扣减库存：不限仓库，直接按 goods_id 更新所有匹配行
       for (const item of items) {
         if (!item.goods_id || !item.num) continue
-        await pool.query(
-          'UPDATE stock_inventory SET qty=GREATEST(0, qty-$1), update_time=NOW() WHERE goods_id=$2',
-          [parseFloat(item.num), item.goods_id]
-        )
+        const num = parseFloat(item.num)
+        const beforeR = await pool.query('SELECT qty, warehouse_id, warehouse_name FROM stock_inventory WHERE goods_id=$1 LIMIT 1', [item.goods_id])
+        const beforeQty = beforeR.rows[0] ? parseFloat(beforeR.rows[0].qty) : 0
+        const wId = beforeR.rows[0]?.warehouse_id || 0
+        const wName = beforeR.rows[0]?.warehouse_name || ''
+        await pool.query('UPDATE stock_inventory SET qty=GREATEST(0, qty-$1), update_time=NOW() WHERE goods_id=$2', [num, item.goods_id])
+        const afterQty = Math.max(0, beforeQty - num)
+        await pool.query('INSERT INTO stock_flow (goods_id, goods_name, warehouse_id, warehouse_name, type, qty, before_qty, after_qty, order_no, remark) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)',
+          [item.goods_id, item.goods_name || '', wId, wName, 'procure_return', -num, beforeQty, afterQty, ret.order_no || '', '采购退货审核'])
         console.log('[stock deduct]', item.goods_id, item.num)
       }
       // 退款到资金账户
@@ -1662,10 +1667,14 @@ router.post('/procure/ProcureReturn/audit', async (req, res) => {
       // 加回库存
       for (const item of items) {
         if (!item.goods_id || !item.num) continue
-        await pool.query(
-          'UPDATE stock_inventory SET qty=qty+$1, update_time=NOW() WHERE goods_id=$2',
-          [parseFloat(item.num), item.goods_id]
-        )
+        const num = parseFloat(item.num)
+        const beforeR = await pool.query('SELECT qty, warehouse_id, warehouse_name FROM stock_inventory WHERE goods_id=$1 LIMIT 1', [item.goods_id])
+        const beforeQty = beforeR.rows[0] ? parseFloat(beforeR.rows[0].qty) : 0
+        const wId = beforeR.rows[0]?.warehouse_id || 0
+        const wName = beforeR.rows[0]?.warehouse_name || ''
+        await pool.query('UPDATE stock_inventory SET qty=qty+$1, update_time=NOW() WHERE goods_id=$2', [num, item.goods_id])
+        await pool.query('INSERT INTO stock_flow (goods_id, goods_name, warehouse_id, warehouse_name, type, qty, before_qty, after_qty, order_no, remark) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)',
+          [item.goods_id, item.goods_name || '', wId, wName, 'procure_return_reverse', num, beforeQty, beforeQty + num, ret.order_no || '', '采购退货反审核'])
       }
       // 从资金账户扣回退款
       if (fundId && totalAmount > 0) {

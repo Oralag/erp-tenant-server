@@ -1063,7 +1063,7 @@ router.post('/stock/SaleReturnOrder/audit', async (req, res) => {
     await pool.query('UPDATE sale_return_order SET status=$1 WHERE id=$2', [newStatus, id])
     return ok(res)
   } catch (e) { console.error('[SaleReturnOrder audit error]', e.message); fail(res, e.message) }
-}))
+})
 
 // StockAll (库存汇总)
 router.get('/stock/StockAll/index', async (req, res) => {

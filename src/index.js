@@ -1164,6 +1164,48 @@ router.post('/stock/OtherIn/del', async (req, res) => {
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
+router.post('/stock/OtherIn/audit', async (req, res) => {
+  try {
+    const { id, status } = req.body
+    if (!id) return fail(res, 'id不能为空')
+    const newStatus = status ?? 1
+    const r = await pool.query('SELECT * FROM stock_other_in WHERE id=$1', [id])
+    const order = r.rows[0]
+    if (!order) return fail(res, '入库单不存在')
+    if (order.status === newStatus) return ok(res)
+    let goodsInfo = []
+    try { goodsInfo = typeof order.goods_info === 'string' ? JSON.parse(order.goods_info) : (order.goods_info || []) } catch {}
+    const warehouseId = order.warehouse_id || 0
+    const warehouseName = order.warehouse_name || ''
+    const orderNo = order.order_no || ''
+    const isAudit = newStatus === 1
+    const delta = isAudit ? 1 : -1
+    for (const item of goodsInfo) {
+      const goodsId = item.goods_id || 0
+      if (!goodsId) continue
+      const num = parseFloat(item.num) || 0
+      if (num <= 0) continue
+      const change = num * delta
+      const existing = await pool.query('SELECT * FROM stock_inventory WHERE goods_id=$1 AND warehouse_id=$2', [goodsId, warehouseId])
+      let beforeQty = 0
+      if (existing.rows.length > 0) {
+        beforeQty = parseFloat(existing.rows[0].qty) || 0
+        const afterQty = Math.max(0, beforeQty + change)
+        await pool.query('UPDATE stock_inventory SET qty=$1, goods_name=$2, unit_name=$3, update_time=NOW() WHERE goods_id=$4 AND warehouse_id=$5',
+          [afterQty, item.goods_name || '', item.unit_name || '', goodsId, warehouseId])
+        await pool.query('INSERT INTO stock_flow (goods_id, goods_name, warehouse_id, warehouse_name, type, qty, before_qty, after_qty, order_no, remark) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)',
+          [goodsId, item.goods_name || '', warehouseId, warehouseName, isAudit ? 'other_in' : 'other_in_reverse', change, beforeQty, afterQty, orderNo, isAudit ? '其他入库审核' : '其他入库反审核'])
+      } else if (isAudit) {
+        await pool.query('INSERT INTO stock_inventory (goods_id, goods_name, goods_code, unit_name, warehouse_id, warehouse_name, qty) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+          [goodsId, item.goods_name || '', item.goods_sn || '', item.unit_name || '', warehouseId, warehouseName, num])
+        await pool.query('INSERT INTO stock_flow (goods_id, goods_name, warehouse_id, warehouse_name, type, qty, before_qty, after_qty, order_no, remark) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)',
+          [goodsId, item.goods_name || '', warehouseId, warehouseName, 'other_in', num, 0, num, orderNo, '其他入库审核'])
+      }
+    }
+    await pool.query('UPDATE stock_other_in SET status=$1 WHERE id=$2', [newStatus, id])
+    return ok(res)
+  } catch (e) { console.error('[OtherIn audit error]', e.message); fail(res, e.message) }
+})
 
 // OtherOut (其他出库)
 router.get('/stock/OtherOut/index', async (req, res) => {
@@ -1188,6 +1230,43 @@ router.post('/stock/OtherOut/del', async (req, res) => {
     await pool.query('DELETE FROM stock_other_out WHERE id=$1', [id])
     return ok(res)
   } catch (e) { fail(res, e.message) }
+})
+router.post('/stock/OtherOut/audit', async (req, res) => {
+  try {
+    const { id, status } = req.body
+    if (!id) return fail(res, 'id不能为空')
+    const newStatus = status ?? 1
+    const r = await pool.query('SELECT * FROM stock_other_out WHERE id=$1', [id])
+    const order = r.rows[0]
+    if (!order) return fail(res, '出库单不存在')
+    if (order.status === newStatus) return ok(res)
+    let goodsInfo = []
+    try { goodsInfo = typeof order.goods_info === 'string' ? JSON.parse(order.goods_info) : (order.goods_info || []) } catch {}
+    const warehouseId = order.warehouse_id || 0
+    const warehouseName = order.warehouse_name || ''
+    const orderNo = order.order_no || ''
+    const isAudit = newStatus === 1
+    const delta = isAudit ? -1 : 1  // 出库审核扣库存，反审核加回
+    for (const item of goodsInfo) {
+      const goodsId = item.goods_id || 0
+      if (!goodsId) continue
+      const num = parseFloat(item.num) || 0
+      if (num <= 0) continue
+      const change = num * delta
+      const existing = await pool.query('SELECT * FROM stock_inventory WHERE goods_id=$1 AND warehouse_id=$2', [goodsId, warehouseId])
+      let beforeQty = 0
+      if (existing.rows.length > 0) {
+        beforeQty = parseFloat(existing.rows[0].qty) || 0
+        const afterQty = Math.max(0, beforeQty + change)
+        await pool.query('UPDATE stock_inventory SET qty=$1, goods_name=$2, unit_name=$3, update_time=NOW() WHERE goods_id=$4 AND warehouse_id=$5',
+          [afterQty, item.goods_name || '', item.unit_name || '', goodsId, warehouseId])
+        await pool.query('INSERT INTO stock_flow (goods_id, goods_name, warehouse_id, warehouse_name, type, qty, before_qty, after_qty, order_no, remark) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)',
+          [goodsId, item.goods_name || '', warehouseId, warehouseName, isAudit ? 'other_out' : 'other_out_reverse', change, beforeQty, afterQty, orderNo, isAudit ? '其他出库审核' : '其他出库反审核'])
+      }
+    }
+    await pool.query('UPDATE stock_other_out SET status=$1 WHERE id=$2', [newStatus, id])
+    return ok(res)
+  } catch (e) { console.error('[OtherOut audit error]', e.message); fail(res, e.message) }
 })
 
 // Allocation (调拨管理)

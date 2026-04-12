@@ -1113,6 +1113,39 @@ router.post('/stock/OtherOut/del', async (req, res) => {
   } catch (e) { fail(res, e.message) }
 })
 
+// Allocation (调拨管理)
+router.get('/stock/Allocation/index', async (req, res) => {
+  try {
+    const { page, list_rows, offset } = pageParams(req.query)
+    await listQuery(res, 'stock_allocation', { keyword: req.query.transfer_no, keywordCols: ['transfer_no'], baseWhere: '1=1', orderBy: 'id DESC', page, list_rows, offset })
+  } catch (e) { fail(res, e.message) }
+})
+router.post('/stock/Allocation/add', async (req, res) => {
+  try {
+    const b = filterBodyCols('stock_allocation', { transfer_no: genOrderNo('DB'), status: 0, ...req.body })
+    const cols = Object.keys(b).filter(k => b[k] !== undefined)
+    const vals = cols.map(k => typeof b[k] === 'object' ? JSON.stringify(b[k]) : b[k])
+    const r = await pool.query(`INSERT INTO stock_allocation (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
+    return ok(res, r.rows[0])
+  } catch (e) { fail(res, e.message) }
+})
+router.post('/stock/Allocation/del', async (req, res) => {
+  try {
+    const { id } = req.body
+    if (!id) return fail(res, 'id不能为空')
+    await pool.query('DELETE FROM stock_allocation WHERE id=$1', [id])
+    return ok(res)
+  } catch (e) { fail(res, e.message) }
+})
+router.post('/stock/Allocation/batchDel', async (req, res) => {
+  try {
+    const { ids } = req.body
+    if (!ids || !ids.length) return fail(res, 'ids不能为空')
+    await pool.query(`DELETE FROM stock_allocation WHERE id=ANY($1)`, [ids])
+    return ok(res)
+  } catch (e) { fail(res, e.message) }
+})
+
 // StockCheck (盘点)
 router.get('/stock/StockCheck/index', async (req, res) => {
   try {

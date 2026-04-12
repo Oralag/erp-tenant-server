@@ -219,6 +219,16 @@ async function initDb() {
     // 补加 category 字段（幂等）
     await client.query("ALTER TABLE pay_receipt ADD COLUMN IF NOT EXISTS category VARCHAR(50) DEFAULT ''").catch(() => {})
     await client.query("ALTER TABLE collect_receipt ADD COLUMN IF NOT EXISTS category VARCHAR(50) DEFAULT ''").catch(() => {})
+    await client.query("ALTER TABLE purchase_order ADD COLUMN IF NOT EXISTS expense_amount DECIMAL(10,2) DEFAULT 0").catch(() => {})
+    // purchase_order 补加折扣/运费/分期字段
+    await client.query("ALTER TABLE purchase_order ADD COLUMN IF NOT EXISTS freight_bearer VARCHAR(20) DEFAULT 'buyer'").catch(() => {})
+    await client.query("ALTER TABLE purchase_order ADD COLUMN IF NOT EXISTS discount_type VARCHAR(20) DEFAULT 'none'").catch(() => {})
+    await client.query("ALTER TABLE purchase_order ADD COLUMN IF NOT EXISTS discount_value DECIMAL(10,2) DEFAULT 0").catch(() => {})
+    await client.query("ALTER TABLE purchase_order ADD COLUMN IF NOT EXISTS after_discount DECIMAL(10,2) DEFAULT 0").catch(() => {})
+    await client.query("ALTER TABLE purchase_order ADD COLUMN IF NOT EXISTS installment BOOLEAN DEFAULT FALSE").catch(() => {})
+    await client.query("ALTER TABLE purchase_order ADD COLUMN IF NOT EXISTS delivery_date DATE").catch(() => {})
+    await client.query("ALTER TABLE purchase_order ADD COLUMN IF NOT EXISTS need_invoice BOOLEAN DEFAULT FALSE").catch(() => {})
+    await client.query("ALTER TABLE purchase_order ADD COLUMN IF NOT EXISTS attachments_info JSONB DEFAULT '[]'").catch(() => {})
     console.log('Database initialized successfully')
   } finally {
     client.release()

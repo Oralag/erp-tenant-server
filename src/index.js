@@ -950,9 +950,46 @@ router.post('/stock/SaleOutOrder/audit', async (req, res) => {
   try {
     const { id, status } = req.body
     if (!id) return fail(res, 'id不能为空')
-    await pool.query('UPDATE sale_out_order SET status=$1 WHERE id=$2', [status ?? 1, id])
+    const newStatus = status ?? 1
+
+    const r = await pool.query('SELECT * FROM sale_out_order WHERE id=$1', [id])
+    const order = r.rows[0]
+    if (!order) return fail(res, '出库单不存在')
+    if (order.status === newStatus) return ok(res)
+
+    let goodsInfo = []
+    try { goodsInfo = typeof order.goods_info === 'string' ? JSON.parse(order.goods_info) : (order.goods_info || []) } catch {}
+
+    const warehouseId = order.warehouse_id || 0
+    const warehouseName = order.warehouse_name || ''
+    const orderNo = order.order_no || ''
+    const isAudit = newStatus === 1
+    const delta = isAudit ? -1 : 1  // 审核扣库存，反审核加回
+
+    for (const item of goodsInfo) {
+      const goodsId = item.goods_id || 0
+      if (!goodsId) continue
+      const num = parseFloat(item.num) || 0
+      if (num <= 0) continue
+      const change = num * delta
+
+      const existing = await pool.query('SELECT * FROM stock_inventory WHERE goods_id=$1 AND warehouse_id=$2', [goodsId, warehouseId])
+      let beforeQty = 0
+      if (existing.rows.length > 0) {
+        beforeQty = parseFloat(existing.rows[0].qty) || 0
+        const afterQty = Math.max(0, beforeQty + change)
+        await pool.query('UPDATE stock_inventory SET qty=$1, goods_name=$2, unit_name=$3, update_time=NOW() WHERE goods_id=$4 AND warehouse_id=$5',
+          [afterQty, item.goods_name || '', item.unit_name || '', goodsId, warehouseId])
+        const afterQtyR = await pool.query('SELECT qty FROM stock_inventory WHERE goods_id=$1 AND warehouse_id=$2', [goodsId, warehouseId])
+        const afterQty2 = afterQtyR.rows[0] ? parseFloat(afterQtyR.rows[0].qty) : 0
+        await pool.query('INSERT INTO stock_flow (goods_id, goods_name, warehouse_id, warehouse_name, type, qty, before_qty, after_qty, order_no, remark) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)',
+          [goodsId, item.goods_name || '', warehouseId, warehouseName, isAudit ? 'sale_out' : 'sale_out_reverse', change, beforeQty, afterQty2, orderNo, isAudit ? '销售出库审核' : '销售出库反审核'])
+      }
+    }
+
+    await pool.query('UPDATE sale_out_order SET status=$1 WHERE id=$2', [newStatus, id])
     return ok(res)
-  } catch (e) { fail(res, e.message) }
+  } catch (e) { console.error('[SaleOutOrder audit error]', e.message); fail(res, e.message) }
 })
 
 // SaleReturnOrder
@@ -983,10 +1020,50 @@ router.post('/stock/SaleReturnOrder/audit', async (req, res) => {
   try {
     const { id, status } = req.body
     if (!id) return fail(res, 'id不能为空')
-    await pool.query('UPDATE sale_return_order SET status=$1 WHERE id=$2', [status ?? 1, id])
+    const newStatus = status ?? 1
+
+    const r = await pool.query('SELECT * FROM sale_return_order WHERE id=$1', [id])
+    const order = r.rows[0]
+    if (!order) return fail(res, '退货单不存在')
+    if (order.status === newStatus) return ok(res)
+
+    let goodsInfo = []
+    try { goodsInfo = typeof order.goods_info === 'string' ? JSON.parse(order.goods_info) : (order.goods_info || []) } catch {}
+
+    const warehouseId = order.warehouse_id || 0
+    const warehouseName = order.warehouse_name || ''
+    const orderNo = order.order_no || ''
+    const isAudit = newStatus === 1
+    const delta = isAudit ? 1 : -1  // 审核加库存（退货入库），反审核扣回
+
+    for (const item of goodsInfo) {
+      const goodsId = item.goods_id || 0
+      if (!goodsId) continue
+      const num = parseFloat(item.num) || 0
+      if (num <= 0) continue
+      const change = num * delta
+
+      const existing = await pool.query('SELECT * FROM stock_inventory WHERE goods_id=$1 AND warehouse_id=$2', [goodsId, warehouseId])
+      let beforeQty = 0
+      if (existing.rows.length > 0) {
+        beforeQty = parseFloat(existing.rows[0].qty) || 0
+        const afterQty = Math.max(0, beforeQty + change)
+        await pool.query('UPDATE stock_inventory SET qty=$1, goods_name=$2, unit_name=$3, update_time=NOW() WHERE goods_id=$4 AND warehouse_id=$5',
+          [afterQty, item.goods_name || '', item.unit_name || '', goodsId, warehouseId])
+        await pool.query('INSERT INTO stock_flow (goods_id, goods_name, warehouse_id, warehouse_name, type, qty, before_qty, after_qty, order_no, remark) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)',
+          [goodsId, item.goods_name || '', warehouseId, warehouseName, isAudit ? 'sale_return' : 'sale_return_reverse', change, beforeQty, afterQty, orderNo, isAudit ? '销售退货审核' : '销售退货反审核'])
+      } else if (isAudit && warehouseId) {
+        await pool.query('INSERT INTO stock_inventory (goods_id, goods_name, goods_code, unit_name, warehouse_id, warehouse_name, qty) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+          [goodsId, item.goods_name || '', item.goods_sn || '', item.unit_name || '', warehouseId, warehouseName, num])
+        await pool.query('INSERT INTO stock_flow (goods_id, goods_name, warehouse_id, warehouse_name, type, qty, before_qty, after_qty, order_no, remark) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)',
+          [goodsId, item.goods_name || '', warehouseId, warehouseName, 'sale_return', num, 0, num, orderNo, '销售退货审核'])
+      }
+    }
+
+    await pool.query('UPDATE sale_return_order SET status=$1 WHERE id=$2', [newStatus, id])
     return ok(res)
-  } catch (e) { fail(res, e.message) }
-})
+  } catch (e) { console.error('[SaleReturnOrder audit error]', e.message); fail(res, e.message) }
+}))
 
 // StockAll (库存汇总)
 router.get('/stock/StockAll/index', async (req, res) => {

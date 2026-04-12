@@ -7,8 +7,7 @@ RUN apk add --no-cache \
   freetype \
   harfbuzz \
   ca-certificates \
-  ttf-freefont \
-  font-noto-cjk
+  ttf-freefont
 
 # Tell Remotion/Puppeteer to use system chromium instead of downloading its own
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true

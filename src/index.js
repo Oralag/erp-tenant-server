@@ -1146,9 +1146,64 @@ router.post('/stock/Allocation/audit', async (req, res) => {
   try {
     const { id, status } = req.body
     if (!id) return fail(res, 'id不能为空')
-    await pool.query('UPDATE stock_allocation SET status=$1 WHERE id=$2', [status, id])
+    const newStatus = status ?? 1
+
+    const r = await pool.query('SELECT * FROM stock_allocation WHERE id=$1', [id])
+    const order = r.rows[0]
+    if (!order) return fail(res, '调拨单不存在')
+    if (order.status === newStatus) return ok(res)
+
+    let goodsInfo = []
+    try { goodsInfo = typeof order.goods_info === 'string' ? JSON.parse(order.goods_info) : (order.goods_info || []) } catch {}
+
+    const fromId = order.from_warehouse_id || 0
+    const fromName = order.from_warehouse || ''
+    const toId = order.to_warehouse_id || 0
+    const toName = order.to_warehouse || ''
+    const transferNo = order.transfer_no || ''
+    const isAudit = newStatus === 1
+
+    for (const item of goodsInfo) {
+      const goodsId = item.goods_id || 0
+      if (!goodsId) continue
+      const num = parseFloat(item.num) || 0
+      if (num <= 0) continue
+
+      // 调出仓库：审核减库存，反审核加回
+      if (fromId) {
+        const ex = await pool.query('SELECT * FROM stock_inventory WHERE goods_id=$1 AND warehouse_id=$2', [goodsId, fromId])
+        let beforeQty = 0
+        if (ex.rows.length > 0) {
+          beforeQty = parseFloat(ex.rows[0].qty) || 0
+          const afterQty = isAudit ? Math.max(0, beforeQty - num) : beforeQty + num
+          await pool.query('UPDATE stock_inventory SET qty=$1, update_time=NOW() WHERE goods_id=$2 AND warehouse_id=$3', [afterQty, goodsId, fromId])
+          await pool.query('INSERT INTO stock_flow (goods_id, goods_name, warehouse_id, warehouse_name, type, qty, before_qty, after_qty, order_no, remark) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)',
+            [goodsId, item.goods_name || '', fromId, fromName, isAudit ? 'allot_out' : 'allot_out_reverse', isAudit ? -num : num, beforeQty, afterQty, transferNo, isAudit ? '调拨调出' : '调拨调出反审核'])
+        }
+      }
+
+      // 调入仓库：审核加库存，反审核减回
+      if (toId) {
+        const ex2 = await pool.query('SELECT * FROM stock_inventory WHERE goods_id=$1 AND warehouse_id=$2', [goodsId, toId])
+        let beforeQty2 = 0
+        if (ex2.rows.length > 0) {
+          beforeQty2 = parseFloat(ex2.rows[0].qty) || 0
+          const afterQty2 = isAudit ? beforeQty2 + num : Math.max(0, beforeQty2 - num)
+          await pool.query('UPDATE stock_inventory SET qty=$1, update_time=NOW() WHERE goods_id=$2 AND warehouse_id=$3', [afterQty2, goodsId, toId])
+          await pool.query('INSERT INTO stock_flow (goods_id, goods_name, warehouse_id, warehouse_name, type, qty, before_qty, after_qty, order_no, remark) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)',
+            [goodsId, item.goods_name || '', toId, toName, isAudit ? 'allot_in' : 'allot_in_reverse', isAudit ? num : -num, beforeQty2, isAudit ? beforeQty2 + num : Math.max(0, beforeQty2 - num), transferNo, isAudit ? '调拨调入' : '调拨调入反审核'])
+        } else if (isAudit) {
+          await pool.query('INSERT INTO stock_inventory (goods_id, goods_name, goods_code, unit_name, warehouse_id, warehouse_name, qty) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+            [goodsId, item.goods_name || '', item.goods_sn || '', item.unit_name || '', toId, toName, num])
+          await pool.query('INSERT INTO stock_flow (goods_id, goods_name, warehouse_id, warehouse_name, type, qty, before_qty, after_qty, order_no, remark) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)',
+            [goodsId, item.goods_name || '', toId, toName, 'allot_in', num, 0, num, transferNo, '调拨调入'])
+        }
+      }
+    }
+
+    await pool.query('UPDATE stock_allocation SET status=$1 WHERE id=$2', [newStatus, id])
     return ok(res)
-  } catch (e) { fail(res, e.message) }
+  } catch (e) { console.error('[Allocation audit error]', e.message); fail(res, e.message) }
 })
 router.post('/stock/Allocation/del', async (req, res) => {
   try {

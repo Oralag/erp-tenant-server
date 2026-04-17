@@ -229,6 +229,7 @@ async function initDb() {
     await client.query("ALTER TABLE purchase_order ADD COLUMN IF NOT EXISTS delivery_date DATE").catch(() => {})
     await client.query("ALTER TABLE purchase_order ADD COLUMN IF NOT EXISTS need_invoice BOOLEAN DEFAULT FALSE").catch(() => {})
     await client.query("ALTER TABLE purchase_order ADD COLUMN IF NOT EXISTS attachments_info JSONB DEFAULT '[]'").catch(() => {})
+    await client.query("ALTER TABLE purchase_order ADD COLUMN IF NOT EXISTS fee_items JSONB DEFAULT '[]'").catch(() => {})
     await client.query("ALTER TABLE contract_order ADD COLUMN IF NOT EXISTS expense_amount DECIMAL(10,2) DEFAULT 0").catch(() => {})
     console.log('Database initialized successfully')
   } finally {

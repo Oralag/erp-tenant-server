@@ -561,6 +561,15 @@ router.get('/shop/ContractOrder/index', async (req, res) => {
     await listQuery(res, 'sale_contracts', { keyword: req.query.keyword, keywordCols: ['order_no'], baseWhere: conditions.join(' AND '), orderBy: 'id DESC', page, list_rows, offset })
   } catch (e) { fail(res, e.message) }
 })
+router.get('/shop/ContractOrder/detail', async (req, res) => {
+  try {
+    const id = parseInt(req.query.id || 0)
+    if (!id) return fail(res, 'id不能为空')
+    const r = await pool.query('SELECT * FROM sale_contracts WHERE id=$1 AND deleted_at IS NULL LIMIT 1', [id])
+    if (!r.rows[0]) return fail(res, '合同不存在')
+    return ok(res, r.rows[0])
+  } catch (e) { fail(res, e.message) }
+})
 router.post('/shop/ContractOrder/add', async (req, res) => {
   try {
     const b = filterBodyCols('sale_contracts', { order_no: genOrderNo('XS'), order_sn: genOrderNo('XS'), ...req.body })
@@ -1063,6 +1072,304 @@ router.post('/stock/SaleReturnOrder/audit', async (req, res) => {
     await pool.query('UPDATE sale_return_order SET status=$1 WHERE id=$2', [newStatus, id])
     return ok(res)
   } catch (e) { console.error('[SaleReturnOrder audit error]', e.message); fail(res, e.message) }
+})
+
+// SampleOrder (样品管理)
+const SAMPLE_ALLOWED_COLS = new Set([
+  'sample_no','sample_type','customer_id','customer_name','contact_name','admin_name',
+  'sample_date','return_date','warehouse_id','warehouse_name','goods_info','sample_amount',
+  'freight_amount','freight_bearer','courier','tracking_no','receivable_amount',
+  'paid_amount','company_cost','receipt_fund_id','receipt_fund_name',
+  'expense_payment_status','expense_fund_id','expense_fund_name',
+  'other_out_id','receivable_id','receipt_id','expense_id',
+  'remark','status',
+])
+
+function parseGoodsInfo(value) {
+  if (Array.isArray(value)) return value
+  try { return JSON.parse(value || '[]') } catch { return [] }
+}
+
+function calcSampleAmounts(row, goodsInfo = parseGoodsInfo(row.goods_info)) {
+  const sampleType = row.sample_type || 'free'
+  const sampleAmount = sampleType === 'paid' ? Number(row.sample_amount || 0) : 0
+  const freightAmount = Number(row.freight_amount || 0)
+  const freightBearer = row.freight_bearer || 'seller'
+  const customerFreight = freightBearer === 'buyer' ? freightAmount : freightBearer === 'half' ? freightAmount / 2 : 0
+  const companyFreight = freightBearer === 'seller' ? freightAmount : freightBearer === 'half' ? freightAmount / 2 : 0
+  const itemCost = goodsInfo.reduce((sum, item) => {
+    const price = Number(item.cost_price ?? item.out_price ?? item.price ?? 0)
+    return sum + Number(item.num || 0) * price
+  }, 0)
+  const companySampleCost = sampleType === 'paid' ? 0 : itemCost
+  const receivableAmount = Math.max(0, sampleAmount + customerFreight)
+  const companyCost = Math.max(0, companySampleCost + companyFreight)
+  return { receivableAmount, companyCost }
+}
+
+async function applySampleStock(client, order, goodsInfo, direction) {
+  const warehouseId = Number(order.warehouse_id || 0)
+  const warehouseName = order.warehouse_name || ''
+  const orderNo = order.sample_no || ''
+  const isAudit = direction === 'audit'
+  const delta = isAudit ? -1 : 1
+  for (const item of goodsInfo) {
+    const goodsId = Number(item.goods_id || 0)
+    const num = Number(item.num || 0)
+    if (!goodsId || num <= 0) continue
+    const change = num * delta
+    const existing = await client.query('SELECT * FROM stock_inventory WHERE goods_id=$1 AND warehouse_id=$2', [goodsId, warehouseId])
+    if (!existing.rows.length) {
+      if (isAudit) {
+        await client.query(
+          'INSERT INTO stock_inventory (goods_id, goods_name, goods_code, unit_name, warehouse_id, warehouse_name, qty) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+          [goodsId, item.goods_name || '', item.goods_sn || '', item.unit_name || '', warehouseId, warehouseName, -num],
+        )
+        await client.query(
+          'INSERT INTO stock_flow (goods_id, goods_name, warehouse_id, warehouse_name, type, qty, before_qty, after_qty, order_no, remark) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)',
+          [goodsId, item.goods_name || '', warehouseId, warehouseName, 'sample_out', -num, 0, -num, orderNo, '样品出库审核'],
+        )
+      }
+      continue
+    }
+    const beforeQty = Number(existing.rows[0].qty || 0)
+    const afterQty = beforeQty + change
+    await client.query(
+      'UPDATE stock_inventory SET qty=$1, goods_name=$2, unit_name=$3, update_time=NOW() WHERE goods_id=$4 AND warehouse_id=$5',
+      [afterQty, item.goods_name || '', item.unit_name || '', goodsId, warehouseId],
+    )
+    await client.query(
+      'INSERT INTO stock_flow (goods_id, goods_name, warehouse_id, warehouse_name, type, qty, before_qty, after_qty, order_no, remark) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)',
+      [goodsId, item.goods_name || '', warehouseId, warehouseName, isAudit ? 'sample_out' : 'sample_out_reverse', change, beforeQty, afterQty, orderNo, isAudit ? '样品出库审核' : '样品出库反审核'],
+    )
+  }
+}
+
+router.get('/shop/SampleOrder/index', async (req, res) => {
+  try {
+    const { page, list_rows, offset } = pageParams(req.query)
+    const conditions = ['deleted_at IS NULL']
+    const params = []
+    if (req.query.status !== undefined && req.query.status !== '') {
+      params.push(Number(req.query.status))
+      conditions.push(`status=$${params.length}`)
+    }
+    if (req.query.sample_type) {
+      params.push(String(req.query.sample_type))
+      conditions.push(`sample_type=$${params.length}`)
+    }
+    if (req.query.customer_name) {
+      params.push(`%${String(req.query.customer_name)}%`)
+      conditions.push(`customer_name ILIKE $${params.length}`)
+    }
+    if (req.query.keyword) {
+      params.push(`%${String(req.query.keyword)}%`)
+      conditions.push(`(sample_no ILIKE $${params.length} OR customer_name ILIKE $${params.length} OR tracking_no ILIKE $${params.length})`)
+    }
+    const where = `WHERE ${conditions.join(' AND ')}`
+    const [countR, rowsR] = await Promise.all([
+      pool.query(`SELECT COUNT(*) FROM sale_samples ${where}`, params),
+      pool.query(`SELECT * FROM sale_samples ${where} ORDER BY id DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`, [...params, list_rows, offset]),
+    ])
+    return ok(res, { rows: rowsR.rows, total: parseInt(countR.rows[0].count), page, list_rows })
+  } catch (e) { fail(res, e.message) }
+})
+
+router.post('/shop/SampleOrder/add', async (req, res) => {
+  try {
+    const goodsInfo = parseGoodsInfo(req.body.goods_info)
+    const amounts = calcSampleAmounts(req.body, goodsInfo)
+    const body = {
+      sample_no: genOrderNo('YP'),
+      sample_date: new Date().toISOString().slice(0, 10),
+      ...req.body,
+      goods_info: JSON.stringify(goodsInfo),
+      receivable_amount: req.body.receivable_amount ?? amounts.receivableAmount,
+      company_cost: req.body.company_cost ?? amounts.companyCost,
+    }
+    const cols = Object.keys(body).filter(k => SAMPLE_ALLOWED_COLS.has(k) && body[k] !== undefined)
+    const vals = cols.map(k => body[k])
+    const r = await pool.query(`INSERT INTO sale_samples (${cols.join(',')}) VALUES (${cols.map((_, i) => `$${i + 1}`)}) RETURNING *`, vals)
+    return ok(res, r.rows[0])
+  } catch (e) { fail(res, e.message) }
+})
+
+router.post('/shop/SampleOrder/edit', async (req, res) => {
+  try {
+    const { id, ...rest } = req.body
+    if (!id) return fail(res, 'id不能为空')
+    const old = await pool.query('SELECT status FROM sale_samples WHERE id=$1 AND deleted_at IS NULL', [id])
+    if (!old.rows.length) return fail(res, '样品单不存在')
+    if (Number(old.rows[0].status) === 1) return fail(res, '已审核样品单不能编辑，请先反审核')
+    const goodsInfo = rest.goods_info !== undefined ? parseGoodsInfo(rest.goods_info) : undefined
+    const amounts = calcSampleAmounts({ ...rest, goods_info: goodsInfo || [] }, goodsInfo || [])
+    const body = {
+      ...rest,
+      ...(goodsInfo ? { goods_info: JSON.stringify(goodsInfo) } : {}),
+      ...(rest.receivable_amount === undefined ? { receivable_amount: amounts.receivableAmount } : {}),
+      ...(rest.company_cost === undefined ? { company_cost: amounts.companyCost } : {}),
+    }
+    const cols = Object.keys(body).filter(k => SAMPLE_ALLOWED_COLS.has(k) && body[k] !== undefined)
+    if (!cols.length) return fail(res, '无有效字段')
+    const vals = cols.map(k => body[k])
+    const sets = cols.map((k, i) => `${k}=$${i + 1}`).join(',')
+    const r = await pool.query(`UPDATE sale_samples SET ${sets}, updated_at=NOW() WHERE id=$${vals.length + 1} RETURNING *`, [...vals, id])
+    return ok(res, r.rows[0])
+  } catch (e) { fail(res, e.message) }
+})
+
+router.post('/shop/SampleOrder/del', async (req, res) => {
+  try {
+    const { id } = req.body
+    if (!id) return fail(res, 'id不能为空')
+    const r = await pool.query('SELECT status FROM sale_samples WHERE id=$1 AND deleted_at IS NULL', [id])
+    if (Number(r.rows[0]?.status) === 1) return fail(res, '请先反审核再删除')
+    await pool.query('UPDATE sale_samples SET deleted_at=NOW() WHERE id=$1', [id])
+    return ok(res)
+  } catch (e) { fail(res, e.message) }
+})
+
+router.post('/shop/SampleOrder/audit', async (req, res) => {
+  const client = await pool.connect()
+  try {
+    const { id, status } = req.body
+    if (!id) return fail(res, 'id不能为空')
+    const newStatus = status ?? 1
+    await client.query('BEGIN')
+    const r = await client.query('SELECT * FROM sale_samples WHERE id=$1 AND deleted_at IS NULL FOR UPDATE', [id])
+    const sample = r.rows[0]
+    if (!sample) throw new Error('样品单不存在')
+    if (Number(sample.status) === Number(newStatus)) {
+      await client.query('COMMIT')
+      return ok(res, sample)
+    }
+    if (Number(newStatus) === 1) {
+      const goodsInfo = parseGoodsInfo(sample.goods_info)
+      const amounts = calcSampleAmounts(sample, goodsInfo)
+      const otherOut = await client.query(
+        `INSERT INTO stock_other_out (order_no, warehouse_id, warehouse_name, goods_info, remark, status)
+         VALUES ($1,$2,$3,$4,$5,1) RETURNING *`,
+        [sample.sample_no, sample.warehouse_id || 0, sample.warehouse_name || '', JSON.stringify(goodsInfo), `样品出库：${sample.customer_name || sample.contact_name || ''}`,],
+      )
+      await applySampleStock(client, sample, goodsInfo, 'audit')
+
+      let receivableId = 0
+      let receiptId = 0
+      const receivableAmount = Number(sample.receivable_amount || amounts.receivableAmount || 0)
+      const paidAmount = Math.min(Number(sample.paid_amount || 0), receivableAmount)
+      const unpaidAmount = Math.max(0, receivableAmount - paidAmount)
+      if (paidAmount > 0 && !Number(sample.receipt_fund_id || 0)) {
+        throw new Error('已收金额大于0时必须选择收款账户')
+      }
+      if (receivableAmount > 0) {
+        const rec = await client.query(
+          `INSERT INTO finance_receivable (customer_id, customer_name, order_sn, total_amount, paid_amount, un_pay_amount, due_date, status)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+          [sample.customer_id || 0, sample.customer_name || '', sample.sample_no || '', receivableAmount, paidAmount, unpaidAmount, sample.sample_date || null, unpaidAmount > 0 ? 0 : 1],
+        )
+        receivableId = rec.rows[0].id
+      }
+      if (paidAmount > 0) {
+        const receipt = await client.query(
+          `INSERT INTO collect_receipt (receipt_no, order_sn, customer_id, customer_name, amount, receipt_date, pay_type, fund_id, fund_name, remark, status)
+           VALUES ($1,$2,$3,$4,$5,$6,'customer',$7,$8,$9,1) RETURNING *`,
+          [
+            genOrderNo('SK'),
+            sample.sample_no || '',
+            sample.customer_id || 0,
+            sample.customer_name || '',
+            paidAmount,
+            sample.sample_date || null,
+            Number(sample.receipt_fund_id || 0),
+            sample.receipt_fund_name || '',
+            '样品单收款自动生成',
+          ],
+        )
+        receiptId = receipt.rows[0].id
+        await client.query(
+          'UPDATE finance_funds SET balance=balance+$1, update_time=NOW() WHERE id=$2',
+          [paidAmount, Number(sample.receipt_fund_id || 0)],
+        )
+      }
+
+      let expenseId = 0
+      const companyCost = Number(sample.company_cost || amounts.companyCost || 0)
+      if (companyCost > 0) {
+        const expensePaid = (sample.expense_payment_status || 'pending') === 'paid'
+        if (expensePaid && !Number(sample.expense_fund_id || 0)) {
+          throw new Error('公司费用选择已付款时必须选择付款账户')
+        }
+        const expenseRemark = `${expensePaid ? '【已付款】' : '【待付款】'} 样品单 ${sample.sample_no} 自动生成`
+        const exp = await client.query(
+          `INSERT INTO finance_expenses (expense_no, name, amount, expense_date, fund_id, fund_name, remark, status)
+           VALUES ($1,'样品费用',$2,$3,$4,$5,$6,1) RETURNING *`,
+          [
+            genOrderNo('FY'),
+            companyCost,
+            sample.sample_date || null,
+            expensePaid ? Number(sample.expense_fund_id || 0) : 0,
+            expensePaid ? (sample.expense_fund_name || '') : '',
+            expenseRemark,
+          ],
+        )
+        expenseId = exp.rows[0].id
+        if (expensePaid) {
+          await client.query(
+            'UPDATE finance_funds SET balance=balance-$1, update_time=NOW() WHERE id=$2',
+            [companyCost, Number(sample.expense_fund_id || 0)],
+          )
+        }
+      }
+      const updated = await client.query(
+        `UPDATE sale_samples
+         SET status=1, other_out_id=$1, receivable_id=$2, receipt_id=$3, expense_id=$4,
+             receivable_amount=$5, company_cost=$6, updated_at=NOW()
+         WHERE id=$7 RETURNING *`,
+        [otherOut.rows[0].id, receivableId, receiptId, expenseId, receivableAmount, companyCost, id],
+      )
+      await client.query('COMMIT')
+      return ok(res, updated.rows[0])
+    }
+
+    if (Number(newStatus) === 0 && Number(sample.status) === 1) {
+      const goodsInfo = parseGoodsInfo(sample.goods_info)
+      await applySampleStock(client, sample, goodsInfo, 'reverse')
+      if (sample.other_out_id) await client.query('UPDATE stock_other_out SET status=0 WHERE id=$1', [sample.other_out_id])
+      if (sample.receivable_id) await client.query('DELETE FROM finance_receivable WHERE id=$1', [sample.receivable_id])
+      if (sample.receipt_id) {
+        const receipt = await client.query('SELECT amount, fund_id FROM collect_receipt WHERE id=$1', [sample.receipt_id])
+        await client.query('UPDATE collect_receipt SET deleted_at=NOW() WHERE id=$1', [sample.receipt_id])
+        if (receipt.rows[0]?.fund_id && Number(receipt.rows[0]?.amount)) {
+          await client.query('UPDATE finance_funds SET balance=balance-$1, update_time=NOW() WHERE id=$2', [Number(receipt.rows[0].amount), receipt.rows[0].fund_id])
+        }
+      }
+      if (sample.expense_id) {
+        const expense = await client.query('SELECT amount, fund_id FROM finance_expenses WHERE id=$1', [sample.expense_id])
+        await client.query('DELETE FROM finance_expenses WHERE id=$1', [sample.expense_id])
+        if (expense.rows[0]?.fund_id && Number(expense.rows[0]?.amount)) {
+          await client.query('UPDATE finance_funds SET balance=balance+$1, update_time=NOW() WHERE id=$2', [Number(expense.rows[0].amount), expense.rows[0].fund_id])
+        }
+      }
+      const updated = await client.query(
+        `UPDATE sale_samples
+         SET status=0, other_out_id=0, receivable_id=0, receipt_id=0, expense_id=0, updated_at=NOW()
+         WHERE id=$1 RETURNING *`,
+        [id],
+      )
+      await client.query('COMMIT')
+      return ok(res, updated.rows[0])
+    }
+
+    const updated = await client.query('UPDATE sale_samples SET status=$1, updated_at=NOW() WHERE id=$2 RETURNING *', [newStatus, id])
+    await client.query('COMMIT')
+    return ok(res, updated.rows[0])
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    console.error('[SampleOrder audit error]', e.message)
+    fail(res, e.message)
+  } finally {
+    client.release()
+  }
 })
 
 // StockAll (库存汇总)
@@ -2777,4 +3084,3 @@ router.post('/goods/BomGoods/del', async (req, res) => {
 })
 
 start()
-

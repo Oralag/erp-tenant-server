@@ -3083,4 +3083,52 @@ router.post('/goods/BomGoods/del', async (req, res) => {
   } catch (e) { fail(res, e.message) }
 })
 
+// ── 临时数据库迁移路由（使用后请删除） ─────────────────────────────────────────
+router.get('/admin/migrate-2026-05', async (req, res) => {
+  const secret = req.query.secret
+  if (secret !== 'migrate_nomad_2026') return res.status(403).json({error: 'forbidden'})
+  try {
+    const migrations = [
+      // sale_contracts 扩展字段
+      `ALTER TABLE sale_contracts ADD COLUMN IF NOT EXISTS discount_type VARCHAR(20) DEFAULT 'none'`,
+      `ALTER TABLE sale_contracts ADD COLUMN IF NOT EXISTS discount_value DECIMAL(10,2) DEFAULT 0`,
+      `ALTER TABLE sale_contracts ADD COLUMN IF NOT EXISTS after_discount DECIMAL(10,2) DEFAULT 0`,
+      `ALTER TABLE sale_contracts ADD COLUMN IF NOT EXISTS freight_amount DECIMAL(10,2) DEFAULT 0`,
+      `ALTER TABLE sale_contracts ADD COLUMN IF NOT EXISTS freight_bearer VARCHAR(20) DEFAULT 'seller'`,
+      `ALTER TABLE sale_contracts ADD COLUMN IF NOT EXISTS income_amount DECIMAL(10,2) DEFAULT 0`,
+      `ALTER TABLE sale_contracts ADD COLUMN IF NOT EXISTS receive_amount DECIMAL(10,2) DEFAULT 0`,
+      `ALTER TABLE sale_contracts ADD COLUMN IF NOT EXISTS receive_account VARCHAR(100) DEFAULT ''`,
+      `ALTER TABLE sale_contracts ADD COLUMN IF NOT EXISTS prepay_amount DECIMAL(10,2) DEFAULT 0`,
+      `ALTER TABLE sale_contracts ADD COLUMN IF NOT EXISTS expense_amount DECIMAL(10,2) DEFAULT 0`,
+      `ALTER TABLE sale_contracts ADD COLUMN IF NOT EXISTS installment INT DEFAULT 0`,
+      `ALTER TABLE sale_contracts ADD COLUMN IF NOT EXISTS sign_date DATE`,
+      `ALTER TABLE sale_contracts ADD COLUMN IF NOT EXISTS expire_date DATE`,
+      `ALTER TABLE sale_contracts ADD COLUMN IF NOT EXISTS need_invoice INT DEFAULT 0`,
+      `ALTER TABLE sale_contracts ADD COLUMN IF NOT EXISTS commission_rate DECIMAL(5,2) DEFAULT 0`,
+      `ALTER TABLE sale_contracts ADD COLUMN IF NOT EXISTS fee_items TEXT DEFAULT '[]'`,
+      `ALTER TABLE sale_contracts ADD COLUMN IF NOT EXISTS level_id INT`,
+      `ALTER TABLE sale_contracts ADD COLUMN IF NOT EXISTS admin_id INT`,
+    ]
+    const results = []
+    for (const sql of migrations) {
+      try {
+        await pool.query(sql)
+        results.push({ sql: sql.slice(0,60), status: 'ok' })
+      } catch(e) {
+        results.push({ sql: sql.slice(0,60), status: 'error', msg: e.message })
+      }
+    }
+    // Refresh tableColsCache
+    const r = await pool.query(`SELECT table_name, column_name FROM information_schema.columns WHERE table_schema='public'`)
+    r.rows.forEach(({ table_name, column_name }) => {
+      if (!tableColsCache[table_name]) tableColsCache[table_name] = new Set()
+      tableColsCache[table_name].add(column_name)
+    })
+    return res.json({ ok: true, results })
+  } catch(e) {
+    return res.status(500).json({ error: e.message })
+  }
+})
+
+
 start()

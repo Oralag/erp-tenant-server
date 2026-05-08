@@ -1107,6 +1107,50 @@ function calcSampleAmounts(row, goodsInfo = parseGoodsInfo(row.goods_info)) {
   return { receivableAmount, companyCost }
 }
 
+let sampleTableReady = false
+async function ensureSaleSamplesTable() {
+  if (sampleTableReady) return
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS sale_samples (
+      id SERIAL PRIMARY KEY,
+      sample_no VARCHAR(100) DEFAULT '',
+      sample_type VARCHAR(20) DEFAULT 'free',
+      customer_id INT DEFAULT 0,
+      customer_name VARCHAR(200) DEFAULT '',
+      contact_name VARCHAR(100) DEFAULT '',
+      admin_name VARCHAR(100) DEFAULT '',
+      sample_date DATE,
+      return_date DATE,
+      warehouse_id INT DEFAULT 0,
+      warehouse_name VARCHAR(100) DEFAULT '',
+      goods_info JSONB DEFAULT '[]',
+      sample_amount DECIMAL(10,2) DEFAULT 0,
+      freight_amount DECIMAL(10,2) DEFAULT 0,
+      freight_bearer VARCHAR(20) DEFAULT 'seller',
+      courier VARCHAR(100) DEFAULT '',
+      tracking_no VARCHAR(100) DEFAULT '',
+      receivable_amount DECIMAL(10,2) DEFAULT 0,
+      paid_amount DECIMAL(10,2) DEFAULT 0,
+      company_cost DECIMAL(10,2) DEFAULT 0,
+      receipt_fund_id INT DEFAULT 0,
+      receipt_fund_name VARCHAR(100) DEFAULT '',
+      expense_payment_status VARCHAR(20) DEFAULT 'pending',
+      expense_fund_id INT DEFAULT 0,
+      expense_fund_name VARCHAR(100) DEFAULT '',
+      other_out_id INT DEFAULT 0,
+      receivable_id INT DEFAULT 0,
+      receipt_id INT DEFAULT 0,
+      expense_id INT DEFAULT 0,
+      remark TEXT DEFAULT '',
+      status INT DEFAULT 0,
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW(),
+      deleted_at TIMESTAMP
+    );
+  `)
+  sampleTableReady = true
+}
+
 async function applySampleStock(client, order, goodsInfo, direction) {
   const warehouseId = Number(order.warehouse_id || 0)
   const warehouseName = order.warehouse_name || ''
@@ -1147,6 +1191,7 @@ async function applySampleStock(client, order, goodsInfo, direction) {
 
 router.get('/shop/SampleOrder/index', async (req, res) => {
   try {
+    await ensureSaleSamplesTable()
     const { page, list_rows, offset } = pageParams(req.query)
     const conditions = ['deleted_at IS NULL']
     const params = []
@@ -1177,6 +1222,7 @@ router.get('/shop/SampleOrder/index', async (req, res) => {
 
 router.post('/shop/SampleOrder/add', async (req, res) => {
   try {
+    await ensureSaleSamplesTable()
     const goodsInfo = parseGoodsInfo(req.body.goods_info)
     const amounts = calcSampleAmounts(req.body, goodsInfo)
     const body = {
@@ -1196,6 +1242,7 @@ router.post('/shop/SampleOrder/add', async (req, res) => {
 
 router.post('/shop/SampleOrder/edit', async (req, res) => {
   try {
+    await ensureSaleSamplesTable()
     const { id, ...rest } = req.body
     if (!id) return fail(res, 'id不能为空')
     const old = await pool.query('SELECT status FROM sale_samples WHERE id=$1 AND deleted_at IS NULL', [id])
@@ -1220,6 +1267,7 @@ router.post('/shop/SampleOrder/edit', async (req, res) => {
 
 router.post('/shop/SampleOrder/del', async (req, res) => {
   try {
+    await ensureSaleSamplesTable()
     const { id } = req.body
     if (!id) return fail(res, 'id不能为空')
     const r = await pool.query('SELECT status FROM sale_samples WHERE id=$1 AND deleted_at IS NULL', [id])
@@ -1232,6 +1280,7 @@ router.post('/shop/SampleOrder/del', async (req, res) => {
 router.post('/shop/SampleOrder/audit', async (req, res) => {
   const client = await pool.connect()
   try {
+    await ensureSaleSamplesTable()
     const { id, status } = req.body
     if (!id) return fail(res, 'id不能为空')
     const newStatus = status ?? 1

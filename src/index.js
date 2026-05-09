@@ -1107,6 +1107,32 @@ function calcSampleAmounts(row, goodsInfo = parseGoodsInfo(row.goods_info)) {
   return { receivableAmount, companyCost }
 }
 
+function normalizeSampleBody(body = {}) {
+  const normalized = { ...body }
+  const intFields = [
+    'id',
+    'customer_id',
+    'warehouse_id',
+    'receipt_fund_id',
+    'expense_fund_id',
+    'other_out_id',
+    'receivable_id',
+    'receipt_id',
+    'expense_id',
+    'status',
+  ]
+  for (const field of intFields) {
+    const value = normalized[field]
+    if (value === '' || value === null || value === undefined) {
+      normalized[field] = field === 'id' ? value : 0
+      continue
+    }
+    const num = Number(value)
+    if (!Number.isNaN(num)) normalized[field] = num
+  }
+  return normalized
+}
+
 let sampleTableReady = false
 async function ensureSaleSamplesTable() {
   if (sampleTableReady) return
@@ -1223,15 +1249,16 @@ router.get('/shop/SampleOrder/index', async (req, res) => {
 router.post('/shop/SampleOrder/add', async (req, res) => {
   try {
     await ensureSaleSamplesTable()
-    const goodsInfo = parseGoodsInfo(req.body.goods_info)
-    const amounts = calcSampleAmounts(req.body, goodsInfo)
+    const normalizedBody = normalizeSampleBody(req.body)
+    const goodsInfo = parseGoodsInfo(normalizedBody.goods_info)
+    const amounts = calcSampleAmounts(normalizedBody, goodsInfo)
     const body = {
       sample_no: genOrderNo('YP'),
       sample_date: new Date().toISOString().slice(0, 10),
-      ...req.body,
+      ...normalizedBody,
       goods_info: JSON.stringify(goodsInfo),
-      receivable_amount: req.body.receivable_amount ?? amounts.receivableAmount,
-      company_cost: req.body.company_cost ?? amounts.companyCost,
+      receivable_amount: normalizedBody.receivable_amount ?? amounts.receivableAmount,
+      company_cost: normalizedBody.company_cost ?? amounts.companyCost,
     }
     const cols = Object.keys(body).filter(k => SAMPLE_ALLOWED_COLS.has(k) && body[k] !== undefined)
     const vals = cols.map(k => body[k])
@@ -1243,7 +1270,7 @@ router.post('/shop/SampleOrder/add', async (req, res) => {
 router.post('/shop/SampleOrder/edit', async (req, res) => {
   try {
     await ensureSaleSamplesTable()
-    const { id, ...rest } = req.body
+    const { id, ...rest } = normalizeSampleBody(req.body)
     if (!id) return fail(res, 'id不能为空')
     const old = await pool.query('SELECT status FROM sale_samples WHERE id=$1 AND deleted_at IS NULL', [id])
     if (!old.rows.length) return fail(res, '样品单不存在')

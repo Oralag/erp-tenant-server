@@ -112,7 +112,15 @@ app.post('/adminapi/login/account', async (req, res) => {
   try {
     const { account, password } = req.body
     if (!account || !password) return fail(res, '账号和密码不能为空')
-    const result = await pool.query('SELECT * FROM admins WHERE account=$1 AND deleted_at IS NULL', [account])
+    const normalizedAccount = String(account).trim()
+    const result = await pool.query(
+      `SELECT *
+       FROM admins
+       WHERE (account=$1 OR mobile=$1) AND deleted_at IS NULL
+       ORDER BY CASE WHEN account=$1 THEN 0 ELSE 1 END, id ASC
+       LIMIT 1`,
+      [normalizedAccount],
+    )
     const user = result.rows[0]
     if (!user) return fail(res, '账号不存在')
     // support plain-text legacy passwords and bcrypt

@@ -2457,6 +2457,26 @@ router.post('/retail/order/add', async (req, res) => {
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })
+router.post('/retail/order/edit', async (req, res) => {
+  try {
+    const { id, goods_info, order_date, member_id, member_name, store_id, store_name, pay_type, remark, total_amount, discount_amount, pay_amount } = req.body
+    if (!id) return fail(res, '缺少零售单 ID')
+    if (!goods_info) return fail(res, '缺少 goods_info')
+    const row = await pool.query('SELECT status FROM retail_orders WHERE id=$1', [id])
+    if (!row.rows.length) return fail(res, '订单不存在')
+    if (Number(row.rows[0].status) === 1) return fail(res, '已审核订单不可编辑，请先反审核')
+    const goodsStr = typeof goods_info === 'string' ? goods_info : JSON.stringify(goods_info)
+    await pool.query(
+      `UPDATE retail_orders SET goods_info=$1, total_amount=$2, discount_amount=$3, pay_amount=$4,
+       order_date=$5, member_id=$6, member_name=$7, store_id=$8, store_name=$9, pay_type=$10, remark=$11
+       WHERE id=$12`,
+      [goodsStr, total_amount??0, discount_amount??0, pay_amount??0,
+       order_date||null, member_id||0, member_name||'', store_id||0, store_name||'', pay_type||'cash', remark||'', id]
+    )
+    const r = await pool.query('SELECT * FROM retail_orders WHERE id=$1', [id])
+    return ok(res, r.rows[0])
+  } catch (e) { fail(res, e.message) }
+})
 router.post('/retail/order/audit', async (req, res) => {
   try {
     const { id, status } = req.body

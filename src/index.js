@@ -1614,6 +1614,37 @@ router.post('/stock/OtherOut/add', async (req, res) => {
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })
+// 撤销出库单：直接恢复库存 + 删除所有相关流水 + 删除单据，不产生任何新流水记录
+router.post('/stock/OtherOut/annul', async (req, res) => {
+  try {
+    const { id } = req.body
+    if (!id) return fail(res, 'id不能为空')
+    const r = await pool.query('SELECT * FROM stock_other_out WHERE id=$1', [id])
+    const order = r.rows[0]
+    if (!order) return ok(res) // 已不存在，幂等
+    let goodsInfo = []
+    try { goodsInfo = typeof order.goods_info === 'string' ? JSON.parse(order.goods_info) : (order.goods_info || []) } catch {}
+    const warehouseId = order.warehouse_id || 0
+    const orderNo = order.order_no || ''
+    // 若已审核，直接加回库存（不走 audit 接口，避免产生反向流水）
+    if (Number(order.status) === 1) {
+      for (const item of goodsInfo) {
+        const goodsId = item.goods_id || 0
+        const num = parseFloat(item.num) || 0
+        if (!goodsId || num <= 0) continue
+        await pool.query(
+          'UPDATE stock_inventory SET qty=qty+$1, update_time=NOW() WHERE goods_id=$2 AND warehouse_id=$3',
+          [num, goodsId, warehouseId]
+        )
+      }
+    }
+    // 删除所有关联流水（order_no 匹配）
+    if (orderNo) await pool.query('DELETE FROM stock_flow WHERE order_no=$1', [orderNo])
+    // 删除单据
+    await pool.query('DELETE FROM stock_other_out WHERE id=$1', [id])
+    return ok(res)
+  } catch (e) { fail(res, e.message) }
+})
 router.post('/stock/OtherOut/del', async (req, res) => {
   try {
     const { id } = req.body

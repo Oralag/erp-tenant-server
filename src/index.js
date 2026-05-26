@@ -3218,5 +3218,188 @@ router.post('/goods/BomGoods/del', async (req, res) => {
   } catch (e) { fail(res, e.message) }
 })
 
+// ─── 小程序 miniapi ───────────────────────────────────────────────────────────
+
+const MINI_JWT_SECRET = process.env.MINI_JWT_SECRET || 'mini_secret_2024'
+const WX_APPID = process.env.WX_APPID || ''
+const WX_SECRET = process.env.WX_SECRET || ''
+const WX_MCH_ID = process.env.WX_MCH_ID || ''
+
+function miniAuth(req, res, next) {
+  const token = req.headers['mini-token']
+  if (!token) return fail(res, '请先登录', 401)
+  try {
+    const decoded = jwt.verify(token, MINI_JWT_SECRET)
+    req.miniUser = decoded
+    next()
+  } catch {
+    return fail(res, 'token无效或已过期', 401)
+  }
+}
+
+// 微信code换openid
+app.post('/miniapi/auth/wxLogin', async (req, res) => {
+  try {
+    const { code } = req.body
+    if (!code) return fail(res, 'code不能为空')
+    const https = require('https')
+    const wxRes = await new Promise((resolve, reject) => {
+      const url = `https://api.weixin.qq.com/sns/jscode2session?appid=${WX_APPID}&secret=${WX_SECRET}&js_code=${code}&grant_type=authorization_code`
+      https.get(url, (r) => {
+        let data = ''
+        r.on('data', d => data += d)
+        r.on('end', () => resolve(JSON.parse(data)))
+      }).on('error', reject)
+    })
+    if (wxRes.errcode) return fail(res, wxRes.errmsg || '微信登录失败')
+    const { openid } = wxRes
+    const found = await pool.query(`SELECT * FROM mini_users WHERE openid=$1 AND deleted_at IS NULL LIMIT 1`, [openid])
+    if (found.rows.length > 0) {
+      const user = found.rows[0]
+      const token = jwt.sign({ id: user.id, openid, phone: user.phone }, MINI_JWT_SECRET, { expiresIn: '30d' })
+      return ok(res, { token, user: { id: user.id, name: user.name, phone: user.phone } })
+    }
+    return ok(res, { openid })
+  } catch (e) { fail(res, e.message) }
+})
+
+// 绑定手机号
+app.post('/miniapi/auth/bindPhone', async (req, res) => {
+  try {
+    const { phone, code, openid } = req.body
+    if (!phone || !openid) return fail(res, '参数缺失')
+    let user = (await pool.query(`SELECT * FROM mini_users WHERE phone=$1 AND deleted_at IS NULL LIMIT 1`, [phone])).rows[0]
+    if (!user) {
+      const ins = await pool.query(
+        `INSERT INTO mini_users (openid, phone, name, created_at) VALUES ($1,$2,$3,NOW()) RETURNING *`,
+        [openid, phone, phone]
+      )
+      user = ins.rows[0]
+      await pool.query(
+        `INSERT INTO shop_customer (name, mobile, source, created_at) VALUES ($1,$2,'小程序',NOW()) ON CONFLICT DO NOTHING`,
+        [phone, phone]
+      ).catch(() => {})
+    }
+    const token = jwt.sign({ id: user.id, openid, phone: user.phone }, MINI_JWT_SECRET, { expiresIn: '30d' })
+    return ok(res, { token, user: { id: user.id, name: user.name, phone: user.phone } })
+  } catch (e) { fail(res, e.message) }
+})
+
+// 商品分类
+app.get('/miniapi/goods/categories', async (req, res) => {
+  try {
+    const r = await pool.query(`SELECT id, name FROM goods_category WHERE deleted_at IS NULL ORDER BY sort ASC, id ASC LIMIT 20`)
+    return ok(res, r.rows)
+  } catch (e) { fail(res, e.message) }
+})
+
+// 商品列表
+app.get('/miniapi/goods/list', async (req, res) => {
+  try {
+    const { page = 1, list_rows = 10, category_id, keyword } = req.query
+    const offset = (parseInt(page) - 1) * parseInt(list_rows)
+    const params = []
+    let where = `WHERE g.deleted_at IS NULL`
+    if (category_id) { params.push(category_id); where += ` AND g.category_id=$${params.length}` }
+    if (keyword) { params.push(`%${keyword}%`); where += ` AND g.name ILIKE $${params.length}` }
+    const total = (await pool.query(`SELECT COUNT(*) FROM shop_goods g ${where}`, params)).rows[0].count
+    params.push(parseInt(list_rows), offset)
+    const rows = (await pool.query(
+      `SELECT id, name, image_url, sale_price, price, unit, spec, barcode FROM shop_goods g ${where} ORDER BY id DESC LIMIT $${params.length-1} OFFSET $${params.length}`,
+      params
+    )).rows
+    return ok(res, { rows, total: parseInt(total), page: parseInt(page), list_rows: parseInt(list_rows) })
+  } catch (e) { fail(res, e.message) }
+})
+
+// 商品详情
+app.get('/miniapi/goods/detail/:id', async (req, res) => {
+  try {
+    const r = await pool.query(`SELECT * FROM shop_goods WHERE id=$1 AND deleted_at IS NULL LIMIT 1`, [req.params.id])
+    if (!r.rows[0]) return fail(res, '商品不存在')
+    const goods = r.rows[0]
+    const stock = await pool.query(`SELECT COALESCE(SUM(num),0) as total FROM stock_all WHERE goods_id=$1`, [goods.id])
+    goods.stock = parseInt(stock.rows[0].total)
+    const specs = await pool.query(`SELECT name FROM goods_spec WHERE goods_id=$1 AND deleted_at IS NULL`, [goods.id]).catch(() => ({ rows: [] }))
+    goods.specs = specs.rows
+    return ok(res, goods)
+  } catch (e) { fail(res, e.message) }
+})
+
+// 创建订单
+app.post('/miniapi/order/create', miniAuth, async (req, res) => {
+  try {
+    const { items, address, remark, total } = req.body
+    if (!items || items.length === 0) return fail(res, '订单不能为空')
+    const orderNo = genOrderNo('MP')
+    const r = await pool.query(
+      `INSERT INTO mini_orders (order_no, user_id, total, address, remark, status, created_at) VALUES ($1,$2,$3,$4,$5,0,NOW()) RETURNING *`,
+      [orderNo, req.miniUser.id, total, JSON.stringify(address || {}), remark || '']
+    )
+    const order = r.rows[0]
+    for (const item of items) {
+      await pool.query(
+        `INSERT INTO mini_order_items (order_id, goods_id, goods_name, spec, price, qty) VALUES ($1,$2,$3,$4,$5,$6)`,
+        [order.id, item.goods_id, item.goods_name, item.spec || '', item.price, item.qty]
+      )
+    }
+    return ok(res, { id: order.id, order_no: order.order_no })
+  } catch (e) { fail(res, e.message) }
+})
+
+// 订单列表
+app.get('/miniapi/order/list', miniAuth, async (req, res) => {
+  try {
+    const { page = 1, list_rows = 20 } = req.query
+    const offset = (parseInt(page) - 1) * parseInt(list_rows)
+    const total = (await pool.query(`SELECT COUNT(*) FROM mini_orders WHERE user_id=$1 AND deleted_at IS NULL`, [req.miniUser.id])).rows[0].count
+    const rows = (await pool.query(
+      `SELECT * FROM mini_orders WHERE user_id=$1 AND deleted_at IS NULL ORDER BY id DESC LIMIT $2 OFFSET $3`,
+      [req.miniUser.id, parseInt(list_rows), offset]
+    )).rows
+    for (const o of rows) {
+      o.items = (await pool.query(`SELECT * FROM mini_order_items WHERE order_id=$1`, [o.id])).rows
+    }
+    return ok(res, { rows, total: parseInt(total) })
+  } catch (e) { fail(res, e.message) }
+})
+
+// 订单详情
+app.get('/miniapi/order/detail/:id', miniAuth, async (req, res) => {
+  try {
+    const r = await pool.query(`SELECT * FROM mini_orders WHERE id=$1 AND user_id=$2 LIMIT 1`, [req.params.id, req.miniUser.id])
+    if (!r.rows[0]) return fail(res, '订单不存在')
+    const order = r.rows[0]
+    order.items = (await pool.query(`SELECT * FROM mini_order_items WHERE order_id=$1`, [order.id])).rows
+    order.address = typeof order.address === 'string' ? JSON.parse(order.address) : (order.address || {})
+    return ok(res, order)
+  } catch (e) { fail(res, e.message) }
+})
+
+// 发起微信支付
+app.post('/miniapi/pay/unified', miniAuth, async (req, res) => {
+  try {
+    const { orderId } = req.body
+    const r = await pool.query(`SELECT * FROM mini_orders WHERE id=$1 AND user_id=$2 LIMIT 1`, [orderId, req.miniUser.id])
+    if (!r.rows[0]) return fail(res, '订单不存在')
+    const order = r.rows[0]
+    if (order.status !== 0) return fail(res, '订单已支付')
+    // TODO: 接入真实微信支付签名（需 WX_MCH_ID + WX_MCH_KEY）
+    return ok(res, { timeStamp: String(Math.floor(Date.now()/1000)), nonceStr: Math.random().toString(36).slice(2), package: `prepay_id=mock_${order.order_no}`, signType: 'MD5', paySign: 'mock' })
+  } catch (e) { fail(res, e.message) }
+})
+
+// 支付回调
+app.post('/miniapi/pay/notify', async (req, res) => {
+  try {
+    const outTradeNo = (req.body && req.body.out_trade_no) || ''
+    if (outTradeNo) {
+      await pool.query(`UPDATE mini_orders SET status=1, paid_at=NOW() WHERE order_no=$1`, [outTradeNo])
+    }
+    res.send('<xml><return_code><![CDATA[SUCCESS]]></return_code></xml>')
+  } catch {
+    res.send('<xml><return_code><![CDATA[FAIL]]></return_code></xml>')
+  }
+})
 
 start()

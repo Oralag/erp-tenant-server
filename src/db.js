@@ -125,6 +125,42 @@ async function initDb() {
       CREATE TABLE IF NOT EXISTS sale_offers (id SERIAL PRIMARY KEY, order_no VARCHAR(100) DEFAULT '', customer_id INT DEFAULT 0, customer_name VARCHAR(200) DEFAULT '', admin_name VARCHAR(100) DEFAULT '', offer_date DATE, total_amount DECIMAL(10,2) DEFAULT 0, goods_info JSONB DEFAULT '[]', remark TEXT DEFAULT '', status INT DEFAULT 0, created_at TIMESTAMP DEFAULT NOW(), deleted_at TIMESTAMP);
       CREATE TABLE IF NOT EXISTS sale_out_order (id SERIAL PRIMARY KEY, order_no VARCHAR(100) DEFAULT '', order_sn VARCHAR(100) DEFAULT '', customer_id INT DEFAULT 0, customer_name VARCHAR(200) DEFAULT '', admin_name VARCHAR(100) DEFAULT '', out_date DATE, total_amount DECIMAL(10,2) DEFAULT 0, goods_info JSONB DEFAULT '[]', remark TEXT DEFAULT '', status INT DEFAULT 0, warehouse_id INT DEFAULT 0, warehouse_name VARCHAR(100) DEFAULT '', created_at TIMESTAMP DEFAULT NOW(), deleted_at TIMESTAMP);
       CREATE TABLE IF NOT EXISTS sale_return_order (id SERIAL PRIMARY KEY, order_no VARCHAR(100) DEFAULT '', customer_id INT DEFAULT 0, customer_name VARCHAR(200) DEFAULT '', return_date DATE, goods_info JSONB DEFAULT '[]', remark TEXT DEFAULT '', status INT DEFAULT 0, warehouse_id INT DEFAULT 0, warehouse_name VARCHAR(100) DEFAULT '', created_at TIMESTAMP DEFAULT NOW(), deleted_at TIMESTAMP);
+      CREATE TABLE IF NOT EXISTS sale_samples (
+        id SERIAL PRIMARY KEY,
+        sample_no VARCHAR(100) DEFAULT '',
+        sample_type VARCHAR(20) DEFAULT 'free',
+        customer_id INT DEFAULT 0,
+        customer_name VARCHAR(200) DEFAULT '',
+        contact_name VARCHAR(100) DEFAULT '',
+        admin_name VARCHAR(100) DEFAULT '',
+        sample_date DATE,
+        return_date DATE,
+        warehouse_id INT DEFAULT 0,
+        warehouse_name VARCHAR(100) DEFAULT '',
+        goods_info JSONB DEFAULT '[]',
+        sample_amount DECIMAL(10,2) DEFAULT 0,
+        freight_amount DECIMAL(10,2) DEFAULT 0,
+        freight_bearer VARCHAR(20) DEFAULT 'seller',
+        courier VARCHAR(100) DEFAULT '',
+        tracking_no VARCHAR(100) DEFAULT '',
+        receivable_amount DECIMAL(10,2) DEFAULT 0,
+        paid_amount DECIMAL(10,2) DEFAULT 0,
+        company_cost DECIMAL(10,2) DEFAULT 0,
+        receipt_fund_id INT DEFAULT 0,
+        receipt_fund_name VARCHAR(100) DEFAULT '',
+        expense_payment_status VARCHAR(20) DEFAULT 'pending',
+        expense_fund_id INT DEFAULT 0,
+        expense_fund_name VARCHAR(100) DEFAULT '',
+        other_out_id INT DEFAULT 0,
+        receivable_id INT DEFAULT 0,
+        receipt_id INT DEFAULT 0,
+        expense_id INT DEFAULT 0,
+        remark TEXT DEFAULT '',
+        status INT DEFAULT 0,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW(),
+        deleted_at TIMESTAMP
+      );
 
       CREATE TABLE IF NOT EXISTS finance_funds (id SERIAL PRIMARY KEY, name VARCHAR(100) NOT NULL, fund_type INT DEFAULT 1, balance DECIMAL(10,2) DEFAULT 0, bank_name VARCHAR(100) DEFAULT '', bank_account VARCHAR(100) DEFAULT '', remark TEXT DEFAULT '', status INT DEFAULT 1, create_time TIMESTAMP DEFAULT NOW(), update_time TIMESTAMP DEFAULT NOW(), deleted_at TIMESTAMP);
       CREATE TABLE IF NOT EXISTS collect_receipt (id SERIAL PRIMARY KEY, receipt_no VARCHAR(100) DEFAULT '', order_sn VARCHAR(100) DEFAULT '', customer_id INT DEFAULT 0, customer_name VARCHAR(200) DEFAULT '', contact_name VARCHAR(100) DEFAULT '', amount DECIMAL(10,2) DEFAULT 0, receipt_date DATE, pay_type VARCHAR(50) DEFAULT 'customer', fund_id INT DEFAULT 0, fund_name VARCHAR(100) DEFAULT '', remark TEXT DEFAULT '', status INT DEFAULT 1, created_at TIMESTAMP DEFAULT NOW(), deleted_at TIMESTAMP);
@@ -160,6 +196,36 @@ async function initDb() {
 
       INSERT INTO admins (name, account, password, role_name) VALUES ('管理员', 'admin', '123456', '超级管理员') ON CONFLICT (account) DO NOTHING;
       INSERT INTO warehouses (name) VALUES ('默认仓库') ON CONFLICT DO NOTHING;
+
+      CREATE TABLE IF NOT EXISTS mini_users (
+        id SERIAL PRIMARY KEY,
+        openid VARCHAR(64) UNIQUE NOT NULL,
+        phone VARCHAR(20),
+        name VARCHAR(64),
+        created_at TIMESTAMP DEFAULT NOW(),
+        deleted_at TIMESTAMP
+      );
+      CREATE TABLE IF NOT EXISTS mini_orders (
+        id SERIAL PRIMARY KEY,
+        order_no VARCHAR(32) UNIQUE NOT NULL,
+        user_id INTEGER NOT NULL,
+        total DECIMAL(10,2) NOT NULL DEFAULT 0,
+        address JSONB,
+        remark TEXT DEFAULT '',
+        status SMALLINT DEFAULT 0,
+        paid_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT NOW(),
+        deleted_at TIMESTAMP
+      );
+      CREATE TABLE IF NOT EXISTS mini_order_items (
+        id SERIAL PRIMARY KEY,
+        order_id INTEGER NOT NULL,
+        goods_id INTEGER,
+        goods_name VARCHAR(128) NOT NULL,
+        spec VARCHAR(64) DEFAULT '',
+        price DECIMAL(10,2) NOT NULL,
+        qty INTEGER NOT NULL DEFAULT 1
+      );
 
       CREATE TABLE IF NOT EXISTS bom_order (
         id SERIAL PRIMARY KEY,
@@ -220,6 +286,11 @@ async function initDb() {
     await client.query("ALTER TABLE pay_receipt ADD COLUMN IF NOT EXISTS category VARCHAR(50) DEFAULT ''").catch(() => {})
     await client.query("ALTER TABLE collect_receipt ADD COLUMN IF NOT EXISTS category VARCHAR(50) DEFAULT ''").catch(() => {})
     await client.query("ALTER TABLE purchase_order ADD COLUMN IF NOT EXISTS expense_amount DECIMAL(10,2) DEFAULT 0").catch(() => {})
+    await client.query("ALTER TABLE sale_samples ADD COLUMN IF NOT EXISTS receipt_fund_id INT DEFAULT 0").catch(() => {})
+    await client.query("ALTER TABLE sale_samples ADD COLUMN IF NOT EXISTS receipt_fund_name VARCHAR(100) DEFAULT ''").catch(() => {})
+    await client.query("ALTER TABLE sale_samples ADD COLUMN IF NOT EXISTS expense_payment_status VARCHAR(20) DEFAULT 'pending'").catch(() => {})
+    await client.query("ALTER TABLE sale_samples ADD COLUMN IF NOT EXISTS expense_fund_id INT DEFAULT 0").catch(() => {})
+    await client.query("ALTER TABLE sale_samples ADD COLUMN IF NOT EXISTS expense_fund_name VARCHAR(100) DEFAULT ''").catch(() => {})
     // purchase_order 补加折扣/运费/分期字段
     await client.query("ALTER TABLE purchase_order ADD COLUMN IF NOT EXISTS freight_bearer VARCHAR(20) DEFAULT 'buyer'").catch(() => {})
     await client.query("ALTER TABLE purchase_order ADD COLUMN IF NOT EXISTS discount_type VARCHAR(20) DEFAULT 'none'").catch(() => {})
@@ -238,4 +309,3 @@ async function initDb() {
 }
 
 module.exports = { pool, initDb }
-

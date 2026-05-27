@@ -3048,12 +3048,6 @@ app.post('/screenshot', async (req, res) => {
   }
 })
 
-// ─── 404 fallback ───────────────────────────────────────────────────────────
-
-app.use((req, res) => {
-  res.status(404).json({ code: 0, message: `路由不存在: ${req.method} ${req.path}` })
-})
-
 // ─── 浏览器操作路由（给亚当用，使用 Browserless REST API）──────────────────
 
 const BROWSERLESS_TOKEN = process.env.BROWSERLESS_API_KEY || ''
@@ -3400,6 +3394,11 @@ app.post('/miniapi/pay/notify', async (req, res) => {
   } catch {
     res.send('<xml><return_code><![CDATA[FAIL]]></return_code></xml>')
   }
+})
+
+// ─── 404 fallback ───────────────────────────────────────────────────────────
+app.use((req, res) => {
+  res.status(404).json({ code: 0, message: `路由不存在: ${req.method} ${req.path}` })
 })
 
 start()

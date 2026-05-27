@@ -3282,7 +3282,7 @@ app.post('/miniapi/auth/bindPhone', async (req, res) => {
 // 商品分类
 app.get('/miniapi/goods/categories', async (req, res) => {
   try {
-    const r = await pool.query(`SELECT id, name FROM goods_cate WHERE deleted_at IS NULL ORDER BY sort ASC, id ASC LIMIT 20`)
+    const r = await pool.query(`SELECT id, name FROM goods_cate WHERE status=1 ORDER BY sort ASC, id ASC LIMIT 20`)
     return ok(res, r.rows)
   } catch (e) { fail(res, e.message) }
 })

@@ -3218,6 +3218,27 @@ const MINI_JWT_SECRET = process.env.MINI_JWT_SECRET || 'mini_secret_2024'
 const WX_APPID = process.env.WX_APPID || ''
 const WX_SECRET = process.env.WX_SECRET || ''
 const WX_MCH_ID = process.env.WX_MCH_ID || ''
+const WX_MCH_KEY = process.env.WX_MCH_KEY || ''
+
+// 微信支付V2签名
+function wxPaySign(params) {
+  const crypto = require('crypto')
+  const str = Object.keys(params).filter(k => params[k] !== '' && params[k] !== undefined).sort()
+    .map(k => `${k}=${params[k]}`).join('&') + `&key=${WX_MCH_KEY}`
+  return crypto.createHash('md5').update(str).digest('hex').toUpperCase()
+}
+
+// 对象转XML
+function toXml(obj) {
+  return '<xml>' + Object.keys(obj).map(k => `<${k}><![CDATA[${obj[k]}]]></${k}>`).join('') + '</xml>'
+}
+
+// XML转对象
+function fromXml(xml) {
+  const result = {}
+  xml.replace(/<(\w+)>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/\1>/g, (_, k, v) => { result[k] = v })
+  return result
+}
 
 function miniAuth(req, res, next) {
   const token = req.headers['mini-token']
@@ -3416,19 +3437,71 @@ app.post('/miniapi/pay/unified', miniAuth, async (req, res) => {
     if (!r.rows[0]) return fail(res, '订单不存在')
     const order = r.rows[0]
     if (order.status !== 0) return fail(res, '订单已支付')
-    // TODO: 接入真实微信支付签名（需 WX_MCH_ID + WX_MCH_KEY）
-    return ok(res, { timeStamp: String(Math.floor(Date.now()/1000)), nonceStr: Math.random().toString(36).slice(2), package: `prepay_id=mock_${order.order_no}`, signType: 'MD5', paySign: 'mock' })
+
+    const https = require('https')
+    const nonceStr = Math.random().toString(36).slice(2, 18) + Math.random().toString(36).slice(2, 18)
+    const totalFee = Math.round(parseFloat(order.total_amount) * 100) // 转分
+    const notifyUrl = 'https://erp-server-xsji.onrender.com/miniapi/pay/notify'
+
+    const params = {
+      appid: WX_APPID,
+      mch_id: WX_MCH_ID,
+      nonce_str: nonceStr,
+      body: '数字游牧ERP-商品购买',
+      out_trade_no: order.order_no,
+      total_fee: String(totalFee),
+      spbill_create_ip: req.ip || '127.0.0.1',
+      notify_url: notifyUrl,
+      trade_type: 'JSAPI',
+      openid: req.miniUser.openid,
+    }
+    params.sign = wxPaySign(params)
+
+    const xmlBody = toXml(params)
+    const wxRes = await new Promise((resolve, reject) => {
+      const req2 = https.request({ hostname: 'api.mch.weixin.qq.com', path: '/pay/unifiedorder', method: 'POST', headers: { 'Content-Type': 'text/xml', 'Content-Length': Buffer.byteLength(xmlBody) } }, r2 => {
+        let d = ''
+        r2.on('data', c => d += c)
+        r2.on('end', () => resolve(fromXml(d)))
+      })
+      req2.on('error', reject)
+      req2.write(xmlBody)
+      req2.end()
+    })
+
+    if (wxRes.return_code !== 'SUCCESS' || wxRes.result_code !== 'SUCCESS') {
+      return fail(res, wxRes.err_code_des || wxRes.return_msg || '微信支付下单失败')
+    }
+
+    const prepayId = wxRes.prepay_id
+    const timeStamp = String(Math.floor(Date.now() / 1000))
+    const nonceStr2 = Math.random().toString(36).slice(2, 18)
+    const packageStr = `prepay_id=${prepayId}`
+    const paySign = wxPaySign({ appId: WX_APPID, timeStamp, nonceStr: nonceStr2, package: packageStr, signType: 'MD5' })
+
+    return ok(res, { timeStamp, nonceStr: nonceStr2, package: packageStr, signType: 'MD5', paySign })
   } catch (e) { fail(res, e.message) }
 })
 
 // 支付回调
 app.post('/miniapi/pay/notify', async (req, res) => {
   try {
-    const outTradeNo = (req.body && req.body.out_trade_no) || ''
-    if (outTradeNo) {
-      await pool.query(`UPDATE mini_orders SET status=1, paid_at=NOW() WHERE order_no=$1`, [outTradeNo])
-    }
-    res.send('<xml><return_code><![CDATA[SUCCESS]]></return_code></xml>')
+    let body = ''
+    req.on('data', d => body += d)
+    req.on('end', async () => {
+      try {
+        const data = fromXml(body)
+        if (data.return_code === 'SUCCESS' && data.result_code === 'SUCCESS') {
+          // 验签
+          const sign = data.sign
+          const { sign: _, ...rest } = data
+          if (wxPaySign(rest) === sign) {
+            await pool.query(`UPDATE mini_orders SET status=1, paid_at=NOW() WHERE order_no=$1 AND status=0`, [data.out_trade_no])
+          }
+        }
+        res.send('<xml><return_code><![CDATA[SUCCESS]]></return_code><return_msg><![CDATA[OK]]></return_msg></xml>')
+      } catch { res.send('<xml><return_code><![CDATA[FAIL]]></return_code></xml>') }
+    })
   } catch {
     res.send('<xml><return_code><![CDATA[FAIL]]></return_code></xml>')
   }

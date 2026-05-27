@@ -3435,6 +3435,26 @@ app.post('/miniapi/pay/notify', async (req, res) => {
 })
 
 // Nova 客服聊天（收集 Cloudflare SSE → 返回完整 JSON）
+// 品牌主页配置（代理 Cloudflare KV，补全图片绝对路径）
+app.get('/miniapi/brand/config', async (req, res) => {
+  try {
+    const cfRes = await fetch('https://nomaderp.pages.dev/api/brand-config')
+    const json = await cfRes.json()
+    const cfg = json.data || {}
+    // 补全相对路径图片 URL
+    const abs = (url) => {
+      if (!url) return ''
+      if (url.startsWith('http')) return url
+      return 'https://nomaderp.pages.dev' + (url.startsWith('/') ? '' : '/') + url
+    }
+    cfg.heroImage = abs(cfg.heroImage)
+    if (Array.isArray(cfg.categories)) {
+      cfg.categories = cfg.categories.map(c => ({ ...c, img: abs(c.img) }))
+    }
+    return ok(res, cfg)
+  } catch (e) { fail(res, e.message) }
+})
+
 app.post('/miniapi/nova/chat', async (req, res) => {
   try {
     const { messages = [] } = req.body

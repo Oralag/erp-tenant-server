@@ -3287,14 +3287,29 @@ app.get('/miniapi/goods/categories', async (req, res) => {
   } catch (e) { fail(res, e.message) }
 })
 
+const BRAND_BASE = 'https://nomaderp.pages.dev'
+
+// 相对路径补全为绝对 URL（品牌主页图片都托管在 nomaderp.pages.dev）
+function toAbsUrl(url) {
+  if (!url) return ''
+  if (url.startsWith('http')) return url
+  return BRAND_BASE + (url.startsWith('/') ? '' : '/') + url
+}
+
 // 解析品牌主页字段（与 shopStore.ts 保持一致）
 function parseBrandGoods(row) {
   let brand = {}
   try { brand = JSON.parse(row.remark || '{}')['__brand__'] || {} } catch {}
+  const rawImg = brand.image || (row.images ? row.images.split(',')[0] : '') || ''
   return {
     id: row.id,
     name: row.goods_name || '',
-    image_url: brand.image || (row.images ? row.images.split(',')[0] : '') || '',
+    image_url: toAbsUrl(rawImg),
+    header_images: (brand.headerImages || []).map(toAbsUrl),
+    detail_images: (brand.detailImages && brand.detailImages.length
+      ? brand.detailImages
+      : (brand.detailImage ? [brand.detailImage] : [])
+    ).map(toAbsUrl),
     sale_price: parseFloat(row.sell_price) || 0,
     unit: row.unit_name || '件',
     spec: row.spec || '',
@@ -3337,7 +3352,7 @@ app.get('/miniapi/goods/detail/:id', async (req, res) => {
     const r = await pool.query(`SELECT * FROM goods WHERE id=$1 AND deleted_at IS NULL LIMIT 1`, [req.params.id])
     if (!r.rows[0]) return fail(res, '商品不存在')
     const goods = parseBrandGoods(r.rows[0])
-    const stock = await pool.query(`SELECT COALESCE(SUM(num),0) as total FROM stock_all WHERE goods_id=$1`, [r.rows[0].id])
+    const stock = await pool.query(`SELECT COALESCE(SUM(qty),0) as total FROM stock_inventory WHERE goods_id=$1`, [r.rows[0].id])
     goods.stock = parseInt(stock.rows[0].total)
     return ok(res, goods)
   } catch (e) { fail(res, e.message) }

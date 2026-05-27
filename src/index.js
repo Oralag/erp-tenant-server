@@ -3458,7 +3458,7 @@ app.post('/miniapi/nova/chat', async (req, res) => {
       if (!line.startsWith('data: ') || line === 'data: [DONE]') continue
       try {
         const d = JSON.parse(line.slice(6))
-        if (d.type === 'text' && d.content) reply += d.content
+        if (d.type === 'text') reply += (d.text || d.content || '')
       } catch {}
     }
     return ok(res, { reply: reply || '抱歉，暂时无法回复，请稍后再试。' })

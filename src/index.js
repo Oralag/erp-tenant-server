@@ -3434,6 +3434,37 @@ app.post('/miniapi/pay/notify', async (req, res) => {
   }
 })
 
+// Nova 客服聊天（收集 Cloudflare SSE → 返回完整 JSON）
+app.post('/miniapi/nova/chat', async (req, res) => {
+  try {
+    const { messages = [] } = req.body
+    const brandContext = `NOMADIC DAIRY — 内蒙古锡林郭勒盟草原奶食品牌。
+产品：奶皮、奶豆腐、青砖奶茶、冻炒米、奶果子、蒙古黄油、马奶酒。
+特点：纯天然无添加，传统蒙古族工艺，鲜奶直供，可溯源到牧场。
+物流：顺丰冷链1-3日、京东次日达、满199包邮。
+售后：7天无忧退换，破损必赔。
+批发：起订量各品类不同，联系客服报价。`
+
+    const cfRes = await fetch('https://nomaderp.pages.dev/api/brand-chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messages, brandContext }),
+    })
+
+    const text = await cfRes.text()
+    // 解析 SSE 拼接完整回复
+    let reply = ''
+    for (const line of text.split('\n')) {
+      if (!line.startsWith('data: ') || line === 'data: [DONE]') continue
+      try {
+        const d = JSON.parse(line.slice(6))
+        if (d.type === 'text' && d.content) reply += d.content
+      } catch {}
+    }
+    return ok(res, { reply: reply || '抱歉，暂时无法回复，请稍后再试。' })
+  } catch (e) { fail(res, e.message) }
+})
+
 // ─── 404 fallback ───────────────────────────────────────────────────────────
 app.use((req, res) => {
   res.status(404).json({ code: 0, message: `路由不存在: ${req.method} ${req.path}` })

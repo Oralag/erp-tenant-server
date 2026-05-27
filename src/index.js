@@ -3299,13 +3299,13 @@ app.get('/miniapi/goods/list', async (req, res) => {
     const { page = 1, list_rows = 10, category_id, keyword } = req.query
     const offset = (parseInt(page) - 1) * parseInt(list_rows)
     const params = []
-    let where = `WHERE g.deleted_at IS NULL`
-    if (category_id) { params.push(category_id); where += ` AND g.category_id=$${params.length}` }
+    let where = `WHERE g.deleted_at IS NULL AND g.status=1 AND g.can_sale=1`
+    if (category_id) { params.push(category_id); where += ` AND g.cate_id=$${params.length}` }
     if (keyword) { params.push(`%${keyword}%`); where += ` AND g.goods_name ILIKE $${params.length}` }
     const total = (await pool.query(`SELECT COUNT(*) FROM goods g ${where}`, params)).rows[0].count
     params.push(parseInt(list_rows), offset)
     const rows = (await pool.query(
-      `SELECT id, goods_name as name, images as image_url, sell_price as sale_price, cost_price as price, unit_name as unit, spec, barcode FROM goods g ${where} ORDER BY id DESC LIMIT $${params.length-1} OFFSET $${params.length}`,
+      `SELECT id, goods_name as name, images as image_url, sell_price as sale_price, cost_price as price, unit_name as unit, spec, barcode, goods_memo as description FROM goods g ${where} ORDER BY sort ASC, id DESC LIMIT $${params.length-1} OFFSET $${params.length}`,
       params
     )).rows
     return ok(res, { rows, total: parseInt(total), page: parseInt(page), list_rows: parseInt(list_rows) })
@@ -3315,7 +3315,7 @@ app.get('/miniapi/goods/list', async (req, res) => {
 // 商品详情
 app.get('/miniapi/goods/detail/:id', async (req, res) => {
   try {
-    const r = await pool.query(`SELECT *, goods_name as name, images as image_url, sell_price as sale_price, unit_name as unit FROM goods WHERE id=$1 AND deleted_at IS NULL LIMIT 1`, [req.params.id])
+    const r = await pool.query(`SELECT *, goods_name as name, images as image_url, sell_price as sale_price, unit_name as unit, goods_memo as description FROM goods WHERE id=$1 AND deleted_at IS NULL LIMIT 1`, [req.params.id])
     if (!r.rows[0]) return fail(res, '商品不存在')
     const goods = r.rows[0]
     const stock = await pool.query(`SELECT COALESCE(SUM(num),0) as total FROM stock_all WHERE goods_id=$1`, [goods.id])

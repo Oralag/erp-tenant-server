@@ -3287,35 +3287,58 @@ app.get('/miniapi/goods/categories', async (req, res) => {
   } catch (e) { fail(res, e.message) }
 })
 
-// 商品列表
+// 解析品牌主页字段（与 shopStore.ts 保持一致）
+function parseBrandGoods(row) {
+  let brand = {}
+  try { brand = JSON.parse(row.remark || '{}')['__brand__'] || {} } catch {}
+  return {
+    id: row.id,
+    name: row.goods_name || '',
+    image_url: brand.image || (row.images ? row.images.split(',')[0] : '') || '',
+    sale_price: parseFloat(row.sell_price) || 0,
+    unit: row.unit_name || '件',
+    spec: row.spec || '',
+    barcode: row.barcode || '',
+    description: brand.description || row.goods_memo || '',
+    tags: brand.tags || [],
+    rating: brand.rating || 5.0,
+    wholesalePrice: brand.wholesalePrice || 0,
+    minOrderQuantity: brand.minOrderQuantity || 1,
+    sort: row.sort || 0,
+  }
+}
+
+// 商品列表 — 只返回品牌主页标记 show:true 的商品（与 shopStore.ts 逻辑一致）
 app.get('/miniapi/goods/list', async (req, res) => {
   try {
     const { page = 1, list_rows = 10, category_id, keyword } = req.query
-    const offset = (parseInt(page) - 1) * parseInt(list_rows)
+    const pageNum = parseInt(page), pageSize = parseInt(list_rows)
     const params = []
-    let where = `WHERE g.deleted_at IS NULL AND g.status=1 AND g.can_sale=1`
-    if (category_id) { params.push(category_id); where += ` AND g.cate_id=$${params.length}` }
-    if (keyword) { params.push(`%${keyword}%`); where += ` AND g.goods_name ILIKE $${params.length}` }
-    const total = (await pool.query(`SELECT COUNT(*) FROM goods g ${where}`, params)).rows[0].count
-    params.push(parseInt(list_rows), offset)
+    let where = `WHERE deleted_at IS NULL AND status=1 AND can_sale=1`
+    if (category_id) { params.push(category_id); where += ` AND cate_id=$${params.length}` }
+    if (keyword) { params.push(`%${keyword}%`); where += ` AND goods_name ILIKE $${params.length}` }
+    // 拉全量（≤500），在 Node 里过滤 show:true，与品牌主页 .filter(p=>p.show===true) 一致
     const rows = (await pool.query(
-      `SELECT id, goods_name as name, images as image_url, sell_price as sale_price, cost_price as price, unit_name as unit, spec, barcode, goods_memo as description FROM goods g ${where} ORDER BY sort ASC, id DESC LIMIT $${params.length-1} OFFSET $${params.length}`,
+      `SELECT id, goods_name, images, remark, sell_price, unit_name, spec, barcode, goods_memo, sort FROM goods ${where} ORDER BY sort ASC, id DESC LIMIT 500`,
       params
     )).rows
-    return ok(res, { rows, total: parseInt(total), page: parseInt(page), list_rows: parseInt(list_rows) })
+    const brandRows = rows.filter(g => {
+      try { return JSON.parse(g.remark || '{}')['__brand__']?.show === true } catch { return false }
+    })
+    const total = brandRows.length
+    const pageData = brandRows.slice((pageNum - 1) * pageSize, pageNum * pageSize).map(parseBrandGoods)
+    return ok(res, { rows: pageData, total, page: pageNum, list_rows: pageSize })
   } catch (e) { fail(res, e.message) }
 })
 
 // 商品详情
 app.get('/miniapi/goods/detail/:id', async (req, res) => {
   try {
-    const r = await pool.query(`SELECT *, goods_name as name, images as image_url, sell_price as sale_price, unit_name as unit, goods_memo as description FROM goods WHERE id=$1 AND deleted_at IS NULL LIMIT 1`, [req.params.id])
+    const r = await pool.query(`SELECT * FROM goods WHERE id=$1 AND deleted_at IS NULL LIMIT 1`, [req.params.id])
     if (!r.rows[0]) return fail(res, '商品不存在')
-    const goods = r.rows[0]
-    const stock = await pool.query(`SELECT COALESCE(SUM(num),0) as total FROM stock_all WHERE goods_id=$1`, [goods.id])
+    const goods = parseBrandGoods(r.rows[0])
+    const stock = await pool.query(`SELECT COALESCE(SUM(num),0) as total FROM stock_all WHERE goods_id=$1`, [r.rows[0].id])
     goods.stock = parseInt(stock.rows[0].total)
-    const specs = await pool.query(`SELECT name FROM goods_spec WHERE goods_id=$1 AND deleted_at IS NULL`, [goods.id]).catch(() => ({ rows: [] }))
-    goods.specs = specs.rows
     return ok(res, goods)
   } catch (e) { fail(res, e.message) }
 })

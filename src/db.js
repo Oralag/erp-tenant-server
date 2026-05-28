@@ -202,8 +202,25 @@ async function initDb() {
         openid VARCHAR(64) UNIQUE NOT NULL,
         phone VARCHAR(20),
         name VARCHAR(64),
+        points INTEGER DEFAULT 0,
+        total_spent DECIMAL(10,2) DEFAULT 0,
+        level SMALLINT DEFAULT 0,
+        vip_expire_at TIMESTAMP,
         created_at TIMESTAMP DEFAULT NOW(),
         deleted_at TIMESTAMP
+      );
+      ALTER TABLE mini_users ADD COLUMN IF NOT EXISTS points INTEGER DEFAULT 0;
+      ALTER TABLE mini_users ADD COLUMN IF NOT EXISTS total_spent DECIMAL(10,2) DEFAULT 0;
+      ALTER TABLE mini_users ADD COLUMN IF NOT EXISTS level SMALLINT DEFAULT 0;
+      ALTER TABLE mini_users ADD COLUMN IF NOT EXISTS vip_expire_at TIMESTAMP;
+      CREATE TABLE IF NOT EXISTS mini_points_log (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        points INTEGER NOT NULL,
+        type VARCHAR(20) NOT NULL,
+        remark VARCHAR(128) DEFAULT '',
+        order_id INTEGER,
+        created_at TIMESTAMP DEFAULT NOW()
       );
       CREATE TABLE IF NOT EXISTS mini_orders (
         id SERIAL PRIMARY KEY,
@@ -219,6 +236,9 @@ async function initDb() {
         deleted_at TIMESTAMP
       );
       ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS total_amount DECIMAL(10,2);
+      ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS original_amount DECIMAL(10,2);
+      ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS discount DECIMAL(4,2) DEFAULT 1.0;
+      ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS points_used INTEGER DEFAULT 0;
       CREATE TABLE IF NOT EXISTS mini_order_items (
         id SERIAL PRIMARY KEY,
         order_id INTEGER NOT NULL,

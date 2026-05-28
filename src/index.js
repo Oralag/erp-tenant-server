@@ -3437,22 +3437,35 @@ app.post('/miniapi/order/create', miniAuth, async (req, res) => {
     )).rows
     const goodsMap = Object.fromEntries(goodsRows.map(g => [g.id, g]))
 
-    let serverTotal = 0
+    let originalTotal = 0
     const validItems = []
     for (const item of items) {
       const g = goodsMap[item.goods_id]
       if (!g) return fail(res, `商品不存在: ${item.goods_id}`)
       const qty = Math.max(1, parseInt(item.qty) || 1)
       const price = parseFloat(g.price)
-      serverTotal += price * qty
+      originalTotal += price * qty
       validItems.push({ goods_id: g.id, goods_name: g.name, spec: item.spec || '', price, qty })
     }
-    serverTotal = Math.round(serverTotal * 100) / 100
+    originalTotal = Math.round(originalTotal * 100) / 100
+
+    // 会员折扣
+    const userRow = (await pool.query(`SELECT * FROM mini_users WHERE id=$1`, [req.miniUser.id])).rows[0]
+    const userLevel = calcLevel(userRow || {})
+    const levelInfo = MEMBER_LEVELS[userLevel]
+    const discount = levelInfo.discount
+
+    // 积分抵扣
+    const usePoints = Math.min(parseInt(req.body.use_points || 0), userRow?.points || 0)
+    const pointsDeduct = Math.floor(usePoints / POINTS_REDEEM_RATE * 100) / 100
+
+    let serverTotal = Math.max(0, Math.round((originalTotal * discount - pointsDeduct) * 100) / 100)
 
     const orderNo = genOrderNo('MP')
     const r = await pool.query(
-      `INSERT INTO mini_orders (order_no, user_id, total_amount, address, remark, status, created_at) VALUES ($1,$2,$3,$4,$5,0,NOW()) RETURNING *`,
-      [orderNo, req.miniUser.id, serverTotal, JSON.stringify(address || {}), remark || '']
+      `INSERT INTO mini_orders (order_no, user_id, total_amount, original_amount, discount, points_used, address, remark, status, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,0,NOW()) RETURNING *`,
+      [orderNo, req.miniUser.id, serverTotal, originalTotal, discount, usePoints, JSON.stringify(address || {}), remark || '']
     )
     const order = r.rows[0]
     for (const item of validItems) {
@@ -3461,7 +3474,12 @@ app.post('/miniapi/order/create', miniAuth, async (req, res) => {
         [order.id, item.goods_id, item.goods_name, item.spec, item.price, item.qty]
       )
     }
-    return ok(res, { id: order.id, order_no: order.order_no, total_amount: serverTotal })
+    // 扣除使用的积分
+    if (usePoints > 0) {
+      await pool.query(`UPDATE mini_users SET points=points-$1 WHERE id=$2`, [usePoints, req.miniUser.id])
+      await pool.query(`INSERT INTO mini_points_log (user_id,points,type,remark,order_id,created_at) VALUES ($1,$2,'use','积分抵扣',$3,NOW())`, [req.miniUser.id, -usePoints, order.id])
+    }
+    return ok(res, { id: order.id, order_no: order.order_no, total_amount: serverTotal, original_amount: originalTotal, discount, points_used: usePoints })
   } catch (e) { fail(res, e.message) }
 })
 
@@ -3561,7 +3579,21 @@ app.post('/miniapi/pay/notify', async (req, res) => {
           const sign = data.sign
           const { sign: _, ...rest } = data
           if (wxPaySign(rest) === sign) {
-            await pool.query(`UPDATE mini_orders SET status=1, paid_at=NOW() WHERE order_no=$1 AND status=0`, [data.out_trade_no])
+            const updOrder = (await pool.query(`UPDATE mini_orders SET status=1, paid_at=NOW() WHERE order_no=$1 AND status=0 RETURNING *`, [data.out_trade_no])).rows[0]
+            if (updOrder) {
+              const paidUser = (await pool.query(`SELECT * FROM mini_users WHERE id=$1`, [updOrder.user_id])).rows[0]
+              if (paidUser) {
+                const lvl = calcLevel(paidUser)
+                const mult = MEMBER_LEVELS[lvl].multiplier
+                const earnPoints = Math.floor(parseFloat(updOrder.total_amount || updOrder.total || 0) * POINTS_PER_YUAN * mult)
+                const newSpent = parseFloat(paidUser.total_spent || 0) + parseFloat(updOrder.total_amount || updOrder.total || 0)
+                const newLevel = newSpent >= 2000 ? 2 : newSpent >= 500 ? 1 : 0
+                await pool.query(`UPDATE mini_users SET points=COALESCE(points,0)+$1, total_spent=COALESCE(total_spent,0)+$2, level=GREATEST(level,$3) WHERE id=$4`,
+                  [earnPoints, parseFloat(updOrder.total_amount || updOrder.total || 0), newLevel, updOrder.user_id])
+                await pool.query(`INSERT INTO mini_points_log (user_id,points,type,remark,order_id,created_at) VALUES ($1,$2,'earn','消费送积分',$3,NOW())`,
+                  [updOrder.user_id, earnPoints, updOrder.id])
+              }
+            }
           }
         }
         res.send('<xml><return_code><![CDATA[SUCCESS]]></return_code><return_msg><![CDATA[OK]]></return_msg></xml>')
@@ -3570,6 +3602,124 @@ app.post('/miniapi/pay/notify', async (req, res) => {
   } catch {
     res.send('<xml><return_code><![CDATA[FAIL]]></return_code></xml>')
   }
+})
+
+// ─── 会员系统 ─────────────────────────────────────────────────────────────────
+
+const MEMBER_LEVELS = [
+  { level: 0, name: '普通会员', minSpent: 0,    multiplier: 1,   discount: 1.0  },
+  { level: 1, name: '银牌会员', minSpent: 500,  multiplier: 1.5, discount: 0.95 },
+  { level: 2, name: '金牌会员', minSpent: 2000, multiplier: 2,   discount: 0.90 },
+  { level: 3, name: 'VIP会员',  minSpent: 0,    multiplier: 3,   discount: 0.85 },
+]
+const VIP_PRICE = 99
+const POINTS_PER_YUAN = 10  // 消费1元得10积分
+const POINTS_REDEEM_RATE = 100  // 100积分=1元
+
+function calcLevel(user) {
+  const now = new Date()
+  if (user.vip_expire_at && new Date(user.vip_expire_at) > now) return 3
+  const spent = parseFloat(user.total_spent || 0)
+  if (spent >= 2000) return 2
+  if (spent >= 500) return 1
+  return 0
+}
+
+// 会员信息
+app.get('/miniapi/member/info', miniAuth, async (req, res) => {
+  try {
+    const r = await pool.query(`SELECT * FROM mini_users WHERE id=$1`, [req.miniUser.id])
+    const user = r.rows[0]
+    if (!user) return fail(res, '用户不存在')
+    const level = calcLevel(user)
+    const levelInfo = MEMBER_LEVELS[level]
+    const nextLevel = MEMBER_LEVELS[Math.min(level + 1, 3)]
+    const spent = parseFloat(user.total_spent || 0)
+    return ok(res, {
+      points: user.points || 0,
+      total_spent: spent,
+      level,
+      level_name: level === 3 ? 'VIP会员' : levelInfo.name,
+      discount: levelInfo.discount,
+      multiplier: levelInfo.multiplier,
+      vip_expire_at: user.vip_expire_at,
+      next_level: level < 3 ? { name: nextLevel.name, need: Math.max(0, nextLevel.minSpent - spent) } : null,
+    })
+  } catch (e) { fail(res, e.message) }
+})
+
+// 积分明细
+app.get('/miniapi/member/points/log', miniAuth, async (req, res) => {
+  try {
+    const rows = (await pool.query(
+      `SELECT * FROM mini_points_log WHERE user_id=$1 ORDER BY id DESC LIMIT 30`,
+      [req.miniUser.id]
+    )).rows
+    return ok(res, rows)
+  } catch (e) { fail(res, e.message) }
+})
+
+// 购买VIP会员（发起支付）
+app.post('/miniapi/member/buy-vip', miniAuth, async (req, res) => {
+  try {
+    const https = require('https')
+    const orderNo = genOrderNo('VIP')
+    const nonceStr = Math.random().toString(36).slice(2, 18) + Math.random().toString(36).slice(2, 18)
+    const totalFee = VIP_PRICE * 100
+    const params = {
+      appid: WX_APPID,
+      mch_id: WX_MCH_ID,
+      nonce_str: nonceStr,
+      body: '数字游牧-VIP年度会员',
+      out_trade_no: orderNo,
+      total_fee: String(totalFee),
+      spbill_create_ip: req.ip || '127.0.0.1',
+      notify_url: 'https://erp-server-xsji.onrender.com/miniapi/pay/vip-notify',
+      trade_type: 'JSAPI',
+      openid: req.miniUser.openid,
+      attach: String(req.miniUser.id),
+    }
+    params.sign = wxPaySign(params)
+    const xmlBody = toXml(params)
+    const wxRes = await new Promise((resolve, reject) => {
+      const req2 = https.request({ hostname: 'api.mch.weixin.qq.com', path: '/pay/unifiedorder', method: 'POST', headers: { 'Content-Type': 'text/xml', 'Content-Length': Buffer.byteLength(xmlBody) } }, r2 => {
+        let d = ''; r2.on('data', c => d += c); r2.on('end', () => resolve(fromXml(d)))
+      })
+      req2.on('error', reject); req2.write(xmlBody); req2.end()
+    })
+    if (wxRes.return_code !== 'SUCCESS' || wxRes.result_code !== 'SUCCESS')
+      return fail(res, wxRes.err_code_des || wxRes.return_msg || 'VIP支付下单失败')
+    const prepayId = wxRes.prepay_id
+    const timeStamp = String(Math.floor(Date.now() / 1000))
+    const nonceStr2 = Math.random().toString(36).slice(2, 18)
+    const packageStr = `prepay_id=${prepayId}`
+    const paySign = wxPaySign({ appId: WX_APPID, timeStamp, nonceStr: nonceStr2, package: packageStr, signType: 'MD5' })
+    return ok(res, { timeStamp, nonceStr: nonceStr2, package: packageStr, signType: 'MD5', paySign, orderNo })
+  } catch (e) { fail(res, e.message) }
+})
+
+// VIP支付回调
+app.post('/miniapi/pay/vip-notify', async (req, res) => {
+  try {
+    let body = ''
+    req.on('data', d => body += d)
+    req.on('end', async () => {
+      try {
+        const data = fromXml(body)
+        if (data.return_code === 'SUCCESS' && data.result_code === 'SUCCESS') {
+          const { sign: _, ...rest } = data
+          if (wxPaySign(rest) === data.sign) {
+            const userId = parseInt(data.attach)
+            const expireAt = new Date(Date.now() + 365 * 24 * 3600 * 1000)
+            await pool.query(`UPDATE mini_users SET vip_expire_at=$1, level=3 WHERE id=$2`, [expireAt, userId])
+            await pool.query(`INSERT INTO mini_points_log (user_id, points, type, remark, created_at) VALUES ($1,990,'earn','购买VIP会员赠送积分',NOW())`, [userId])
+            await pool.query(`UPDATE mini_users SET points=COALESCE(points,0)+990 WHERE id=$1`, [userId])
+          }
+        }
+        res.send('<xml><return_code><![CDATA[SUCCESS]]></return_code><return_msg><![CDATA[OK]]></return_msg></xml>')
+      } catch { res.send('<xml><return_code><![CDATA[FAIL]]></return_code></xml>') }
+    })
+  } catch { res.send('<xml><return_code><![CDATA[FAIL]]></return_code></xml>') }
 })
 
 // Nova 客服聊天（收集 Cloudflare SSE → 返回完整 JSON）

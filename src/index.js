@@ -1936,6 +1936,20 @@ router.post('/procure/ProcureInhouse/add', async (req, res) => {
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })
+router.post('/procure/ProcureInhouse/edit', async (req, res) => {
+  try {
+    const { id, ...rawRest } = req.body
+    if (!id) return fail(res, 'id不能为空')
+    const rest = filterBodyCols('procure_inhouse', rawRest)
+    const cols = Object.keys(rest).filter((k) => rest[k] !== undefined)
+    if (cols.length === 0) return fail(res, '无有效字段')
+    const sets = cols.map((k, i) => `${k}=$${i + 1}`)
+    const vals = cols.map((k) => typeof rest[k] === 'object' ? JSON.stringify(rest[k]) : rest[k])
+    const sql = `UPDATE procure_inhouse SET ${sets.join(',')} WHERE id=$${vals.length + 1} RETURNING *`
+    const result = await pool.query(sql, [...vals, id])
+    return ok(res, result.rows[0])
+  } catch (e) { fail(res, e.message) }
+})
 router.post('/procure/ProcureInhouse/del', async (req, res) => {
   try {
     const { id } = req.body

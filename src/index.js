@@ -3278,7 +3278,50 @@ app.post('/miniapi/auth/wxLogin', async (req, res) => {
   } catch (e) { fail(res, e.message) }
 })
 
-// 绑定手机号
+// 微信授权手机号登录（getPhoneNumber code方式）
+app.post('/miniapi/auth/phoneLogin', async (req, res) => {
+  try {
+    const { phoneCode, openid } = req.body
+    if (!phoneCode || !openid) return fail(res, '参数缺失')
+
+    // 获取 access_token
+    const tokenRes = await fetch(`https://api.weixin.qq.com/cgi-bin/token?grant_type=client_credential&appid=${WX_APPID}&secret=${WX_SECRET}`)
+    const tokenData = await tokenRes.json()
+    if (!tokenData.access_token) return fail(res, '获取access_token失败')
+
+    // 用 code 换手机号
+    const phoneRes = await fetch(`https://api.weixin.qq.com/wxa/business/getuserphonenumber?access_token=${tokenData.access_token}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code: phoneCode })
+    })
+    const phoneData = await phoneRes.json()
+    if (phoneData.errcode !== 0) return fail(res, phoneData.errmsg || '获取手机号失败')
+
+    const phone = phoneData.phone_info.phoneNumber
+
+    let user = (await pool.query(`SELECT * FROM mini_users WHERE openid=$1 AND deleted_at IS NULL LIMIT 1`, [openid])).rows[0]
+    if (!user) {
+      const ins = await pool.query(
+        `INSERT INTO mini_users (openid, phone, name, created_at) VALUES ($1,$2,$3,NOW()) RETURNING *`,
+        [openid, phone, phone]
+      )
+      user = ins.rows[0]
+      await pool.query(
+        `INSERT INTO shop_customer (name, mobile, source, created_at) VALUES ($1,$2,'小程序',NOW()) ON CONFLICT DO NOTHING`,
+        [phone, phone]
+      ).catch(() => {})
+    } else if (!user.phone) {
+      await pool.query(`UPDATE mini_users SET phone=$1, name=$2 WHERE id=$3`, [phone, phone, user.id])
+      user.phone = phone; user.name = phone
+    }
+
+    const token = jwt.sign({ id: user.id, openid, phone: user.phone }, MINI_JWT_SECRET, { expiresIn: '30d' })
+    return ok(res, { token, user: { id: user.id, name: user.name, phone: user.phone } })
+  } catch (e) { fail(res, e.message) }
+})
+
+// 绑定手机号（旧接口保留）
 app.post('/miniapi/auth/bindPhone', async (req, res) => {
   try {
     const { phone, code, openid } = req.body

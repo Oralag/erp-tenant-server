@@ -1025,6 +1025,18 @@ router.post('/stock/SaleReturnOrder/add', async (req, res) => {
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })
+router.post('/stock/SaleReturnOrder/edit', async (req, res) => {
+  try {
+    const { id, ...rest } = req.body
+    if (!id) return fail(res, 'id不能为空')
+    const cols = Object.keys(rest).filter(k => rest[k] !== undefined)
+    if (!cols.length) return fail(res, '无有效字段')
+    const sets = cols.map((k, i) => `${k}=$${i + 1}`)
+    const vals = cols.map(k => typeof rest[k] === 'object' ? JSON.stringify(rest[k]) : rest[k])
+    const r = await pool.query(`UPDATE sale_return_order SET ${sets.join(',')} WHERE id=$${vals.length + 1} RETURNING *`, [...vals, id])
+    return ok(res, r.rows[0])
+  } catch (e) { fail(res, e.message) }
+})
 router.post('/stock/SaleReturnOrder/del', async (req, res) => {
   try {
     const { id } = req.body

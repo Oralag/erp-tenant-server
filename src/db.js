@@ -210,6 +210,7 @@ async function initDb() {
         order_no VARCHAR(32) UNIQUE NOT NULL,
         user_id INTEGER NOT NULL,
         total DECIMAL(10,2) NOT NULL DEFAULT 0,
+        total_amount DECIMAL(10,2),
         address JSONB,
         remark TEXT DEFAULT '',
         status SMALLINT DEFAULT 0,
@@ -217,6 +218,7 @@ async function initDb() {
         created_at TIMESTAMP DEFAULT NOW(),
         deleted_at TIMESTAMP
       );
+      ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS total_amount DECIMAL(10,2);
       CREATE TABLE IF NOT EXISTS mini_order_items (
         id SERIAL PRIMARY KEY,
         order_id INTEGER NOT NULL,

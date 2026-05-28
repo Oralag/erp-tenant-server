@@ -3425,21 +3425,43 @@ app.get('/miniapi/goods/detail/:id', async (req, res) => {
 // 创建订单
 app.post('/miniapi/order/create', miniAuth, async (req, res) => {
   try {
-    const { items, address, remark, total } = req.body
+    const { items, address, remark } = req.body
     if (!items || items.length === 0) return fail(res, '订单不能为空')
+
+    // 服务端重新计算总价，不信任客户端传值
+    const goodsIds = items.map(i => i.goods_id).filter(Boolean)
+    if (goodsIds.length === 0) return fail(res, '商品信息有误')
+    const goodsRows = (await pool.query(
+      `SELECT id, name, price FROM brand_goods WHERE id = ANY($1) AND status=1`,
+      [goodsIds]
+    )).rows
+    const goodsMap = Object.fromEntries(goodsRows.map(g => [g.id, g]))
+
+    let serverTotal = 0
+    const validItems = []
+    for (const item of items) {
+      const g = goodsMap[item.goods_id]
+      if (!g) return fail(res, `商品不存在: ${item.goods_id}`)
+      const qty = Math.max(1, parseInt(item.qty) || 1)
+      const price = parseFloat(g.price)
+      serverTotal += price * qty
+      validItems.push({ goods_id: g.id, goods_name: g.name, spec: item.spec || '', price, qty })
+    }
+    serverTotal = Math.round(serverTotal * 100) / 100
+
     const orderNo = genOrderNo('MP')
     const r = await pool.query(
-      `INSERT INTO mini_orders (order_no, user_id, total, address, remark, status, created_at) VALUES ($1,$2,$3,$4,$5,0,NOW()) RETURNING *`,
-      [orderNo, req.miniUser.id, total, JSON.stringify(address || {}), remark || '']
+      `INSERT INTO mini_orders (order_no, user_id, total_amount, address, remark, status, created_at) VALUES ($1,$2,$3,$4,$5,0,NOW()) RETURNING *`,
+      [orderNo, req.miniUser.id, serverTotal, JSON.stringify(address || {}), remark || '']
     )
     const order = r.rows[0]
-    for (const item of items) {
+    for (const item of validItems) {
       await pool.query(
         `INSERT INTO mini_order_items (order_id, goods_id, goods_name, spec, price, qty) VALUES ($1,$2,$3,$4,$5,$6)`,
-        [order.id, item.goods_id, item.goods_name, item.spec || '', item.price, item.qty]
+        [order.id, item.goods_id, item.goods_name, item.spec, item.price, item.qty]
       )
     }
-    return ok(res, { id: order.id, order_no: order.order_no })
+    return ok(res, { id: order.id, order_no: order.order_no, total_amount: serverTotal })
   } catch (e) { fail(res, e.message) }
 })
 
@@ -3483,7 +3505,7 @@ app.post('/miniapi/pay/unified', miniAuth, async (req, res) => {
 
     const https = require('https')
     const nonceStr = Math.random().toString(36).slice(2, 18) + Math.random().toString(36).slice(2, 18)
-    const totalFee = Math.round(parseFloat(order.total_amount) * 100) // 转分
+    const totalFee = Math.round(parseFloat(order.total_amount || order.total || 0) * 100) // 转分
     const notifyUrl = 'https://erp-server-xsji.onrender.com/miniapi/pay/notify'
 
     const params = {

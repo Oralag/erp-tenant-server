@@ -3137,7 +3137,8 @@ async function migrateSaleReturnOrder() {
     ADD COLUMN IF NOT EXISTS warehouse_name VARCHAR(100) DEFAULT '',
     ADD COLUMN IF NOT EXISTS reason TEXT DEFAULT '',
     ADD COLUMN IF NOT EXISTS order_sn VARCHAR(100) DEFAULT '',
-    ADD COLUMN IF NOT EXISTS sale_out_order_id INT DEFAULT 0`)
+    ADD COLUMN IF NOT EXISTS sale_out_order_id INT DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS level_id INT DEFAULT 0`)
 }
 
 async function start() {

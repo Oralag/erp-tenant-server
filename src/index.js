@@ -1027,8 +1027,9 @@ router.post('/stock/SaleReturnOrder/add', async (req, res) => {
 })
 router.post('/stock/SaleReturnOrder/edit', async (req, res) => {
   try {
-    const { id, ...rest } = req.body
+    const { id, ...rawRest } = req.body
     if (!id) return fail(res, 'id不能为空')
+    const rest = filterBodyCols('sale_return_order', rawRest)
     const cols = Object.keys(rest).filter(k => rest[k] !== undefined)
     if (!cols.length) return fail(res, '无有效字段')
     const sets = cols.map((k, i) => `${k}=$${i + 1}`)

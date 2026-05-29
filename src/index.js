@@ -3128,9 +3128,22 @@ app.post('/browser', async (req, res) => {
 
 // ─── start ──────────────────────────────────────────────────────────────────
 
+async function migrateSaleReturnOrder() {
+  await pool.query(`ALTER TABLE sale_return_order
+    ADD COLUMN IF NOT EXISTS return_amount NUMERIC(12,2) DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS total_amount NUMERIC(12,2) DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS admin_name VARCHAR(100) DEFAULT '',
+    ADD COLUMN IF NOT EXISTS warehouse_id INT DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS warehouse_name VARCHAR(100) DEFAULT '',
+    ADD COLUMN IF NOT EXISTS reason TEXT DEFAULT '',
+    ADD COLUMN IF NOT EXISTS order_sn VARCHAR(100) DEFAULT '',
+    ADD COLUMN IF NOT EXISTS sale_out_order_id INT DEFAULT 0`)
+}
+
 async function start() {
   try {
     await initDb()
+    await migrateSaleReturnOrder()
     await loadTableCols()
     app.listen(PORT, () => {
       console.log(`ERP server running on port ${PORT}`)

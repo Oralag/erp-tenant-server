@@ -3553,6 +3553,72 @@ app.get('/miniapi/order/detail/:id', miniAuth, async (req, res) => {
   } catch (e) { fail(res, e.message) }
 })
 
+// ─── 小程序订单管理（ERP后台用，使用adminapi auth）─────────────────────────────
+
+// 建表时补字段（运行时幂等）
+;(async () => {
+  try {
+    await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS express_company VARCHAR(50) DEFAULT ''`)
+    await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS tracking_no VARCHAR(100) DEFAULT ''`)
+    await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS shipped_at TIMESTAMP`)
+    // status: 0=待支付 1=待发货 2=已发货 3=已完成 4=已取消
+  } catch(e) { console.log('mini_orders alter:', e.message) }
+})()
+
+// 订单列表（ERP后台）
+app.get('/adminapi/mini/orders', auth, async (req, res) => {
+  try {
+    const { page = 1, list_rows = 20, status, keyword } = req.query
+    const offset = (parseInt(page) - 1) * parseInt(list_rows)
+    const conditions = ['deleted_at IS NULL']
+    const params = []
+    if (status !== undefined && status !== '') { params.push(parseInt(status)); conditions.push(`status=$${params.length}`) }
+    if (keyword) { params.push(`%${keyword}%`); conditions.push(`(order_no ILIKE $${params.length} OR address::text ILIKE $${params.length})`) }
+    const where = conditions.join(' AND ')
+    const total = (await pool.query(`SELECT COUNT(*) FROM mini_orders WHERE ${where}`, params)).rows[0].count
+    params.push(parseInt(list_rows)); params.push(offset)
+    const rows = (await pool.query(
+      `SELECT o.*, u.phone as user_phone FROM mini_orders o LEFT JOIN mini_users u ON u.id=o.user_id WHERE ${where} ORDER BY o.id DESC LIMIT $${params.length-1} OFFSET $${params.length}`,
+      params
+    )).rows
+    for (const o of rows) {
+      o.items = (await pool.query(`SELECT * FROM mini_order_items WHERE order_id=$1`, [o.id])).rows
+      o.address = typeof o.address === 'string' ? JSON.parse(o.address || '{}') : (o.address || {})
+    }
+    return ok(res, { rows, total: parseInt(total) })
+  } catch (e) { fail(res, e.message) }
+})
+
+// 发货（ERP后台）
+app.post('/adminapi/mini/order/ship', auth, async (req, res) => {
+  try {
+    const { order_id, express_company, tracking_no } = req.body
+    if (!order_id) return fail(res, '缺少订单ID')
+    if (!tracking_no) return fail(res, '请填写快递单号')
+    const r = await pool.query(
+      `UPDATE mini_orders SET status=2, express_company=$1, tracking_no=$2, shipped_at=NOW() WHERE id=$3 AND status=1 RETURNING *`,
+      [express_company || '', tracking_no, order_id]
+    )
+    if (!r.rows[0]) return fail(res, '订单不存在或状态不是待发货')
+    return ok(res, r.rows[0])
+  } catch (e) { fail(res, e.message) }
+})
+
+// 订单详情（ERP后台）
+app.get('/adminapi/mini/order/:id', auth, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT o.*, u.phone as user_phone FROM mini_orders o LEFT JOIN mini_users u ON u.id=o.user_id WHERE o.id=$1 AND o.deleted_at IS NULL`,
+      [req.params.id]
+    )
+    if (!r.rows[0]) return fail(res, '订单不存在')
+    const order = r.rows[0]
+    order.items = (await pool.query(`SELECT * FROM mini_order_items WHERE order_id=$1`, [order.id])).rows
+    order.address = typeof order.address === 'string' ? JSON.parse(order.address || '{}') : (order.address || {})
+    return ok(res, order)
+  } catch (e) { fail(res, e.message) }
+})
+
 // 发起微信支付
 app.post('/miniapi/pay/unified', miniAuth, async (req, res) => {
   try {

@@ -3473,7 +3473,7 @@ app.post('/miniapi/order/create', miniAuth, async (req, res) => {
     const goodsIds = items.map(i => i.goods_id).filter(Boolean)
     if (goodsIds.length === 0) return fail(res, '商品信息有误')
     const goodsRows = (await pool.query(
-      `SELECT id, name, price FROM brand_goods WHERE id = ANY($1) AND status=1`,
+      `SELECT id, goods_name as name, sell_price as price FROM goods WHERE id = ANY($1) AND status=1 AND can_sale=1`,
       [goodsIds]
     )).rows
     const goodsMap = Object.fromEntries(goodsRows.map(g => [g.id, g]))

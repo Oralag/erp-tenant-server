@@ -3570,12 +3570,12 @@ app.get('/adminapi/mini/orders', auth, async (req, res) => {
   try {
     const { page = 1, list_rows = 20, status, keyword } = req.query
     const offset = (parseInt(page) - 1) * parseInt(list_rows)
-    const conditions = ['deleted_at IS NULL']
+    const conditions = ['o.deleted_at IS NULL']
     const params = []
-    if (status !== undefined && status !== '') { params.push(parseInt(status)); conditions.push(`status=$${params.length}`) }
-    if (keyword) { params.push(`%${keyword}%`); conditions.push(`(order_no ILIKE $${params.length} OR address::text ILIKE $${params.length} OR tracking_no ILIKE $${params.length})`) }
+    if (status !== undefined && status !== '') { params.push(parseInt(status)); conditions.push(`o.status=$${params.length}`) }
+    if (keyword) { params.push(`%${keyword}%`); conditions.push(`(o.order_no ILIKE $${params.length} OR o.address::text ILIKE $${params.length} OR o.tracking_no ILIKE $${params.length})`) }
     const where = conditions.join(' AND ')
-    const total = (await pool.query(`SELECT COUNT(*) FROM mini_orders WHERE ${where}`, params)).rows[0].count
+    const total = (await pool.query(`SELECT COUNT(*) FROM mini_orders o LEFT JOIN mini_users u ON u.id=o.user_id WHERE ${where}`, params)).rows[0].count
     params.push(parseInt(list_rows)); params.push(offset)
     const rows = (await pool.query(
       `SELECT o.*, u.phone as user_phone FROM mini_orders o LEFT JOIN mini_users u ON u.id=o.user_id WHERE ${where} ORDER BY o.id DESC LIMIT $${params.length-1} OFFSET $${params.length}`,

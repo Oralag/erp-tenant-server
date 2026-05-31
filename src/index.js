@@ -3573,7 +3573,7 @@ app.get('/adminapi/mini/orders', auth, async (req, res) => {
     const conditions = ['deleted_at IS NULL']
     const params = []
     if (status !== undefined && status !== '') { params.push(parseInt(status)); conditions.push(`status=$${params.length}`) }
-    if (keyword) { params.push(`%${keyword}%`); conditions.push(`(order_no ILIKE $${params.length} OR address::text ILIKE $${params.length})`) }
+    if (keyword) { params.push(`%${keyword}%`); conditions.push(`(order_no ILIKE $${params.length} OR address::text ILIKE $${params.length} OR tracking_no ILIKE $${params.length})`) }
     const where = conditions.join(' AND ')
     const total = (await pool.query(`SELECT COUNT(*) FROM mini_orders WHERE ${where}`, params)).rows[0].count
     params.push(parseInt(list_rows)); params.push(offset)

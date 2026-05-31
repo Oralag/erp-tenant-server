@@ -3881,6 +3881,33 @@ app.post('/miniapi/nova/chat', async (req, res) => {
   } catch (e) { fail(res, e.message) }
 })
 
+// ─── 批发合作意向 ─────────────────────────────────────────────────────────────
+app.post('/miniapi/wholesale/inquiry', async (req, res) => {
+  try {
+    const { name, mobile } = req.body
+    if (!name || !mobile) return fail(res, '姓名和手机号不能为空')
+
+    // 保存到 ERP 客户表
+    const now = Math.floor(Date.now() / 1000)
+    await pool.query(
+      `INSERT INTO shop_customer (name, mobile, remark, create_time, update_time)
+       VALUES ($1, $2, $3, $4, $4)
+       ON CONFLICT DO NOTHING`,
+      [name, mobile, '【批发合作意向】来自品牌页', now]
+    )
+
+    // Server酱推送到微信
+    const key = process.env.SERVER_JIANG_KEY
+    if (key) {
+      const title = encodeURIComponent('📦 新批发合作意向')
+      const desp  = encodeURIComponent(`姓名：${name}\n手机：${mobile}\n来源：品牌合作页`)
+      fetch(`https://sctapi.ftqq.com/${key}.send?title=${title}&desp=${desp}`).catch(() => {})
+    }
+
+    return ok(res, { message: '已收到，我们会尽快联系您' })
+  } catch (e) { fail(res, e.message) }
+})
+
 // ─── 404 fallback ───────────────────────────────────────────────────────────
 app.use((req, res) => {
   res.status(404).json({ code: 0, message: `路由不存在: ${req.method} ${req.path}` })

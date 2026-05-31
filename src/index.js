@@ -3884,23 +3884,25 @@ app.post('/miniapi/nova/chat', async (req, res) => {
 // ─── 批发合作意向 ─────────────────────────────────────────────────────────────
 app.post('/miniapi/wholesale/inquiry', async (req, res) => {
   try {
-    const { name, mobile } = req.body
-    if (!name || !mobile) return fail(res, '姓名和手机号不能为空')
+    const { name, wechat, mobile } = req.body
+    if (!name || (!wechat && !mobile)) return fail(res, '请填写姓名及微信号或手机号')
 
     // 保存到 ERP 客户表
     const now = Math.floor(Date.now() / 1000)
+    const remark = `【批发合作意向】微信：${wechat || '-'}  手机：${mobile || '-'}  来源：品牌页`
     await pool.query(
       `INSERT INTO shop_customer (name, mobile, remark, create_time, update_time)
        VALUES ($1, $2, $3, $4, $4)
        ON CONFLICT DO NOTHING`,
-      [name, mobile, '【批发合作意向】来自品牌页', now]
+      [name, mobile || '', remark, now]
     )
 
     // Server酱推送到微信
     const key = process.env.SERVER_JIANG_KEY
     if (key) {
       const title = encodeURIComponent('📦 新批发合作意向')
-      const desp  = encodeURIComponent(`姓名：${name}\n手机：${mobile}\n来源：品牌合作页`)
+      const contact = wechat ? `微信：${wechat}` : `手机：${mobile}`
+      const desp  = encodeURIComponent(`姓名：${name}\n${contact}\n来源：品牌合作页`)
       fetch(`https://sctapi.ftqq.com/${key}.send?title=${title}&desp=${desp}`).catch(() => {})
     }
 

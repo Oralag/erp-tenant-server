@@ -3421,6 +3421,7 @@ function parseBrandGoods(row) {
     barcode: row.barcode || '',
     description: brand.description || row.goods_memo || '',
     tags: brand.tags || [],
+    skuVariants: brand.skuVariants || null,
     rating: brand.rating || 5.0,
     wholesalePrice: brand.wholesalePrice || 0,
     minOrderQuantity: brand.minOrderQuantity || 1,

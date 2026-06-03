@@ -3538,13 +3538,29 @@ app.post('/miniapi/order/create', miniAuth, async (req, res) => {
     const usePoints = Math.min(parseInt(req.body.use_points || 0), userRow?.points || 0)
     const pointsDeduct = Math.floor(usePoints / POINTS_REDEEM_RATE * 100) / 100
 
-    let serverTotal = Math.max(0, Math.round((originalTotal * discount - pointsDeduct) * 100) / 100)
+    // 优惠券抵扣
+    const userCouponId = parseInt(req.body.user_coupon_id || 0)
+    let couponDeduct = 0, usedCoupon = null
+    if (userCouponId) {
+      const uc = (await pool.query(
+        `SELECT uc.*, c.discount_value, c.min_order, c.name FROM mini_user_coupons uc JOIN mini_coupons c ON c.id=uc.coupon_id WHERE uc.id=$1 AND uc.user_id=$2 AND uc.status=0`,
+        [userCouponId, req.miniUser.id]
+      )).rows[0]
+      if (uc && new Date(uc.expire_at) > new Date() && originalTotal * discount >= parseFloat(uc.min_order)) {
+        couponDeduct = parseFloat(uc.discount_value)
+        usedCoupon = uc
+      }
+    }
+
+    let serverTotal = Math.max(0, Math.round((originalTotal * discount - pointsDeduct - couponDeduct) * 100) / 100)
 
     const orderNo = genOrderNo('MP')
+    await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS coupon_id INT DEFAULT 0`)
+    await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS coupon_deduct NUMERIC(8,2) DEFAULT 0`)
     const r = await pool.query(
-      `INSERT INTO mini_orders (order_no, user_id, total_amount, original_amount, discount, points_used, address, remark, status, created_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,0,NOW()) RETURNING *`,
-      [orderNo, req.miniUser.id, serverTotal, originalTotal, discount, usePoints, JSON.stringify(address || {}), remark || '']
+      `INSERT INTO mini_orders (order_no, user_id, total_amount, original_amount, discount, points_used, coupon_id, coupon_deduct, address, remark, status, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,0,NOW()) RETURNING *`,
+      [orderNo, req.miniUser.id, serverTotal, originalTotal, discount, usePoints, userCouponId || 0, couponDeduct, JSON.stringify(address || {}), remark || '']
     )
     const order = r.rows[0]
     for (const item of validItems) {
@@ -3553,12 +3569,16 @@ app.post('/miniapi/order/create', miniAuth, async (req, res) => {
         [order.id, item.goods_id, item.goods_name, item.spec, item.price, item.qty]
       )
     }
-    // 扣除使用的积分
+    // 扣积分
     if (usePoints > 0) {
       await pool.query(`UPDATE mini_users SET points=points-$1 WHERE id=$2`, [usePoints, req.miniUser.id])
       await pool.query(`INSERT INTO mini_points_log (user_id,points,type,remark,order_id,created_at) VALUES ($1,$2,'use','积分抵扣',$3,NOW())`, [req.miniUser.id, -usePoints, order.id])
     }
-    return ok(res, { id: order.id, order_no: order.order_no, total_amount: serverTotal, original_amount: originalTotal, discount, points_used: usePoints })
+    // 核销优惠券
+    if (usedCoupon) {
+      await pool.query(`UPDATE mini_user_coupons SET status=1, used_at=NOW(), order_id=$1 WHERE id=$2`, [order.id, userCouponId])
+    }
+    return ok(res, { id: order.id, order_no: order.order_no, total_amount: serverTotal, original_amount: originalTotal, discount, points_used: usePoints, coupon_deduct: couponDeduct })
   } catch (e) { fail(res, e.message) }
 })
 
@@ -4053,6 +4073,236 @@ app.post('/miniapi/wholesale/inquiry', async (req, res) => {
 
     return ok(res, { message: '已收到，我们会尽快联系您' })
   } catch (e) { fail(res, e.message) }
+})
+
+// ─── 优惠券系统 ──────────────────────────────────────────────────────────────
+
+// 建表（幂等）
+;(async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS mini_coupons (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(60) NOT NULL,
+        type VARCHAR(20) NOT NULL DEFAULT 'general',
+        discount_value NUMERIC(8,2) NOT NULL,
+        min_order NUMERIC(8,2) NOT NULL DEFAULT 0,
+        validity_days INT NOT NULL DEFAULT 30,
+        total_count INT NOT NULL DEFAULT -1,
+        claimed_count INT NOT NULL DEFAULT 0,
+        status SMALLINT NOT NULL DEFAULT 1,
+        start_at TIMESTAMP DEFAULT NOW(),
+        end_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS mini_user_coupons (
+        id SERIAL PRIMARY KEY,
+        user_id INT NOT NULL,
+        coupon_id INT NOT NULL,
+        status SMALLINT NOT NULL DEFAULT 0,
+        expire_at TIMESTAMP NOT NULL,
+        used_at TIMESTAMP,
+        order_id INT,
+        claimed_at TIMESTAMP DEFAULT NOW(),
+        UNIQUE(user_id, coupon_id, claimed_at)
+      )
+    `)
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_muc_user ON mini_user_coupons(user_id)`)
+    // 补生日字段
+    await pool.query(`ALTER TABLE mini_users ADD COLUMN IF NOT EXISTS birth_month SMALLINT`)
+    await pool.query(`ALTER TABLE mini_users ADD COLUMN IF NOT EXISTS birth_day SMALLINT`)
+    // 预置默认券：新客6元券 + 生日8元券
+    await pool.query(`
+      INSERT INTO mini_coupons (name, type, discount_value, min_order, validity_days, total_count)
+      VALUES ('新客专享券', 'new_user', 6, 0, 30, -1),
+             ('生日特权券', 'birthday', 15, 50, 7, -1)
+      ON CONFLICT DO NOTHING
+    `)
+    console.log('mini_coupons tables ready')
+  } catch(e) { console.log('mini_coupons init:', e.message) }
+})()
+
+// 可领优惠券列表（当前用户视角）
+app.get('/miniapi/coupon/list', miniAuth, async (req, res) => {
+  try {
+    const uid = req.miniUser.id
+    const user = (await pool.query(`SELECT * FROM mini_users WHERE id=$1`, [uid])).rows[0]
+    const now = new Date()
+    const coupons = (await pool.query(
+      `SELECT * FROM mini_coupons WHERE status=1 AND (end_at IS NULL OR end_at > NOW()) ORDER BY id ASC`
+    )).rows
+
+    const result = []
+    for (const c of coupons) {
+      // 已领数量（该券该用户）
+      const claimedByUser = parseInt((await pool.query(
+        `SELECT COUNT(*) FROM mini_user_coupons WHERE user_id=$1 AND coupon_id=$2`, [uid, c.id]
+      )).rows[0].count)
+
+      let canClaim = true
+      let reason = ''
+
+      if (c.type === 'new_user') {
+        const orderCount = parseInt((await pool.query(
+          `SELECT COUNT(*) FROM mini_orders WHERE user_id=$1 AND status>=1`, [uid]
+        )).rows[0].count)
+        if (orderCount > 0) { canClaim = false; reason = '仅限新客' }
+        if (claimedByUser > 0) { canClaim = false; reason = '已领取' }
+      } else if (c.type === 'birthday') {
+        const bm = user?.birth_month, bd = user?.birth_day
+        if (!bm) { canClaim = false; reason = '请先设置生日' }
+        else if (bm !== now.getMonth() + 1) { canClaim = false; reason = `生日月(${bm}月)可领` }
+        else {
+          // 同一年只能领一次
+          const thisYear = (await pool.query(
+            `SELECT COUNT(*) FROM mini_user_coupons WHERE user_id=$1 AND coupon_id=$2 AND EXTRACT(YEAR FROM claimed_at)=$3`,
+            [uid, c.id, now.getFullYear()]
+          )).rows[0].count
+          if (parseInt(thisYear) > 0) { canClaim = false; reason = '今年已领' }
+        }
+      } else {
+        if (claimedByUser > 0) { canClaim = false; reason = '已领取' }
+      }
+
+      if (c.total_count > 0 && c.claimed_count >= c.total_count) { canClaim = false; reason = '已抢完' }
+
+      result.push({ ...c, can_claim: canClaim, reason, claimed_by_user: claimedByUser })
+    }
+    return ok(res, result)
+  } catch(e) { fail(res, e.message) }
+})
+
+// 领取优惠券
+app.post('/miniapi/coupon/claim', miniAuth, async (req, res) => {
+  try {
+    const uid = req.miniUser.id
+    const { coupon_id } = req.body
+    if (!coupon_id) return fail(res, 'coupon_id必填')
+    const c = (await pool.query(`SELECT * FROM mini_coupons WHERE id=$1 AND status=1`, [coupon_id])).rows[0]
+    if (!c) return fail(res, '优惠券不存在')
+    if (c.end_at && new Date(c.end_at) < new Date()) return fail(res, '优惠券已过期')
+    if (c.total_count > 0 && c.claimed_count >= c.total_count) return fail(res, '已抢完')
+
+    const user = (await pool.query(`SELECT * FROM mini_users WHERE id=$1`, [uid])).rows[0]
+    const now = new Date()
+
+    if (c.type === 'new_user') {
+      const orderCount = parseInt((await pool.query(
+        `SELECT COUNT(*) FROM mini_orders WHERE user_id=$1 AND status>=1`, [uid]
+      )).rows[0].count)
+      if (orderCount > 0) return fail(res, '仅限新用户领取')
+      const already = (await pool.query(`SELECT id FROM mini_user_coupons WHERE user_id=$1 AND coupon_id=$2 LIMIT 1`, [uid, coupon_id])).rows[0]
+      if (already) return fail(res, '您已领取过该券')
+    } else if (c.type === 'birthday') {
+      if (!user?.birth_month) return fail(res, '请先在个人中心设置生日')
+      if (user.birth_month !== now.getMonth() + 1) return fail(res, `生日月（${user.birth_month}月）才能领取`)
+      const thisYear = parseInt((await pool.query(
+        `SELECT COUNT(*) FROM mini_user_coupons WHERE user_id=$1 AND coupon_id=$2 AND EXTRACT(YEAR FROM claimed_at)=$3`,
+        [uid, coupon_id, now.getFullYear()]
+      )).rows[0].count)
+      if (thisYear > 0) return fail(res, '今年已领取过生日券')
+    } else {
+      const already = (await pool.query(`SELECT id FROM mini_user_coupons WHERE user_id=$1 AND coupon_id=$2 LIMIT 1`, [uid, coupon_id])).rows[0]
+      if (already) return fail(res, '您已领取过该券')
+    }
+
+    const expireAt = new Date(Date.now() + c.validity_days * 86400000)
+    await pool.query(
+      `INSERT INTO mini_user_coupons (user_id, coupon_id, status, expire_at) VALUES ($1,$2,0,$3)`,
+      [uid, coupon_id, expireAt]
+    )
+    await pool.query(`UPDATE mini_coupons SET claimed_count=claimed_count+1 WHERE id=$1`, [coupon_id])
+    return ok(res, { message: `领取成功！${c.validity_days}天内有效`, expire_at: expireAt })
+  } catch(e) { fail(res, e.message) }
+})
+
+// 我的优惠券列表
+app.get('/miniapi/coupon/mine', miniAuth, async (req, res) => {
+  try {
+    const uid = req.miniUser.id
+    // 自动标记过期
+    await pool.query(`UPDATE mini_user_coupons SET status=2 WHERE user_id=$1 AND status=0 AND expire_at<NOW()`, [uid])
+    const rows = (await pool.query(
+      `SELECT uc.*, c.name, c.type, c.discount_value, c.min_order
+       FROM mini_user_coupons uc JOIN mini_coupons c ON c.id=uc.coupon_id
+       WHERE uc.user_id=$1 ORDER BY uc.status ASC, uc.expire_at ASC`,
+      [uid]
+    )).rows
+    return ok(res, rows)
+  } catch(e) { fail(res, e.message) }
+})
+
+// 设置生日
+app.post('/miniapi/user/birthday', miniAuth, async (req, res) => {
+  try {
+    const { month, day } = req.body
+    if (!month || !day || month < 1 || month > 12 || day < 1 || day > 31) return fail(res, '日期无效')
+    const existing = (await pool.query(`SELECT birth_month FROM mini_users WHERE id=$1`, [req.miniUser.id])).rows[0]
+    if (existing?.birth_month) return fail(res, '生日只能设置一次')
+    await pool.query(`UPDATE mini_users SET birth_month=$1, birth_day=$2 WHERE id=$3`, [month, day, req.miniUser.id])
+    return ok(res, { message: '生日设置成功' })
+  } catch(e) { fail(res, e.message) }
+})
+
+// 结算时验证并预占优惠券
+app.post('/miniapi/coupon/apply', miniAuth, async (req, res) => {
+  try {
+    const { coupon_id, order_amount } = req.body
+    if (!coupon_id) return ok(res, { discount: 0 })
+    const uc = (await pool.query(
+      `SELECT uc.*, c.discount_value, c.min_order FROM mini_user_coupons uc JOIN mini_coupons c ON c.id=uc.coupon_id WHERE uc.id=$1 AND uc.user_id=$2 AND uc.status=0`,
+      [coupon_id, req.miniUser.id]
+    )).rows[0]
+    if (!uc) return fail(res, '优惠券无效或已使用')
+    if (new Date(uc.expire_at) < new Date()) return fail(res, '优惠券已过期')
+    if (parseFloat(order_amount) < parseFloat(uc.min_order)) return fail(res, `满${uc.min_order}元可用`)
+    return ok(res, { discount: parseFloat(uc.discount_value), coupon_name: uc.name })
+  } catch(e) { fail(res, e.message) }
+})
+
+// ERP后台：优惠券管理
+app.get('/adminapi/mini/coupons', auth, async (req, res) => {
+  try {
+    const { page = 1, list_rows = 20 } = req.query
+    const offset = (parseInt(page) - 1) * parseInt(list_rows)
+    const total = parseInt((await pool.query(`SELECT COUNT(*) FROM mini_coupons`)).rows[0].count)
+    const rows = (await pool.query(
+      `SELECT c.*, (SELECT COUNT(*) FROM mini_user_coupons uc WHERE uc.coupon_id=c.id) as user_count,
+       (SELECT COUNT(*) FROM mini_user_coupons uc WHERE uc.coupon_id=c.id AND uc.status=1) as used_count
+       FROM mini_coupons c ORDER BY c.id DESC LIMIT $1 OFFSET $2`,
+      [parseInt(list_rows), offset]
+    )).rows
+    return ok(res, { rows, total })
+  } catch(e) { fail(res, e.message) }
+})
+
+app.post('/adminapi/mini/coupons/save', auth, async (req, res) => {
+  try {
+    const { id, name, type = 'general', discount_value, min_order = 0, validity_days = 30, total_count = -1, status = 1, end_at } = req.body
+    if (!name || !discount_value) return fail(res, '名称和金额必填')
+    if (id) {
+      const r = await pool.query(
+        `UPDATE mini_coupons SET name=$1,type=$2,discount_value=$3,min_order=$4,validity_days=$5,total_count=$6,status=$7,end_at=$8 WHERE id=$9 RETURNING *`,
+        [name, type, discount_value, min_order, validity_days, total_count, status, end_at || null, id]
+      )
+      return ok(res, r.rows[0])
+    } else {
+      const r = await pool.query(
+        `INSERT INTO mini_coupons (name,type,discount_value,min_order,validity_days,total_count,status,end_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+        [name, type, discount_value, min_order, validity_days, total_count, status, end_at || null]
+      )
+      return ok(res, r.rows[0])
+    }
+  } catch(e) { fail(res, e.message) }
+})
+
+app.post('/adminapi/mini/coupons/del', auth, async (req, res) => {
+  try {
+    await pool.query(`UPDATE mini_coupons SET status=0 WHERE id=$1`, [req.body.id])
+    return ok(res, {})
+  } catch(e) { fail(res, e.message) }
 })
 
 // ─── 404 fallback ───────────────────────────────────────────────────────────

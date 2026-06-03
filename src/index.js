@@ -18,7 +18,7 @@ const PORT = process.env.PORT || 8888
 
 // ─── 微信订阅消息 ─────────────────────────────────────────────────────────────
 const WX_APPID = process.env.WX_APPID || 'wxdbe895428fd5c21a'
-const WX_APPSECRET = process.env.WX_APPSECRET || ''
+const WX_APPSECRET = process.env.WX_SECRET || process.env.WX_APPSECRET || ''
 // 模板ID（在微信公众平台 → 功能 → 订阅消息 里注册后填入环境变量）
 const TMPL_ORDER_SUCCESS = process.env.TMPL_ORDER_SUCCESS || ''  // 购买成功通知
 const TMPL_SHIP = process.env.TMPL_SHIP || ''                    // 发货提醒

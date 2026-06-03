@@ -3156,16 +3156,17 @@ async function migrateSaleReturnOrder() {
 }
 
 async function start() {
+  // Listen first so Render health check passes immediately (Neon cold start can take 30+ sec)
+  app.listen(PORT, () => {
+    console.log(`ERP server running on port ${PORT}`)
+  })
   try {
     await initDb()
     await migrateSaleReturnOrder()
     await loadTableCols()
-    app.listen(PORT, () => {
-      console.log(`ERP server running on port ${PORT}`)
-    })
+    console.log('Database ready')
   } catch (e) {
-    console.error('Failed to start server:', e)
-    process.exit(1)
+    console.error('DB init failed (server still running):', e)
   }
 }
 

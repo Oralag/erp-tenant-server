@@ -4595,10 +4595,10 @@ app.post('/adminapi/mini/ship', auth, async (req, res) => {
       const goodsName = items.map(i => i.goods_name).join('、').slice(0, 20)
       const now = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })
       await sendSubscribeMsg(user.openid, TMPL_SHIP, `pages/order/detail?id=${order_id}`, {
-        thing1: { value: express_company || '快递' },
-        character_string2: { value: express_no || '待更新' },
-        thing3: { value: goodsName },
-        time4: { value: now.slice(0, 16) },
+        thing1: { value: goodsName },                        // 商品名称
+        thing2: { value: express_company || '快递' },        // 快递方式
+        character_string1: { value: express_no || '待更新' }, // 快递单号
+        time1: { value: now.slice(0, 16) },                  // 发货时间
       })
     }
     return ok(res, {})

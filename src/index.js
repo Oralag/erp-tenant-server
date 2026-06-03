@@ -11,8 +11,67 @@ const path = require('path')
 const crypto = require('crypto')
 const os = require('os')
 
+const https = require('https')
+
 const app = express()
 const PORT = process.env.PORT || 8888
+
+// ─── 微信订阅消息 ─────────────────────────────────────────────────────────────
+const WX_APPID = process.env.WX_APPID || 'wxdbe895428fd5c21a'
+const WX_APPSECRET = process.env.WX_APPSECRET || ''
+// 模板ID（在微信公众平台 → 功能 → 订阅消息 里注册后填入环境变量）
+const TMPL_ORDER_SUCCESS = process.env.TMPL_ORDER_SUCCESS || ''  // 购买成功通知
+const TMPL_SHIP = process.env.TMPL_SHIP || ''                    // 发货提醒
+
+let _wxToken = '', _wxTokenExp = 0
+
+async function getWxAccessToken() {
+  if (_wxToken && Date.now() < _wxTokenExp) return _wxToken
+  if (!WX_APPSECRET) { console.log('WX_APPSECRET not set, skip wx token'); return '' }
+  return new Promise((resolve) => {
+    https.get(
+      `https://api.weixin.qq.com/cgi-bin/token?grant_type=client_credential&appid=${WX_APPID}&secret=${WX_APPSECRET}`,
+      (res) => {
+        let data = ''
+        res.on('data', d => data += d)
+        res.on('end', () => {
+          try {
+            const j = JSON.parse(data)
+            if (j.access_token) {
+              _wxToken = j.access_token
+              _wxTokenExp = Date.now() + (j.expires_in - 300) * 1000
+              resolve(_wxToken)
+            } else {
+              console.log('wx token error:', j)
+              resolve('')
+            }
+          } catch { resolve('') }
+        })
+      }
+    ).on('error', (e) => { console.log('wx token fetch error:', e.message); resolve('') })
+  })
+}
+
+async function sendSubscribeMsg(openid, tmplId, page, data) {
+  if (!openid || !tmplId) return
+  const token = await getWxAccessToken()
+  if (!token) return
+  const body = JSON.stringify({ touser: openid, template_id: tmplId, page, data })
+  return new Promise((resolve) => {
+    const req = https.request(
+      `https://api.weixin.qq.com/cgi-bin/message/subscribe/send?access_token=${token}`,
+      { method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) } },
+      (res) => {
+        let d = ''
+        res.on('data', c => d += c)
+        res.on('end', () => { console.log('wx subscribe send:', d); resolve() })
+      }
+    )
+    req.on('error', (e) => { console.log('wx subscribe error:', e.message); resolve() })
+    req.write(body)
+    req.end()
+  })
+}
 const JWT_SECRET = process.env.JWT_SECRET || 'erp_secret_2024'
 
 app.use(cors())
@@ -3589,6 +3648,20 @@ app.post('/miniapi/order/create', miniAuth, async (req, res) => {
     if (usedCoupon) {
       await pool.query(`UPDATE mini_user_coupons SET status=1, used_at=NOW(), order_id=$1 WHERE id=$2`, [order.id, userCouponId])
     }
+
+    // 订阅消息：购买成功通知（异步，不阻塞响应）
+    const openid = userRow?.openid
+    if (openid && TMPL_ORDER_SUCCESS) {
+      const goodsName = validItems.map(i => i.goods_name).join('、').slice(0, 20)
+      const now = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })
+      sendSubscribeMsg(openid, TMPL_ORDER_SUCCESS, `pages/order/detail?id=${order.id}`, {
+        thing1: { value: goodsName },
+        amount2: { value: `¥${serverTotal.toFixed(2)}` },
+        character_string3: { value: order.order_no },
+        time4: { value: now.slice(0, 16) },
+      }).catch(() => {})
+    }
+
     return ok(res, { id: order.id, order_no: order.order_no, total_amount: serverTotal, original_amount: originalTotal, discount, points_used: usePoints, coupon_deduct: couponDeduct })
   } catch (e) { fail(res, e.message) }
 })
@@ -4502,6 +4575,57 @@ app.post('/adminapi/mini/videos/del', auth, async (req, res) => {
   try {
     await pool.query(`UPDATE mini_videos SET status=0 WHERE id=$1`, [req.body.id])
     return ok(res, {})
+  } catch(e) { fail(res, e.message) }
+})
+
+// 管理端：发货并推送订阅消息
+app.post('/adminapi/mini/ship', auth, async (req, res) => {
+  try {
+    const { order_id, express_company, express_no } = req.body
+    if (!order_id) return fail(res, 'order_id必填')
+    const order = (await pool.query(`SELECT * FROM mini_orders WHERE id=$1`, [order_id])).rows[0]
+    if (!order) return fail(res, '订单不存在')
+    // 更新订单状态为已发货（status=2）
+    await pool.query(`UPDATE mini_orders SET status=2, express_company=$1, tracking_no=$2, shipped_at=NOW() WHERE id=$3`,
+      [express_company || '', express_no || '', order_id])
+    // 推送订阅消息
+    const user = (await pool.query(`SELECT openid FROM mini_users WHERE id=$1`, [order.user_id])).rows[0]
+    if (user?.openid && TMPL_SHIP) {
+      const items = (await pool.query(`SELECT goods_name FROM mini_order_items WHERE order_id=$1`, [order_id])).rows
+      const goodsName = items.map(i => i.goods_name).join('、').slice(0, 20)
+      const now = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })
+      await sendSubscribeMsg(user.openid, TMPL_SHIP, `pages/order/detail?id=${order_id}`, {
+        thing1: { value: express_company || '快递' },
+        character_string2: { value: express_no || '待更新' },
+        thing3: { value: goodsName },
+        time4: { value: now.slice(0, 16) },
+      })
+    }
+    return ok(res, {})
+  } catch(e) { fail(res, e.message) }
+})
+
+// 管理端：手动推送营销消息（如新品通知）
+app.post('/adminapi/mini/broadcast', auth, async (req, res) => {
+  try {
+    const { tmpl_id, page = 'pages/index/index', data, user_ids } = req.body
+    if (!tmpl_id) return fail(res, 'tmpl_id必填')
+    const token = await getWxAccessToken()
+    if (!token) return fail(res, '微信Token获取失败，请检查WX_APPSECRET配置')
+    // 如果指定了user_ids就只推这几个，否则推所有有openid的用户
+    let users
+    if (user_ids && user_ids.length) {
+      users = (await pool.query(`SELECT openid FROM mini_users WHERE id=ANY($1) AND openid IS NOT NULL`, [user_ids])).rows
+    } else {
+      users = (await pool.query(`SELECT openid FROM mini_users WHERE openid IS NOT NULL LIMIT 500`)).rows
+    }
+    let sent = 0
+    for (const u of users) {
+      await sendSubscribeMsg(u.openid, tmpl_id, page, data || {})
+      sent++
+      await new Promise(r => setTimeout(r, 50)) // 避免频率限制
+    }
+    return ok(res, { sent })
   } catch(e) { fail(res, e.message) }
 })
 

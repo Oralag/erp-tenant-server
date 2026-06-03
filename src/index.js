@@ -3426,6 +3426,7 @@ function parseBrandGoods(row) {
     wholesalePrice: brand.wholesalePrice || 0,
     minOrderQuantity: brand.minOrderQuantity || 1,
     sort: row.sort || 0,
+    baseSales: brand.baseSales || 0,
   }
 }
 
@@ -3466,7 +3467,7 @@ app.get('/miniapi/goods/list', async (req, res) => {
     }
     const pageData = pageSlice.map(g => {
       const item = parseBrandGoods(g)
-      item.sales_count = salesMap[g.id] || 0
+      item.sales_count = (salesMap[g.id] || 0) + item.baseSales
       item.avg_rating = reviewMap[g.id]?.avg || 0
       item.review_count = reviewMap[g.id]?.cnt || 0
       return item
@@ -3488,7 +3489,7 @@ app.get('/miniapi/goods/detail/:id', async (req, res) => {
       `SELECT COALESCE(SUM(i.qty),0) as total FROM mini_order_items i JOIN mini_orders o ON o.id=i.order_id WHERE i.goods_id=$1 AND o.status>=1`,
       [r.rows[0].id]
     )).rows[0]
-    goods.sales_count = parseInt(salesRow.total)
+    goods.sales_count = parseInt(salesRow.total) + (goods.baseSales || 0)
     // 评价摘要
     const revRow = (await pool.query(
       `SELECT AVG(rating)::numeric(3,1) as avg, COUNT(*) as cnt FROM mini_reviews WHERE goods_id=$1`,
@@ -3920,14 +3921,14 @@ app.post('/miniapi/nova/chat', async (req, res) => {
 // ─── 批发合作意向 ─────────────────────────────────────────────────────────────
 // ─── 评价系统 ────────────────────────────────────────────────────────────────
 
-// 建表（幂等）
+// 建表 + 默认评价（幂等）
 ;(async () => {
   try {
     await pool.query(`
       CREATE TABLE IF NOT EXISTS mini_reviews (
         id SERIAL PRIMARY KEY,
         goods_id INT NOT NULL,
-        user_id INT NOT NULL,
+        user_id INT NOT NULL DEFAULT 0,
         order_id INT NOT NULL,
         rating SMALLINT NOT NULL CHECK (rating BETWEEN 1 AND 5),
         content TEXT DEFAULT '',
@@ -3936,6 +3937,36 @@ app.post('/miniapi/nova/chat', async (req, res) => {
       )
     `)
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_mini_reviews_goods ON mini_reviews(goods_id)`)
+
+    // 默认好评种子数据（order_id 用负数，不与真实订单冲突）
+    const seeds = [
+      [996, -1,  5, '奶香味很浓，冲出来颜色漂亮，比超市买的好喝多了，回购了好几次！', 12],
+      [996, -2,  5, '地道的蒙古奶茶味道，咸香适中，朋友来家里喝了都想买。', 25],
+      [996, -3,  4, '味道正宗，包装也干净，下次还买。', 38],
+      [994, -4,  5, '从小吃的味道！放在牛奶里泡着吃超香，孩子特别喜欢，已经买了三盒了。', 8],
+      [994, -5,  5, '真正的牧区炒米，酥脆不甜腻，配奶茶绝了。', 19],
+      [994, -6,  5, '货真价实，分量足，包装密封很好，保持了酥脆。', 42],
+      [992, -7,  5, '第一次吃奶果子，口感扎实，奶香纯正，不加防腐剂放心吃，很喜欢！', 6],
+      [992, -8,  4, '口味独特，有点像硬奶酪，喜欢纯天然食品的朋友值得试试。', 30],
+      [992, -9,  5, '买来送父母，他们说好久没吃到这么正宗的奶果子了。', 55],
+      [989, -10, 5, '纯天然黄油，奶香浓郁，抹面包拌饭都香，家里老人孩子都爱吃。', 15],
+      [989, -11, 5, '颜色金黄，入口即化，比市面上的黄油香多了，正宗牧区出品！', 28],
+      [989, -12, 4, '味道纯正，就是量少了点，下次多买几瓶。', 50],
+      [988, -13, 5, '原味的最喜欢，有嚼劲，晒干后更香，配茶吃一绝。', 10],
+      [988, -14, 5, '正宗牧区手工味道，买了好几次了，品质稳定，每次都很满意。', 22],
+      [988, -15, 5, '外甥女超爱，当零食吃健康又好吃，已经推荐给朋友圈了。', 45],
+      [1008,-16, 5, '甜味的很好吃，奶香浓，嚼起来有劲，比奶糖健康多了！', 7],
+      [1008,-17, 5, '孩子当零食，我当代餐，全家都喜欢，已经回购三次了。', 20],
+      [1008,-18, 4, '味道很正宗，甜度刚好不腻，包装精致，送礼自用都合适。', 36],
+    ]
+    for (const [goods_id, order_id, rating, content, days] of seeds) {
+      const d = new Date(Date.now() - days * 86400000)
+      await pool.query(
+        `INSERT INTO mini_reviews (goods_id, user_id, order_id, rating, content, created_at) VALUES ($1,0,$2,$3,$4,$5) ON CONFLICT DO NOTHING`,
+        [goods_id, order_id, rating, content, d]
+      )
+    }
+    console.log('mini_reviews seed done')
   } catch(e) { console.log('mini_reviews create:', e.message) }
 })()
 

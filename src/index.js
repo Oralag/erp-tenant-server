@@ -3447,7 +3447,30 @@ app.get('/miniapi/goods/list', async (req, res) => {
       try { return JSON.parse(g.remark || '{}')['__brand__']?.show === true } catch { return false }
     })
     const total = brandRows.length
-    const pageData = brandRows.slice((pageNum - 1) * pageSize, pageNum * pageSize).map(parseBrandGoods)
+    const pageSlice = brandRows.slice((pageNum - 1) * pageSize, pageNum * pageSize)
+    // 批量查销量
+    const goodsIds = pageSlice.map(g => g.id)
+    let salesMap = {}
+    let reviewMap = {}
+    if (goodsIds.length) {
+      const salesRows = (await pool.query(
+        `SELECT i.goods_id, COALESCE(SUM(i.qty),0) as total FROM mini_order_items i JOIN mini_orders o ON o.id=i.order_id WHERE i.goods_id=ANY($1) AND o.status>=1 GROUP BY i.goods_id`,
+        [goodsIds]
+      )).rows
+      salesRows.forEach(r => { salesMap[r.goods_id] = parseInt(r.total) })
+      const revRows = (await pool.query(
+        `SELECT goods_id, AVG(rating)::numeric(3,1) as avg, COUNT(*) as cnt FROM mini_reviews WHERE goods_id=ANY($1) GROUP BY goods_id`,
+        [goodsIds]
+      )).rows
+      revRows.forEach(r => { reviewMap[r.goods_id] = { avg: parseFloat(r.avg), cnt: parseInt(r.cnt) } })
+    }
+    const pageData = pageSlice.map(g => {
+      const item = parseBrandGoods(g)
+      item.sales_count = salesMap[g.id] || 0
+      item.avg_rating = reviewMap[g.id]?.avg || 0
+      item.review_count = reviewMap[g.id]?.cnt || 0
+      return item
+    })
     return ok(res, { rows: pageData, total, page: pageNum, list_rows: pageSize })
   } catch (e) { fail(res, e.message) }
 })
@@ -3460,6 +3483,19 @@ app.get('/miniapi/goods/detail/:id', async (req, res) => {
     const goods = parseBrandGoods(r.rows[0])
     const stock = await pool.query(`SELECT COALESCE(SUM(qty),0) as total FROM stock_inventory WHERE goods_id=$1`, [r.rows[0].id])
     goods.stock = parseInt(stock.rows[0].total)
+    // 销量统计
+    const salesRow = (await pool.query(
+      `SELECT COALESCE(SUM(i.qty),0) as total FROM mini_order_items i JOIN mini_orders o ON o.id=i.order_id WHERE i.goods_id=$1 AND o.status>=1`,
+      [r.rows[0].id]
+    )).rows[0]
+    goods.sales_count = parseInt(salesRow.total)
+    // 评价摘要
+    const revRow = (await pool.query(
+      `SELECT AVG(rating)::numeric(3,1) as avg, COUNT(*) as cnt FROM mini_reviews WHERE goods_id=$1`,
+      [r.rows[0].id]
+    )).rows[0]
+    goods.avg_rating = parseFloat(revRow.avg) || 0
+    goods.review_count = parseInt(revRow.cnt)
     return ok(res, goods)
   } catch (e) { fail(res, e.message) }
 })
@@ -3882,6 +3918,84 @@ app.post('/miniapi/nova/chat', async (req, res) => {
 })
 
 // ─── 批发合作意向 ─────────────────────────────────────────────────────────────
+// ─── 评价系统 ────────────────────────────────────────────────────────────────
+
+// 建表（幂等）
+;(async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS mini_reviews (
+        id SERIAL PRIMARY KEY,
+        goods_id INT NOT NULL,
+        user_id INT NOT NULL,
+        order_id INT NOT NULL,
+        rating SMALLINT NOT NULL CHECK (rating BETWEEN 1 AND 5),
+        content TEXT DEFAULT '',
+        created_at TIMESTAMP DEFAULT NOW(),
+        UNIQUE(order_id, goods_id)
+      )
+    `)
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_mini_reviews_goods ON mini_reviews(goods_id)`)
+  } catch(e) { console.log('mini_reviews create:', e.message) }
+})()
+
+// 获取商品评价列表
+app.get('/miniapi/review/list', async (req, res) => {
+  try {
+    const { goods_id, page = 1, list_rows = 10 } = req.query
+    if (!goods_id) return fail(res, 'goods_id必填')
+    const offset = (parseInt(page) - 1) * parseInt(list_rows)
+    const total = parseInt((await pool.query(`SELECT COUNT(*) FROM mini_reviews WHERE goods_id=$1`, [goods_id])).rows[0].count)
+    const rows = (await pool.query(
+      `SELECT r.id, r.rating, r.content, r.created_at,
+              COALESCE(u.name, u.phone, '匿名用户') as user_name
+       FROM mini_reviews r
+       LEFT JOIN mini_users u ON u.id=r.user_id
+       WHERE r.goods_id=$1
+       ORDER BY r.id DESC LIMIT $2 OFFSET $3`,
+      [goods_id, parseInt(list_rows), offset]
+    )).rows
+    const avgRow = (await pool.query(`SELECT AVG(rating)::numeric(3,1) as avg, COUNT(*) as cnt FROM mini_reviews WHERE goods_id=$1`, [goods_id])).rows[0]
+    return ok(res, { rows, total, avg_rating: parseFloat(avgRow.avg) || 0, review_count: parseInt(avgRow.cnt) })
+  } catch(e) { fail(res, e.message) }
+})
+
+// 提交评价（需登录，且该订单包含该商品）
+app.post('/miniapi/review/create', miniAuth, async (req, res) => {
+  try {
+    const { goods_id, order_id, rating, content } = req.body
+    if (!goods_id || !order_id || !rating) return fail(res, '参数不完整')
+    if (rating < 1 || rating > 5) return fail(res, '评分1-5分')
+    // 验证订单属于该用户且包含该商品
+    const orderRow = (await pool.query(
+      `SELECT o.id FROM mini_orders o
+       JOIN mini_order_items i ON i.order_id=o.id
+       WHERE o.id=$1 AND o.user_id=$2 AND i.goods_id=$3 AND o.status>=1 LIMIT 1`,
+      [order_id, req.miniUser.id, goods_id]
+    )).rows[0]
+    if (!orderRow) return fail(res, '无权评价，请确认订单已付款')
+    // 防重复
+    const exist = (await pool.query(`SELECT id FROM mini_reviews WHERE order_id=$1 AND goods_id=$2 LIMIT 1`, [order_id, goods_id])).rows[0]
+    if (exist) return fail(res, '已评价过')
+    await pool.query(
+      `INSERT INTO mini_reviews (goods_id, user_id, order_id, rating, content) VALUES ($1,$2,$3,$4,$5)`,
+      [goods_id, req.miniUser.id, order_id, rating, content || '']
+    )
+    // 评价完成赠10积分
+    await pool.query(`UPDATE mini_users SET points=COALESCE(points,0)+10 WHERE id=$1`, [req.miniUser.id])
+    return ok(res, { message: '评价成功，赠送10积分' })
+  } catch(e) { fail(res, e.message) }
+})
+
+// 检查某订单某商品是否已评价
+app.get('/miniapi/review/check', miniAuth, async (req, res) => {
+  try {
+    const { order_id, goods_id } = req.query
+    const r = (await pool.query(`SELECT id FROM mini_reviews WHERE order_id=$1 AND goods_id=$2 LIMIT 1`, [order_id, goods_id])).rows[0]
+    return ok(res, { reviewed: !!r })
+  } catch(e) { fail(res, e.message) }
+})
+
 app.post('/miniapi/wholesale/inquiry', async (req, res) => {
   try {
     const { name, wechat, mobile } = req.body

@@ -38,6 +38,16 @@ function ok(res, data = {}, message = '') {
   return res.json({ code: 1, data, message })
 }
 
+// 健康检查（含DB诊断）
+app.get('/health', async (req, res) => {
+  try {
+    const r = await pool.query('SELECT NOW() as t, current_database() as db')
+    res.json({ ok: true, db: r.rows[0].db, time: r.rows[0].t })
+  } catch(e) {
+    res.json({ ok: false, error: e?.message || '', code: e?.code, stack: e?.stack?.split('\n')[0] })
+  }
+})
+
 function fail(res, message = '操作失败', status = 200) {
   return res.status(status).json({ code: 0, message })
 }
@@ -4302,6 +4312,195 @@ app.post('/adminapi/mini/coupons/save', auth, async (req, res) => {
 app.post('/adminapi/mini/coupons/del', auth, async (req, res) => {
   try {
     await pool.query(`UPDATE mini_coupons SET status=0 WHERE id=$1`, [req.body.id])
+    return ok(res, {})
+  } catch(e) { fail(res, e.message) }
+})
+
+// ─── 视频系统初始化 ──────────────────────────────────────────────────────────
+;(async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS mini_videos (
+        id SERIAL PRIMARY KEY,
+        title TEXT NOT NULL,
+        description TEXT DEFAULT '',
+        video_url TEXT NOT NULL,
+        cover_url TEXT DEFAULT '',
+        goods_id INT DEFAULT 0,
+        like_count INT DEFAULT 0,
+        comment_count INT DEFAULT 0,
+        view_count INT DEFAULT 0,
+        sort INT DEFAULT 0,
+        status SMALLINT DEFAULT 1,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS mini_video_likes (
+        id SERIAL PRIMARY KEY,
+        video_id INT NOT NULL,
+        user_id INT NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW(),
+        UNIQUE(video_id, user_id)
+      )
+    `)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS mini_video_comments (
+        id SERIAL PRIMARY KEY,
+        video_id INT NOT NULL,
+        user_id INT NOT NULL,
+        content TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `)
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_mvc_video ON mini_video_comments(video_id)`)
+    console.log('mini_videos tables ready')
+  } catch(e) { console.log('mini_videos init:', e.message) }
+})()
+
+// 视频列表（分页，支持滑动加载）
+app.get('/miniapi/video/list', async (req, res) => {
+  try {
+    const page = Math.max(1, parseInt(req.query.page) || 1)
+    const limit = 5
+    const offset = (page - 1) * limit
+    const uid = req.miniUser?.id || 0
+
+    const rows = (await pool.query(
+      `SELECT v.*, g.goods_name, g.sale_price, g.header_images
+       FROM mini_videos v
+       LEFT JOIN mini_goods g ON g.id=v.goods_id
+       WHERE v.status=1
+       ORDER BY v.sort DESC, v.id DESC
+       LIMIT $1 OFFSET $2`,
+      [limit, offset]
+    )).rows
+
+    // 当前用户点赞状态
+    let likedIds = new Set()
+    if (uid && rows.length) {
+      const vids = rows.map(r => r.id)
+      const lk = (await pool.query(
+        `SELECT video_id FROM mini_video_likes WHERE user_id=$1 AND video_id=ANY($2)`,
+        [uid, vids]
+      )).rows
+      lk.forEach(r => likedIds.add(r.video_id))
+    }
+
+    const list = rows.map(r => ({
+      ...r,
+      liked: likedIds.has(r.id),
+      header_images: r.header_images ? (typeof r.header_images === 'string' ? JSON.parse(r.header_images) : r.header_images) : [],
+    }))
+    return ok(res, { list, has_more: rows.length === limit })
+  } catch(e) { fail(res, e.message) }
+})
+
+// 点赞/取消点赞
+app.post('/miniapi/video/like', miniAuth, async (req, res) => {
+  try {
+    const { video_id } = req.body
+    const uid = req.miniUser.id
+    const existing = (await pool.query(
+      `SELECT id FROM mini_video_likes WHERE video_id=$1 AND user_id=$2`, [video_id, uid]
+    )).rows[0]
+    if (existing) {
+      await pool.query(`DELETE FROM mini_video_likes WHERE video_id=$1 AND user_id=$2`, [video_id, uid])
+      await pool.query(`UPDATE mini_videos SET like_count=GREATEST(0,like_count-1) WHERE id=$1`, [video_id])
+      return ok(res, { liked: false })
+    } else {
+      await pool.query(`INSERT INTO mini_video_likes (video_id,user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, [video_id, uid])
+      await pool.query(`UPDATE mini_videos SET like_count=like_count+1 WHERE id=$1`, [video_id])
+      return ok(res, { liked: true })
+    }
+  } catch(e) { fail(res, e.message) }
+})
+
+// 评论列表
+app.get('/miniapi/video/comments', async (req, res) => {
+  try {
+    const { video_id } = req.query
+    const rows = (await pool.query(
+      `SELECT c.*, u.name, u.phone FROM mini_video_comments c
+       LEFT JOIN mini_users u ON u.id=c.user_id
+       WHERE c.video_id=$1 ORDER BY c.id DESC LIMIT 50`,
+      [video_id]
+    )).rows
+    return ok(res, rows.map(r => ({
+      ...r,
+      display_name: r.name || (r.phone ? r.phone.slice(0,3)+'****'+r.phone.slice(-2) : '用户'),
+    })))
+  } catch(e) { fail(res, e.message) }
+})
+
+// 发表评论
+app.post('/miniapi/video/comment', miniAuth, async (req, res) => {
+  try {
+    const { video_id, content } = req.body
+    if (!content?.trim()) return fail(res, '评论不能为空')
+    const uid = req.miniUser.id
+    await pool.query(
+      `INSERT INTO mini_video_comments (video_id,user_id,content) VALUES ($1,$2,$3)`,
+      [video_id, uid, content.trim()]
+    )
+    await pool.query(`UPDATE mini_videos SET comment_count=comment_count+1 WHERE id=$1`, [video_id])
+    const user = (await pool.query(`SELECT name,phone FROM mini_users WHERE id=$1`, [uid])).rows[0]
+    return ok(res, {
+      display_name: user?.name || (user?.phone ? user.phone.slice(0,3)+'****'+user.phone.slice(-2) : '用户'),
+      content: content.trim(),
+      created_at: new Date(),
+    })
+  } catch(e) { fail(res, e.message) }
+})
+
+// 曝光计数（静默，不返回数据）
+app.post('/miniapi/video/view', async (req, res) => {
+  try {
+    const { video_id } = req.body
+    if (video_id) await pool.query(`UPDATE mini_videos SET view_count=view_count+1 WHERE id=$1`, [video_id])
+    return ok(res, {})
+  } catch(e) { ok(res, {}) }
+})
+
+// 管理端：视频列表
+app.get('/adminapi/mini/videos', auth, async (req, res) => {
+  try {
+    const { page = 1, list_rows = 20 } = req.query
+    const offset = (page - 1) * list_rows
+    const total = (await pool.query(`SELECT COUNT(*) FROM mini_videos`)).rows[0].count
+    const rows = (await pool.query(
+      `SELECT * FROM mini_videos ORDER BY sort DESC, id DESC LIMIT $1 OFFSET $2`,
+      [list_rows, offset]
+    )).rows
+    return ok(res, { total: +total, list: rows })
+  } catch(e) { fail(res, e.message) }
+})
+
+// 管理端：新增/编辑视频
+app.post('/adminapi/mini/videos/save', auth, async (req, res) => {
+  try {
+    const { id, title, description, video_url, cover_url, goods_id, sort = 0, status = 1 } = req.body
+    if (!title || !video_url) return fail(res, '标题和视频URL必填')
+    if (id) {
+      const r = await pool.query(
+        `UPDATE mini_videos SET title=$1,description=$2,video_url=$3,cover_url=$4,goods_id=$5,sort=$6,status=$7 WHERE id=$8 RETURNING *`,
+        [title, description, video_url, cover_url, goods_id || 0, sort, status, id]
+      )
+      return ok(res, r.rows[0])
+    } else {
+      const r = await pool.query(
+        `INSERT INTO mini_videos (title,description,video_url,cover_url,goods_id,sort,status) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+        [title, description, video_url, cover_url, goods_id || 0, sort, status]
+      )
+      return ok(res, r.rows[0])
+    }
+  } catch(e) { fail(res, e.message) }
+})
+
+// 管理端：删除视频
+app.post('/adminapi/mini/videos/del', auth, async (req, res) => {
+  try {
+    await pool.query(`UPDATE mini_videos SET status=0 WHERE id=$1`, [req.body.id])
     return ok(res, {})
   } catch(e) { fail(res, e.message) }
 })

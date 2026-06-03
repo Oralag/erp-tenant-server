@@ -4578,6 +4578,21 @@ app.post('/adminapi/mini/videos/del', auth, async (req, res) => {
   } catch(e) { fail(res, e.message) }
 })
 
+// 管理端：获取七牛云上传token
+app.get('/adminapi/mini/video-token', auth, (req, res) => {
+  try {
+    const qiniu = require('qiniu')
+    const AK = process.env.QINIU_AK || '5Y3KQi2xwmjZG339-mPFwsrSHm1e5e9nZkoW46Gl'
+    const SK = process.env.QINIU_SK || 'y8BmL62oTxlZSl38IC3pJFyiBO_5g6l6gU7vroYk'
+    const BUCKET = process.env.QINIU_BUCKET || 'nomad-videos'
+    const DOMAIN = process.env.QINIU_DOMAIN || ''
+    const mac = new qiniu.auth.digest.Mac(AK, SK)
+    const policy = new qiniu.rs.PutPolicy({ scope: BUCKET, expires: 3600, returnBody: '{"key":"$(key)","hash":"$(etag)","size":$(fsize)}' })
+    const token = policy.uploadToken(mac)
+    ok(res, { token, domain: DOMAIN || `http://rzrbtj3fi.hn-bkt.clouddn.com`, bucket: BUCKET })
+  } catch(e) { fail(res, e.message) }
+})
+
 // 管理端：发货并推送订阅消息
 app.post('/adminapi/mini/ship', auth, async (req, res) => {
   try {

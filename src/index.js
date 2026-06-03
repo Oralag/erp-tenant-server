@@ -3655,10 +3655,10 @@ app.post('/miniapi/order/create', miniAuth, async (req, res) => {
       const goodsName = validItems.map(i => i.goods_name).join('、').slice(0, 20)
       const now = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })
       sendSubscribeMsg(openid, TMPL_ORDER_SUCCESS, `pages/order/detail?id=${order.id}`, {
-        thing1: { value: goodsName },
-        amount2: { value: `¥${serverTotal.toFixed(2)}` },
-        character_string3: { value: order.order_no },
-        time4: { value: now.slice(0, 16) },
+        thing1: { value: goodsName },           // 商品名称
+        amount1: { value: `¥${serverTotal.toFixed(2)}` }, // 订单总价
+        character_string1: { value: order.order_no },     // 交易单号
+        time1: { value: now.slice(0, 16) },               // 下单时间
       }).catch(() => {})
     }
 

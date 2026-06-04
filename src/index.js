@@ -4442,7 +4442,7 @@ app.get('/miniapi/video/list', async (req, res) => {
     const rows = (await pool.query(
       `SELECT v.*, g.goods_name, g.sale_price, g.header_images
        FROM mini_videos v
-       LEFT JOIN mini_goods g ON g.id=v.goods_id
+       LEFT JOIN shop_goods g ON g.id=v.goods_id
        WHERE v.status=1
        ORDER BY v.sort DESC, v.id DESC
        LIMIT $1 OFFSET $2`,

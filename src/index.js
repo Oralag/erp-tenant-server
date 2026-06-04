@@ -4578,18 +4578,21 @@ app.post('/adminapi/mini/videos/del', auth, async (req, res) => {
   } catch(e) { fail(res, e.message) }
 })
 
-// 管理端：获取七牛云上传token
+// 管理端：获取七牛云上传token（纯内置crypto，无需qiniu包）
 app.get('/adminapi/mini/video-token', auth, (req, res) => {
   try {
-    const qiniu = require('qiniu')
+    const crypto = require('crypto')
     const AK = process.env.QINIU_AK || '5Y3KQi2xwmjZG339-mPFwsrSHm1e5e9nZkoW46Gl'
     const SK = process.env.QINIU_SK || 'y8BmL62oTxlZSl38IC3pJFyiBO_5g6l6gU7vroYk'
     const BUCKET = process.env.QINIU_BUCKET || 'nomad-videos'
-    const DOMAIN = process.env.QINIU_DOMAIN || ''
-    const mac = new qiniu.auth.digest.Mac(AK, SK)
-    const policy = new qiniu.rs.PutPolicy({ scope: BUCKET, expires: 3600, returnBody: '{"key":"$(key)","hash":"$(etag)","size":$(fsize)}' })
-    const token = policy.uploadToken(mac)
-    ok(res, { token, domain: DOMAIN || `http://rzrbtj3fi.hn-bkt.clouddn.com`, bucket: BUCKET })
+    const DOMAIN = process.env.QINIU_DOMAIN || 'https://nomaderp.pages.dev/media'
+    const deadline = Math.floor(Date.now() / 1000) + 3600
+    const policy = { scope: BUCKET, deadline, returnBody: '{"key":"$(key)","hash":"$(etag)"}' }
+    const encodedPolicy = Buffer.from(JSON.stringify(policy)).toString('base64').replace(/\+/g,'-').replace(/\//g,'_')
+    const sign = crypto.createHmac('sha1', SK).update(encodedPolicy).digest()
+    const encodedSign = sign.toString('base64').replace(/\+/g,'-').replace(/\//g,'_')
+    const token = `${AK}:${encodedSign}:${encodedPolicy}`
+    ok(res, { token, domain: DOMAIN, bucket: BUCKET })
   } catch(e) { fail(res, e.message) }
 })
 

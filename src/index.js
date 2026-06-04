@@ -98,13 +98,8 @@ function ok(res, data = {}, message = '') {
 }
 
 // 健康检查（含DB诊断）
-app.get('/health', async (req, res) => {
-  try {
-    const r = await pool.query('SELECT NOW() as t, current_database() as db')
-    res.json({ ok: true, db: r.rows[0].db, time: r.rows[0].t })
-  } catch(e) {
-    res.json({ ok: false, error: e?.message || '', code: e?.code, stack: e?.stack?.split('\n')[0] })
-  }
+app.get('/health', (req, res) => {
+  res.json({ ok: true })
 })
 
 function fail(res, message = '操作失败', status = 200) {

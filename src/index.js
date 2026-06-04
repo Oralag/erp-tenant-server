@@ -4580,13 +4580,14 @@ app.get('/adminapi/mini/video-token', auth, (req, res) => {
     const SK = process.env.QINIU_SK || 'y8BmL62oTxlZSl38IC3pJFyiBO_5g6l6gU7vroYk'
     const BUCKET = process.env.QINIU_BUCKET || 'nomad-videos'
     const DOMAIN = process.env.QINIU_DOMAIN || 'https://nomaderp.pages.dev/media'
+    const UPLOAD_URL = process.env.QINIU_UPLOAD_URL || 'https://up-z2.qiniup.com/'
     const deadline = Math.floor(Date.now() / 1000) + 3600
     const policy = { scope: BUCKET, deadline, returnBody: '{"key":"$(key)","hash":"$(etag)"}' }
     const encodedPolicy = Buffer.from(JSON.stringify(policy)).toString('base64').replace(/\+/g,'-').replace(/\//g,'_')
     const sign = crypto.createHmac('sha1', SK).update(encodedPolicy).digest()
     const encodedSign = sign.toString('base64').replace(/\+/g,'-').replace(/\//g,'_')
     const token = `${AK}:${encodedSign}:${encodedPolicy}`
-    ok(res, { token, domain: DOMAIN, bucket: BUCKET })
+    ok(res, { token, domain: DOMAIN, bucket: BUCKET, uploadUrl: UPLOAD_URL })
   } catch(e) { fail(res, e.message) }
 })
 

@@ -3321,7 +3321,6 @@ router.post('/goods/BomGoods/del', async (req, res) => {
 // ─── 小程序 miniapi ───────────────────────────────────────────────────────────
 
 const MINI_JWT_SECRET = process.env.MINI_JWT_SECRET || 'mini_secret_2024'
-const WX_APPID = process.env.WX_APPID || ''
 const WX_SECRET = process.env.WX_SECRET || ''
 const WX_MCH_ID = process.env.WX_MCH_ID || ''
 const WX_MCH_KEY = process.env.WX_MCH_KEY || ''

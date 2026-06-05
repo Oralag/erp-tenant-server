@@ -4244,12 +4244,16 @@ app.post('/miniapi/wholesale/inquiry', async (req, res) => {
     // 补生日字段
     await pool.query(`ALTER TABLE mini_users ADD COLUMN IF NOT EXISTS birth_month SMALLINT`)
     await pool.query(`ALTER TABLE mini_users ADD COLUMN IF NOT EXISTS birth_day SMALLINT`)
-    // 预置默认券：新客6元券 + 生日8元券
+    await pool.query(`ALTER TABLE mini_coupons ADD COLUMN IF NOT EXISTS points_cost INT NOT NULL DEFAULT 0`)
+    // 预置默认券
     await pool.query(`
-      INSERT INTO mini_coupons (name, type, discount_value, min_order, validity_days, total_count)
-      VALUES ('新客专享券', 'new_user', 6, 0, 30, -1),
-             ('生日特权券', 'birthday', 15, 50, 7, -1),
-             ('签到7天专享券', 'signin7', 8, 30, 14, -1)
+      INSERT INTO mini_coupons (name, type, discount_value, min_order, validity_days, total_count, points_cost)
+      VALUES ('新客专享券', 'new_user', 6, 0, 30, -1, 0),
+             ('生日特权券', 'birthday', 15, 50, 7, -1, 0),
+             ('签到7天专享券', 'signin7', 8, 30, 14, -1, 0),
+             ('积分兑换券¥5', 'points_exchange', 5, 30, 30, -1, 100),
+             ('积分兑换券¥10', 'points_exchange', 10, 60, 30, -1, 200),
+             ('积分兑换券¥20', 'points_exchange', 20, 100, 30, -1, 500)
       ON CONFLICT DO NOTHING
     `)
     console.log('mini_coupons tables ready')
@@ -4723,6 +4727,39 @@ app.post('/adminapi/mini/broadcast', auth, async (req, res) => {
       await new Promise(r => setTimeout(r, 50)) // 避免频率限制
     }
     return ok(res, { sent })
+  } catch(e) { fail(res, e.message) }
+})
+
+// ─── 积分兑换优惠券 ───────────────────────────────────────────────────────────
+
+// 可兑换列表（带当前积分）
+app.get('/miniapi/points/redeemable', miniAuth, async (req, res) => {
+  try {
+    const uid = req.miniUser.id
+    const user = (await pool.query(`SELECT points FROM mini_users WHERE id=$1`, [uid])).rows[0]
+    const coupons = (await pool.query(
+      `SELECT id, name, discount_value, min_order, validity_days, points_cost
+       FROM mini_coupons WHERE type='points_exchange' AND status=1 ORDER BY points_cost ASC`
+    )).rows
+    ok(res, { points: user?.points || 0, coupons })
+  } catch(e) { fail(res, e.message) }
+})
+
+// 积分兑换
+app.post('/miniapi/points/redeem', miniAuth, async (req, res) => {
+  try {
+    const { coupon_id } = req.body
+    const uid = req.miniUser.id
+    const c = (await pool.query(`SELECT * FROM mini_coupons WHERE id=$1 AND type='points_exchange' AND status=1`, [coupon_id])).rows[0]
+    if (!c) return fail(res, '券不存在')
+    const user = (await pool.query(`SELECT points FROM mini_users WHERE id=$1`, [uid])).rows[0]
+    if ((user?.points || 0) < c.points_cost) return fail(res, `积分不足，需要${c.points_cost}分`)
+    const expireAt = new Date(Date.now() + c.validity_days * 86400000)
+    await pool.query(`INSERT INTO mini_user_coupons (user_id, coupon_id, status, expire_at) VALUES ($1,$2,0,$3)`, [uid, c.id, expireAt])
+    await pool.query(`UPDATE mini_users SET points=points-$1 WHERE id=$2`, [c.points_cost, uid])
+    await pool.query(`UPDATE mini_coupons SET claimed_count=claimed_count+1 WHERE id=$1`, [c.id])
+    const newPoints = (user.points || 0) - c.points_cost
+    ok(res, { points: newPoints, coupon_name: c.name })
   } catch(e) { fail(res, e.message) }
 })
 

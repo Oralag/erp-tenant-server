@@ -4476,6 +4476,36 @@ app.post('/adminapi/mini/coupons/del', auth, async (req, res) => {
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_mvc_video ON mini_video_comments(video_id)`)
     console.log('mini_videos tables ready')
   } catch(e) { console.log('mini_videos init:', e.message) }
+})();
+
+// 签到 & 转盘表初始化
+(async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS user_signin (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        signin_date DATE NOT NULL,
+        points_earned INTEGER DEFAULT 5,
+        streak INTEGER DEFAULT 1,
+        created_at TIMESTAMP DEFAULT NOW(),
+        UNIQUE(user_id, signin_date)
+      )
+    `)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS user_lottery (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        prize_name VARCHAR(50),
+        prize_type VARCHAR(20) DEFAULT 'none',
+        prize_value INTEGER DEFAULT 0,
+        sector_index INTEGER DEFAULT 0,
+        spin_date DATE NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `)
+    console.log('signin & lottery tables ready')
+  } catch(e) { console.log('signin/lottery init:', e.message) }
 })()
 
 // 视频列表（分页，支持滑动加载）
@@ -4692,6 +4722,79 @@ app.post('/adminapi/mini/broadcast', auth, async (req, res) => {
       await new Promise(r => setTimeout(r, 50)) // 避免频率限制
     }
     return ok(res, { sent })
+  } catch(e) { fail(res, e.message) }
+})
+
+// ─── 签到 & 转盘 ─────────────────────────────────────────────────────────────
+
+app.get('/miniapi/signin/status', miniAuth, async (req, res) => {
+  try {
+    const uid = req.miniUser.id
+    const today = new Date().toISOString().slice(0, 10)
+    const todayRow = (await pool.query(
+      `SELECT points_earned, streak FROM user_signin WHERE user_id=$1 AND signin_date=$2`, [uid, today]
+    )).rows[0]
+    let streak = todayRow ? todayRow.streak : 0
+    if (!todayRow) {
+      const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10)
+      const y = (await pool.query(`SELECT streak FROM user_signin WHERE user_id=$1 AND signin_date=$2`, [uid, yesterday])).rows[0]
+      streak = y ? y.streak : 0
+    }
+    ok(res, { signed_today: !!todayRow, streak, points_earned: todayRow?.points_earned || 0 })
+  } catch(e) { fail(res, e.message) }
+})
+
+app.post('/miniapi/signin', miniAuth, async (req, res) => {
+  try {
+    const uid = req.miniUser.id
+    const today = new Date().toISOString().slice(0, 10)
+    const existing = (await pool.query(`SELECT id FROM user_signin WHERE user_id=$1 AND signin_date=$2`, [uid, today])).rows[0]
+    if (existing) return fail(res, '今天已签到')
+    const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10)
+    const y = (await pool.query(`SELECT streak FROM user_signin WHERE user_id=$1 AND signin_date=$2`, [uid, yesterday])).rows[0]
+    const streak = y ? y.streak + 1 : 1
+    const points = streak >= 7 ? 10 : streak >= 4 ? 8 : 5
+    await pool.query(`INSERT INTO user_signin (user_id, signin_date, points_earned, streak) VALUES ($1,$2,$3,$4)`, [uid, today, points, streak])
+    await pool.query(`UPDATE mini_users SET points=COALESCE(points,0)+$1 WHERE id=$2`, [points, uid])
+    ok(res, { streak, points_earned: points })
+  } catch(e) { fail(res, e.message) }
+})
+
+app.get('/miniapi/lottery/status', miniAuth, async (req, res) => {
+  try {
+    const uid = req.miniUser.id
+    const today = new Date().toISOString().slice(0, 10)
+    const row = (await pool.query(`SELECT prize_name, prize_value FROM user_lottery WHERE user_id=$1 AND spin_date=$2`, [uid, today])).rows[0]
+    ok(res, { spun_today: !!row, last_prize: row ? { name: row.prize_name, value: row.prize_value } : null })
+  } catch(e) { fail(res, e.message) }
+})
+
+app.post('/miniapi/lottery/spin', miniAuth, async (req, res) => {
+  try {
+    const uid = req.miniUser.id
+    const today = new Date().toISOString().slice(0, 10)
+    const existing = (await pool.query(`SELECT id FROM user_lottery WHERE user_id=$1 AND spin_date=$2`, [uid, today])).rows[0]
+    if (existing) return fail(res, '今天已抽过奖')
+    const PRIZES = [
+      { name: '谢谢参与', type: 'none', value: 0, weight: 15 },
+      { name: '5积分', type: 'points', value: 5, weight: 30 },
+      { name: '10积分', type: 'points', value: 10, weight: 25 },
+      { name: '谢谢参与', type: 'none', value: 0, weight: 10 },
+      { name: '20积分', type: 'points', value: 20, weight: 12 },
+      { name: '50积分', type: 'points', value: 50, weight: 5 },
+      { name: '10积分', type: 'points', value: 10, weight: 2 },
+      { name: '100积分', type: 'points', value: 100, weight: 1 },
+    ]
+    const total = PRIZES.reduce((s, p) => s + p.weight, 0)
+    let r = Math.random() * total, prizeIdx = PRIZES.length - 1
+    for (let i = 0; i < PRIZES.length; i++) { r -= PRIZES[i].weight; if (r <= 0) { prizeIdx = i; break } }
+    const prize = PRIZES[prizeIdx]
+    await pool.query(`INSERT INTO user_lottery (user_id, prize_name, prize_type, prize_value, sector_index, spin_date) VALUES ($1,$2,$3,$4,$5,$6)`,
+      [uid, prize.name, prize.type, prize.value, prizeIdx, today])
+    if (prize.type === 'points' && prize.value > 0) {
+      await pool.query(`UPDATE mini_users SET points=COALESCE(points,0)+$1 WHERE id=$2`, [prize.value, uid])
+    }
+    ok(res, { prize_name: prize.name, prize_value: prize.value, prize_type: prize.type, sector_index: prizeIdx })
   } catch(e) { fail(res, e.message) }
 })
 

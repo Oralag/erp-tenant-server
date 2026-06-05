@@ -3713,6 +3713,15 @@ app.get('/miniapi/order/detail/:id', miniAuth, async (req, res) => {
     if (!r.rows[0]) return fail(res, '订单不存在')
     const order = r.rows[0]
     order.items = (await pool.query(`SELECT * FROM mini_order_items WHERE order_id=$1`, [order.id])).rows
+    // 标记每个商品是否已评价
+    if (order.items.length) {
+      const goodsIds = order.items.map(i => i.goods_id).filter(Boolean)
+      const reviewed = (await pool.query(
+        `SELECT goods_id FROM mini_reviews WHERE order_id=$1 AND goods_id=ANY($2)`,
+        [order.id, goodsIds]
+      )).rows.map(r => r.goods_id)
+      order.items = order.items.map(i => ({ ...i, reviewed: reviewed.includes(i.goods_id) }))
+    }
     order.address = typeof order.address === 'string' ? JSON.parse(order.address) : (order.address || {})
     return ok(res, order)
   } catch (e) { fail(res, e.message) }

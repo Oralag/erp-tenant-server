@@ -4215,7 +4215,7 @@ app.post('/miniapi/review/create', miniAuth, async (req, res) => {
       [goods_id, req.miniUser.id, order_id, rating, content || '', imagesJson]
     )
     // 基础10积分 + 图片每张1积分（最多10张=10分）
-    const photoBonus = Array.isArray(imgArr) ? Math.min(imgArr.length, 10) : 0
+    const photoBonus = Array.isArray(imgArr) ? Math.min(imgArr.length, 6) : 0
     const totalPoints = 10 + photoBonus
     await pool.query(`UPDATE mini_users SET points=COALESCE(points,0)+$1 WHERE id=$2`, [totalPoints, req.miniUser.id])
     const msg = photoBonus > 0

@@ -3582,6 +3582,14 @@ app.get('/miniapi/goods/detail/:id', async (req, res) => {
     )).rows[0]
     goods.avg_rating = parseFloat(revRow.avg) || 0
     goods.review_count = parseInt(revRow.cnt)
+    const reviewRows = (await pool.query(
+      `SELECT r.id, r.rating, r.content, r.created_at,
+              COALESCE(u.name, u.phone, '匿名用户') as user_name
+       FROM mini_reviews r LEFT JOIN mini_users u ON u.id=r.user_id
+       WHERE r.goods_id=$1 ORDER BY r.id DESC LIMIT 10`,
+      [r.rows[0].id]
+    )).rows
+    goods.reviews = reviewRows
     return ok(res, goods)
   } catch (e) { fail(res, e.message) }
 })

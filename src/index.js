@@ -3583,7 +3583,7 @@ app.get('/miniapi/goods/detail/:id', async (req, res) => {
     goods.avg_rating = parseFloat(revRow.avg) || 0
     goods.review_count = parseInt(revRow.cnt)
     const reviewRows = (await pool.query(
-      `SELECT r.id, r.rating, r.content, r.created_at,
+      `SELECT r.id, r.rating, r.content, r.created_at, r.images,
               COALESCE(u.name, u.phone, '匿名用户') as user_name
        FROM mini_reviews r LEFT JOIN mini_users u ON u.id=r.user_id
        WHERE r.goods_id=$1 ORDER BY r.id DESC LIMIT 10`,
@@ -4086,11 +4086,13 @@ ${productLines || '奶皮、奶豆腐、青砖奶茶、冻炒米、奶果子、�
         order_id INT NOT NULL,
         rating SMALLINT NOT NULL CHECK (rating BETWEEN 1 AND 5),
         content TEXT DEFAULT '',
+        images TEXT DEFAULT NULL,
         created_at TIMESTAMP DEFAULT NOW(),
         UNIQUE(order_id, goods_id)
       )
     `)
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_mini_reviews_goods ON mini_reviews(goods_id)`)
+    await pool.query(`ALTER TABLE mini_reviews ADD COLUMN IF NOT EXISTS images TEXT DEFAULT NULL`)
 
     // 默认好评种子数据（order_id 用负数，不与真实订单冲突）
     const seeds = [
@@ -4157,7 +4159,7 @@ app.get('/miniapi/review/list', async (req, res) => {
     const offset = (parseInt(page) - 1) * parseInt(list_rows)
     const total = parseInt((await pool.query(`SELECT COUNT(*) FROM mini_reviews WHERE goods_id=$1`, [goods_id])).rows[0].count)
     const rows = (await pool.query(
-      `SELECT r.id, r.rating, r.content, r.created_at,
+      `SELECT r.id, r.rating, r.content, r.created_at, r.images,
               COALESCE(u.name, u.phone, '匿名用户') as user_name
        FROM mini_reviews r
        LEFT JOIN mini_users u ON u.id=r.user_id
@@ -4167,6 +4169,25 @@ app.get('/miniapi/review/list', async (req, res) => {
     )).rows
     const avgRow = (await pool.query(`SELECT AVG(rating)::numeric(3,1) as avg, COUNT(*) as cnt FROM mini_reviews WHERE goods_id=$1`, [goods_id])).rows[0]
     return ok(res, { rows, total, avg_rating: parseFloat(avgRow.avg) || 0, review_count: parseInt(avgRow.cnt) })
+  } catch(e) { fail(res, e.message) }
+})
+
+// 评价图片上传 token（需登录）
+app.get('/miniapi/upload/review-token', miniAuth, (req, res) => {
+  try {
+    const crypto = require('crypto')
+    const AK = process.env.QINIU_AK || '5Y3KQi2xwmjZG339-mPFwsrSHm1e5e9nZkoW46Gl'
+    const SK = process.env.QINIU_SK || 'y8BmL62oTxlZSl38IC3pJFyiBO_5g6l6gU7vroYk'
+    const BUCKET = process.env.QINIU_BUCKET || 'nomad-videos'
+    const DOMAIN = process.env.QINIU_DOMAIN || 'https://nomaderp.pages.dev/media'
+    const UPLOAD_URL = process.env.QINIU_UPLOAD_URL || 'https://up-z2.qiniup.com/'
+    const deadline = Math.floor(Date.now() / 1000) + 3600
+    const policy = { scope: BUCKET, deadline, returnBody: '{"key":"$(key)","hash":"$(etag)"}' }
+    const encodedPolicy = Buffer.from(JSON.stringify(policy)).toString('base64').replace(/\+/g,'-').replace(/\//g,'_')
+    const sign = crypto.createHmac('sha1', SK).update(encodedPolicy).digest()
+    const encodedSign = sign.toString('base64').replace(/\+/g,'-').replace(/\//g,'_')
+    const token = `${AK}:${encodedSign}:${encodedPolicy}`
+    ok(res, { token, domain: DOMAIN, uploadUrl: UPLOAD_URL })
   } catch(e) { fail(res, e.message) }
 })
 
@@ -4187,9 +4208,11 @@ app.post('/miniapi/review/create', miniAuth, async (req, res) => {
     // 防重复
     const exist = (await pool.query(`SELECT id FROM mini_reviews WHERE order_id=$1 AND goods_id=$2 LIMIT 1`, [order_id, goods_id])).rows[0]
     if (exist) return fail(res, '已评价过')
+    const { goods_id: _g, order_id: _o, rating: _r, content: _c, images: imgArr } = req.body
+    const imagesJson = Array.isArray(imgArr) && imgArr.length ? JSON.stringify(imgArr) : null
     await pool.query(
-      `INSERT INTO mini_reviews (goods_id, user_id, order_id, rating, content) VALUES ($1,$2,$3,$4,$5)`,
-      [goods_id, req.miniUser.id, order_id, rating, content || '']
+      `INSERT INTO mini_reviews (goods_id, user_id, order_id, rating, content, images) VALUES ($1,$2,$3,$4,$5,$6)`,
+      [goods_id, req.miniUser.id, order_id, rating, content || '', imagesJson]
     )
     // 评价完成赠10积分
     await pool.query(`UPDATE mini_users SET points=COALESCE(points,0)+10 WHERE id=$1`, [req.miniUser.id])

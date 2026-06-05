@@ -4248,7 +4248,8 @@ app.post('/miniapi/wholesale/inquiry', async (req, res) => {
     await pool.query(`
       INSERT INTO mini_coupons (name, type, discount_value, min_order, validity_days, total_count)
       VALUES ('新客专享券', 'new_user', 6, 0, 30, -1),
-             ('生日特权券', 'birthday', 15, 50, 7, -1)
+             ('生日特权券', 'birthday', 15, 50, 7, -1),
+             ('签到7天专享券', 'signin7', 8, 30, 14, -1)
       ON CONFLICT DO NOTHING
     `)
     console.log('mini_coupons tables ready')
@@ -4831,7 +4832,23 @@ app.post('/miniapi/signin', miniAuth, async (req, res) => {
     const points = streak >= 7 ? 10 : streak >= 4 ? 8 : 5
     await pool.query(`INSERT INTO user_signin (user_id, signin_date, points_earned, streak) VALUES ($1,$2,$3,$4)`, [uid, today, points, streak])
     await pool.query(`UPDATE mini_users SET points=COALESCE(points,0)+$1 WHERE id=$2`, [points, uid])
-    ok(res, { streak, points_earned: points })
+    // 连签7天整数倍时发签到券
+    let coupon_reward = null
+    if (streak % 7 === 0) {
+      const c = (await pool.query(`SELECT id FROM mini_coupons WHERE type='signin7' AND status=1 LIMIT 1`)).rows[0]
+      if (c) {
+        const expireAt = new Date(Date.now() + 14 * 86400000)
+        try {
+          await pool.query(
+            `INSERT INTO mini_user_coupons (user_id, coupon_id, status, expire_at) VALUES ($1,$2,0,$3)`,
+            [uid, c.id, expireAt]
+          )
+          await pool.query(`UPDATE mini_coupons SET claimed_count=claimed_count+1 WHERE id=$1`, [c.id])
+          coupon_reward = '签到7天专享券 ¥8'
+        } catch {}
+      }
+    }
+    ok(res, { streak, points_earned: points, coupon_reward })
   } catch(e) { fail(res, e.message) }
 })
 

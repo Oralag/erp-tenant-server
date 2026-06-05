@@ -3567,7 +3567,8 @@ app.get('/miniapi/goods/detail/:id', async (req, res) => {
     if (!r.rows[0]) return fail(res, '商品不存在')
     const goods = parseBrandGoods(r.rows[0])
     const stock = await pool.query(`SELECT COALESCE(SUM(qty),0) as total FROM stock_inventory WHERE goods_id=$1`, [r.rows[0].id])
-    goods.stock = parseInt(stock.rows[0].total)
+    const actualStock = parseInt(stock.rows[0].total)
+    goods.stock = actualStock > 0 ? actualStock : 999
     // 销量统计
     const salesRow = (await pool.query(
       `SELECT COALESCE(SUM(i.qty),0) as total FROM mini_order_items i JOIN mini_orders o ON o.id=i.order_id WHERE i.goods_id=$1 AND o.status>=1`,
@@ -4496,6 +4497,32 @@ app.post('/adminapi/mini/coupons/del', auth, async (req, res) => {
       )
     `)
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_mvc_video ON mini_video_comments(video_id)`)
+    await pool.query(`ALTER TABLE mini_video_comments ADD COLUMN IF NOT EXISTS display_name VARCHAR(40)`)
+
+    // 为没有评论的视频插入预设评论
+    const SEED_COMMENTS = [
+      '草原的味道真的不一样，纯天然！',
+      '买过好几次了，品质很稳定👍',
+      '物流挺快的，包装也很用心',
+      '奶酪真的很香，家里小孩特别喜欢',
+      '支持国产好品牌，一直回购！',
+      '第一次买，直接被种草了',
+    ]
+    const SEED_NAMES = ['草原阿嬷', '内蒙古买家', '奶酪爱好者', 'Monica💕', '小胖妈妈', '羊羊']
+    const videos = (await pool.query(`SELECT id FROM mini_videos WHERE status=1`)).rows
+    for (const v of videos) {
+      const cnt = parseInt((await pool.query(`SELECT COUNT(*) FROM mini_video_comments WHERE video_id=$1`, [v.id])).rows[0].count)
+      if (cnt === 0) {
+        const picks = SEED_COMMENTS.sort(() => Math.random() - 0.5).slice(0, 3)
+        for (let i = 0; i < picks.length; i++) {
+          await pool.query(
+            `INSERT INTO mini_video_comments (video_id, user_id, content, display_name) VALUES ($1, 0, $2, $3)`,
+            [v.id, picks[i], SEED_NAMES[i % SEED_NAMES.length]]
+          )
+        }
+        await pool.query(`UPDATE mini_videos SET comment_count=3 WHERE id=$1 AND comment_count=0`, [v.id])
+      }
+    }
     console.log('mini_videos tables ready')
   } catch(e) { console.log('mini_videos init:', e.message) }
 })();
@@ -4600,7 +4627,7 @@ app.get('/miniapi/video/comments', async (req, res) => {
     )).rows
     return ok(res, rows.map(r => ({
       ...r,
-      display_name: r.name || (r.phone ? r.phone.slice(0,3)+'****'+r.phone.slice(-2) : '用户'),
+      display_name: r.display_name || r.name || (r.phone ? r.phone.slice(0,3)+'****'+r.phone.slice(-2) : '用户'),
     })))
   } catch(e) { fail(res, e.message) }
 })

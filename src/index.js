@@ -3416,6 +3416,15 @@ app.post('/miniapi/auth/phoneLogin', async (req, res) => {
         `INSERT INTO shop_customer (name, mobile, source, created_at) VALUES ($1,$2,'小程序',NOW()) ON CONFLICT DO NOTHING`,
         [phone, phone]
       ).catch(() => {})
+      // 新客自动发两张满减券
+      try {
+        const newUserCoupons = (await pool.query(`SELECT id, validity_days FROM mini_coupons WHERE type='new_user' AND status=1`)).rows
+        for (const c of newUserCoupons) {
+          const expireAt = new Date(Date.now() + c.validity_days * 86400000)
+          await pool.query(`INSERT INTO mini_user_coupons (user_id, coupon_id, status, expire_at) VALUES ($1,$2,0,$3)`, [user.id, c.id, expireAt])
+          await pool.query(`UPDATE mini_coupons SET claimed_count=claimed_count+1 WHERE id=$1`, [c.id])
+        }
+      } catch {}
     } else if (!user.phone) {
       await pool.query(`UPDATE mini_users SET phone=$1, name=$2 WHERE id=$3`, [phone, phone, user.id])
       user.phone = phone; user.name = phone
@@ -3432,6 +3441,7 @@ app.post('/miniapi/auth/bindPhone', async (req, res) => {
     const { phone, code, openid } = req.body
     if (!phone || !openid) return fail(res, '参数缺失')
     let user = (await pool.query(`SELECT * FROM mini_users WHERE phone=$1 AND deleted_at IS NULL LIMIT 1`, [phone])).rows[0]
+    const isNewUser = !user
     if (!user) {
       const ins = await pool.query(
         `INSERT INTO mini_users (openid, phone, name, created_at) VALUES ($1,$2,$3,NOW()) RETURNING *`,
@@ -3442,6 +3452,15 @@ app.post('/miniapi/auth/bindPhone', async (req, res) => {
         `INSERT INTO shop_customer (name, mobile, source, created_at) VALUES ($1,$2,'小程序',NOW()) ON CONFLICT DO NOTHING`,
         [phone, phone]
       ).catch(() => {})
+      // 新客自动发两张满减券
+      try {
+        const newUserCoupons = (await pool.query(`SELECT id, validity_days FROM mini_coupons WHERE type='new_user' AND status=1`)).rows
+        for (const c of newUserCoupons) {
+          const expireAt = new Date(Date.now() + c.validity_days * 86400000)
+          await pool.query(`INSERT INTO mini_user_coupons (user_id, coupon_id, status, expire_at) VALUES ($1,$2,0,$3)`, [user.id, c.id, expireAt])
+          await pool.query(`UPDATE mini_coupons SET claimed_count=claimed_count+1 WHERE id=$1`, [c.id])
+        }
+      } catch {}
     }
     const token = jwt.sign({ id: user.id, openid, phone: user.phone }, MINI_JWT_SECRET, { expiresIn: '30d' })
     return ok(res, { token, user: { id: user.id, name: user.name, phone: user.phone } })
@@ -4248,12 +4267,10 @@ app.post('/miniapi/wholesale/inquiry', async (req, res) => {
     // 预置默认券
     await pool.query(`
       INSERT INTO mini_coupons (name, type, discount_value, min_order, validity_days, total_count, points_cost)
-      VALUES ('新客专享券', 'new_user', 6, 0, 30, -1, 0),
+      VALUES ('新客满减券·满100减10', 'new_user', 10, 100, 30, -1, 0),
+             ('新客满减券·满300减20', 'new_user', 20, 300, 30, -1, 0),
              ('生日特权券', 'birthday', 15, 50, 7, -1, 0),
-             ('签到7天专享券', 'signin7', 8, 30, 14, -1, 0),
-             ('积分兑换券¥5', 'points_exchange', 5, 30, 30, -1, 100),
-             ('积分兑换券¥10', 'points_exchange', 10, 60, 30, -1, 200),
-             ('积分兑换券¥20', 'points_exchange', 20, 100, 30, -1, 500)
+             ('签到7天专享券', 'signin7', 8, 30, 14, -1, 0)
       ON CONFLICT DO NOTHING
     `)
     console.log('mini_coupons tables ready')

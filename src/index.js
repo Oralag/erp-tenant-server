@@ -4214,9 +4214,14 @@ app.post('/miniapi/review/create', miniAuth, async (req, res) => {
       `INSERT INTO mini_reviews (goods_id, user_id, order_id, rating, content, images) VALUES ($1,$2,$3,$4,$5,$6)`,
       [goods_id, req.miniUser.id, order_id, rating, content || '', imagesJson]
     )
-    // 评价完成赠10积分
-    await pool.query(`UPDATE mini_users SET points=COALESCE(points,0)+10 WHERE id=$1`, [req.miniUser.id])
-    return ok(res, { message: '评价成功，赠送10积分' })
+    // 基础10积分 + 图片每张1积分（最多10张=10分）
+    const photoBonus = Array.isArray(imgArr) ? Math.min(imgArr.length, 10) : 0
+    const totalPoints = 10 + photoBonus
+    await pool.query(`UPDATE mini_users SET points=COALESCE(points,0)+$1 WHERE id=$2`, [totalPoints, req.miniUser.id])
+    const msg = photoBonus > 0
+      ? `评价成功！获得${totalPoints}积分（评价+10，图片+${photoBonus}）`
+      : '评价成功，获得10积分'
+    return ok(res, { message: msg })
   } catch(e) { fail(res, e.message) }
 })
 

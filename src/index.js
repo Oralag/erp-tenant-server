@@ -4725,6 +4725,81 @@ app.post('/adminapi/mini/broadcast', auth, async (req, res) => {
   } catch(e) { fail(res, e.message) }
 })
 
+// ─── 包装二维码生成 & 扫码追踪 ────────────────────────────────────────────────
+
+// 初始化扫码记录表
+;(async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS qr_scans (
+        id SERIAL PRIMARY KEY,
+        scene VARCHAR(100) NOT NULL,
+        user_id INTEGER,
+        scanned_at TIMESTAMP DEFAULT NOW()
+      )
+    `)
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_qr_scene ON qr_scans(scene)`)
+  } catch(e) { console.log('qr_scans init:', e.message) }
+})()
+
+// 管理端：生成小程序码图片（返回 base64）
+app.post('/adminapi/mini/qrcode', auth, async (req, res) => {
+  try {
+    const { scene = 'pkg001', page = 'pages/lottery/index', width = 430 } = req.body
+    const token = await getWxAccessToken()
+    if (!token) return fail(res, '微信Token获取失败，请检查WX_APPSECRET配置')
+    const wxRes = await fetch(
+      `https://api.weixin.qq.com/wxa/getwxacodeunlimit?access_token=${token}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ scene, page, width, is_hyaline: false }),
+      }
+    )
+    const contentType = wxRes.headers.get('content-type') || ''
+    if (contentType.includes('image')) {
+      const buf = Buffer.from(await wxRes.arrayBuffer())
+      const b64 = buf.toString('base64')
+      return ok(res, { base64: `data:image/png;base64,${b64}`, scene })
+    }
+    const json = await wxRes.json()
+    fail(res, json.errmsg || '生成失败')
+  } catch(e) { fail(res, e.message) }
+})
+
+// 管理端：扫码统计
+app.get('/adminapi/mini/qrcode/stats', auth, async (req, res) => {
+  try {
+    const rows = (await pool.query(`
+      SELECT scene, COUNT(*) AS total,
+             COUNT(DISTINCT user_id) AS unique_users,
+             MAX(scanned_at) AS last_scan
+      FROM qr_scans GROUP BY scene ORDER BY total DESC
+    `)).rows
+    ok(res, rows)
+  } catch(e) { fail(res, e.message) }
+})
+
+// 小程序端：上报扫码（scene 来自二维码参数）
+app.post('/miniapi/qr/scan', async (req, res) => {
+  try {
+    const { scene } = req.body
+    if (!scene) return ok(res, {})
+    // 可选：从 token 取 user_id
+    let userId = null
+    const tk = req.headers['mini-token']
+    if (tk) {
+      try {
+        const jwt = require('jsonwebtoken')
+        const dec = jwt.verify(tk, process.env.JWT_SECRET || 'nomad_secret')
+        userId = dec.id
+      } catch {}
+    }
+    await pool.query(`INSERT INTO qr_scans (scene, user_id) VALUES ($1,$2)`, [scene, userId])
+    ok(res, {})
+  } catch(e) { fail(res, e.message) }
+})
+
 // ─── 签到 & 转盘 ─────────────────────────────────────────────────────────────
 
 app.get('/miniapi/signin/status', miniAuth, async (req, res) => {

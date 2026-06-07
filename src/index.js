@@ -2317,6 +2317,19 @@ router.post('/finance/PayReceipt/add', async (req, res) => {
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })
+router.post('/finance/PayReceipt/edit', async (req, res) => {
+  try {
+    const { id, ...fields } = req.body
+    if (!id) return fail(res, 'id不能为空')
+    const allowed = ['contact_type', 'contact_name', 'remark', 'pay_date', 'fund_id', 'fund_name', 'category']
+    const updates = Object.keys(fields).filter(k => allowed.includes(k) && fields[k] !== undefined)
+    if (updates.length === 0) return fail(res, '没有可更新的字段')
+    const sets = updates.map((k, i) => `${k}=$${i + 1}`)
+    const vals = [...updates.map(k => fields[k]), id]
+    await pool.query(`UPDATE pay_receipt SET ${sets.join(',')} WHERE id=$${vals.length}`, vals)
+    return ok(res)
+  } catch (e) { fail(res, e.message) }
+})
 router.post('/finance/PayReceipt/del', async (req, res) => {
   try {
     const { id } = req.body

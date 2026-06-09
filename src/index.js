@@ -372,6 +372,15 @@ router.get('/goods/ShopGoods/index', async (req, res) => {
     })
   } catch (e) { fail(res, e.message) }
 })
+router.get('/goods/ShopGoods/detail', auth, async (req, res) => {
+  try {
+    const id = parseInt(req.query.id)
+    if (!id) return fail(res, 'id required')
+    const r = await pool.query('SELECT * FROM goods WHERE id=$1 AND deleted_at IS NULL LIMIT 1', [id])
+    if (!r.rows[0]) return fail(res, '商品不存在')
+    return ok(res, r.rows[0])
+  } catch (e) { fail(res, e.message) }
+})
 router.post('/goods/ShopGoods/add', async (req, res) => {
   try {
     const body = req.body

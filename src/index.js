@@ -106,6 +106,10 @@ function fail(res, message = '操作失败', status = 200) {
   return res.status(status).json({ code: 0, message })
 }
 
+function todayCN() {
+  return new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString().slice(0, 10)
+}
+
 function genOrderNo(prefix = 'ORD') {
   const now = new Date()
   const ym =
@@ -3553,6 +3557,11 @@ app.get('/miniapi/goods/list', async (req, res) => {
     const brandRows = rows.filter(g => {
       try { return JSON.parse(g.remark || '{}')['__brand__']?.show === true } catch { return false }
     })
+    // 按基础销量降序排列
+    brandRows.sort((a, b) => {
+      const getBase = g => { try { return JSON.parse(g.remark || '{}')['__brand__']?.baseSales || 0 } catch { return 0 } }
+      return getBase(b) - getBase(a)
+    })
     const total = brandRows.length
     const pageSlice = brandRows.slice((pageNum - 1) * pageSize, pageNum * pageSize)
     // 批量查销量
@@ -3650,7 +3659,8 @@ app.post('/miniapi/order/create', miniAuth, async (req, res) => {
     const discount = levelInfo.discount
 
     // 积分抵扣
-    const usePoints = Math.min(parseInt(req.body.use_points || 0), userRow?.points || 0)
+    const requestedPoints = Math.max(0, parseInt(req.body.use_points || 0) || 0)
+    const usePoints = Math.min(requestedPoints, userRow?.points || 0)
     const pointsDeduct = Math.floor(usePoints / POINTS_REDEEM_RATE * 100) / 100
 
     // 优惠券抵扣
@@ -3666,45 +3676,75 @@ app.post('/miniapi/order/create', miniAuth, async (req, res) => {
         usedCoupon = uc
       }
     }
+    if (userCouponId && !usedCoupon) return fail(res, '优惠券不可用或未满足使用门槛')
 
     let serverTotal = Math.max(0, Math.round((originalTotal * discount - pointsDeduct - couponDeduct) * 100) / 100)
 
-    const orderNo = genOrderNo('MP')
     await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS coupon_id INT DEFAULT 0`)
     await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS coupon_deduct NUMERIC(8,2) DEFAULT 0`)
-    const r = await pool.query(
-      `INSERT INTO mini_orders (order_no, user_id, total_amount, original_amount, discount, points_used, coupon_id, coupon_deduct, address, remark, status, created_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,0,NOW()) RETURNING *`,
-      [orderNo, req.miniUser.id, serverTotal, originalTotal, discount, usePoints, userCouponId || 0, couponDeduct, JSON.stringify(address || {}), remark || '']
-    )
-    const order = r.rows[0]
-    for (const item of validItems) {
-      await pool.query(
-        `INSERT INTO mini_order_items (order_id, goods_id, goods_name, spec, price, qty) VALUES ($1,$2,$3,$4,$5,$6)`,
-        [order.id, item.goods_id, item.goods_name, item.spec, item.price, item.qty]
-      )
-    }
-    // 扣积分
-    if (usePoints > 0) {
-      await pool.query(`UPDATE mini_users SET points=points-$1 WHERE id=$2`, [usePoints, req.miniUser.id])
-      await pool.query(`INSERT INTO mini_points_log (user_id,points,type,remark,order_id,created_at) VALUES ($1,$2,'use','积分抵扣',$3,NOW())`, [req.miniUser.id, -usePoints, order.id])
-    }
-    // 核销优惠券
-    if (usedCoupon) {
-      await pool.query(`UPDATE mini_user_coupons SET status=1, used_at=NOW(), order_id=$1 WHERE id=$2`, [order.id, userCouponId])
-    }
+    const orderNo = genOrderNo('MP')
+    const client = await pool.connect()
+    let order
+    try {
+      await client.query('BEGIN')
 
-    // 订阅消息：购买成功通知（异步，不阻塞响应）
-    const openid = userRow?.openid
-    if (openid && TMPL_ORDER_SUCCESS) {
-      const goodsName = validItems.map(i => i.goods_name).join('、').slice(0, 20)
-      const now = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })
-      sendSubscribeMsg(openid, TMPL_ORDER_SUCCESS, `pages/order/detail?id=${order.id}`, {
-        thing1: { value: goodsName },           // 商品名称
-        amount1: { value: `¥${serverTotal.toFixed(2)}` }, // 订单总价
-        character_string1: { value: order.order_no },     // 交易单号
-        time1: { value: now.slice(0, 16) },               // 下单时间
-      }).catch(() => {})
+      if (usePoints > 0) {
+        const lockedUser = (await client.query(`SELECT points FROM mini_users WHERE id=$1 FOR UPDATE`, [req.miniUser.id])).rows[0]
+        if ((lockedUser?.points || 0) < usePoints) {
+          const err = new Error('积分余额不足')
+          err.userMessage = err.message
+          throw err
+        }
+      }
+
+      if (usedCoupon) {
+        const lockedCoupon = (await client.query(
+          `SELECT id FROM mini_user_coupons
+           WHERE id=$1 AND user_id=$2 AND status=0 AND expire_at>NOW()
+           FOR UPDATE`,
+          [userCouponId, req.miniUser.id]
+        )).rows[0]
+        if (!lockedCoupon) {
+          const err = new Error('优惠券已使用或已过期')
+          err.userMessage = err.message
+          throw err
+        }
+      }
+
+      const r = await client.query(
+        `INSERT INTO mini_orders (order_no, user_id, total_amount, original_amount, discount, points_used, coupon_id, coupon_deduct, address, remark, status, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,0,NOW()) RETURNING *`,
+        [orderNo, req.miniUser.id, serverTotal, originalTotal, discount, usePoints, userCouponId || 0, couponDeduct, JSON.stringify(address || {}), remark || '']
+      )
+      order = r.rows[0]
+
+      for (const item of validItems) {
+        await client.query(
+          `INSERT INTO mini_order_items (order_id, goods_id, goods_name, spec, price, qty) VALUES ($1,$2,$3,$4,$5,$6)`,
+          [order.id, item.goods_id, item.goods_name, item.spec, item.price, item.qty]
+        )
+      }
+
+      if (usePoints > 0) {
+        await client.query(`UPDATE mini_users SET points=COALESCE(points,0)-$1 WHERE id=$2`, [usePoints, req.miniUser.id])
+        await client.query(
+          `INSERT INTO mini_points_log (user_id,points,type,remark,order_id,created_at)
+           VALUES ($1,$2,'use','订单积分抵扣预扣',$3,NOW())`,
+          [req.miniUser.id, -usePoints, order.id]
+        )
+      }
+
+      if (usedCoupon) {
+        await client.query(`UPDATE mini_user_coupons SET status=3, order_id=$1 WHERE id=$2`, [order.id, userCouponId])
+      }
+
+      await client.query('COMMIT')
+    } catch (e) {
+      await client.query('ROLLBACK')
+      if (e.userMessage) return fail(res, e.userMessage)
+      throw e
+    } finally {
+      client.release()
     }
 
     return ok(res, { id: order.id, order_no: order.order_no, total_amount: serverTotal, original_amount: originalTotal, discount, points_used: usePoints, coupon_deduct: couponDeduct })
@@ -3747,6 +3787,33 @@ app.get('/miniapi/order/detail/:id', miniAuth, async (req, res) => {
     order.address = typeof order.address === 'string' ? JSON.parse(order.address) : (order.address || {})
     return ok(res, order)
   } catch (e) { fail(res, e.message) }
+})
+
+// 取消待支付订单并释放预扣积分/预占优惠券
+app.post('/miniapi/order/cancel', miniAuth, async (req, res) => {
+  const client = await pool.connect()
+  try {
+    const { order_id } = req.body
+    if (!order_id) return fail(res, '缺少订单ID')
+    await client.query('BEGIN')
+    const order = (await client.query(
+      `SELECT * FROM mini_orders WHERE id=$1 AND user_id=$2 AND status=0 FOR UPDATE`,
+      [order_id, req.miniUser.id]
+    )).rows[0]
+    if (!order) {
+      await client.query('ROLLBACK')
+      return fail(res, '订单不存在或不可取消')
+    }
+    await releaseOrderBenefits(client, order)
+    await client.query(`UPDATE mini_orders SET status=4 WHERE id=$1`, [order.id])
+    await client.query('COMMIT')
+    return ok(res, { id: order.id, status: 4 })
+  } catch (e) {
+    await client.query('ROLLBACK')
+    return fail(res, e.message)
+  } finally {
+    client.release()
+  }
 })
 
 // ─── 小程序订单管理（ERP后台用，使用adminapi auth）─────────────────────────────
@@ -3829,6 +3896,18 @@ app.post('/miniapi/pay/unified', miniAuth, async (req, res) => {
     const totalFee = Math.round(parseFloat(order.total_amount || order.total || 0) * 100) // 转分
     const notifyUrl = 'https://erp-server-xsji.onrender.com/miniapi/pay/notify'
 
+    if (totalFee <= 0) {
+      const updOrder = (await pool.query(`UPDATE mini_orders SET status=1, paid_at=NOW() WHERE id=$1 AND status=0 RETURNING *`, [order.id])).rows[0]
+      if (updOrder && parseInt(updOrder.coupon_id || 0) > 0) {
+        await pool.query(
+          `UPDATE mini_user_coupons SET status=1, used_at=NOW()
+           WHERE id=$1 AND user_id=$2 AND order_id=$3 AND status=3`,
+          [updOrder.coupon_id, updOrder.user_id, updOrder.id]
+        )
+      }
+      return ok(res, { paid: true, orderId: order.id })
+    }
+
     const params = {
       appid: WX_APPID,
       mch_id: WX_MCH_ID,
@@ -3884,8 +3963,26 @@ app.post('/miniapi/pay/notify', async (req, res) => {
           if (wxPaySign(rest) === sign) {
             const updOrder = (await pool.query(`UPDATE mini_orders SET status=1, paid_at=NOW() WHERE order_no=$1 AND status=0 RETURNING *`, [data.out_trade_no])).rows[0]
             if (updOrder) {
+              if (parseInt(updOrder.coupon_id || 0) > 0) {
+                await pool.query(
+                  `UPDATE mini_user_coupons SET status=1, used_at=NOW()
+                   WHERE id=$1 AND user_id=$2 AND order_id=$3 AND status=3`,
+                  [updOrder.coupon_id, updOrder.user_id, updOrder.id]
+                )
+              }
               const paidUser = (await pool.query(`SELECT * FROM mini_users WHERE id=$1`, [updOrder.user_id])).rows[0]
               if (paidUser) {
+                if (paidUser.openid && TMPL_ORDER_SUCCESS) {
+                  const paidItems = (await pool.query(`SELECT goods_name FROM mini_order_items WHERE order_id=$1`, [updOrder.id])).rows
+                  const goodsName = paidItems.map(i => i.goods_name).join('、').slice(0, 20)
+                  const now = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })
+                  sendSubscribeMsg(paidUser.openid, TMPL_ORDER_SUCCESS, `pages/order/detail?id=${updOrder.id}`, {
+                    thing1: { value: goodsName || '商品' },
+                    amount1: { value: `¥${parseFloat(updOrder.total_amount || updOrder.total || 0).toFixed(2)}` },
+                    character_string1: { value: updOrder.order_no },
+                    time1: { value: now.slice(0, 16) },
+                  }).catch(() => {})
+                }
                 const lvl = calcLevel(paidUser)
                 const mult = MEMBER_LEVELS[lvl].multiplier
                 const earnPoints = Math.floor(parseFloat(updOrder.total_amount || updOrder.total || 0) * POINTS_PER_YUAN * mult)
@@ -3919,6 +4016,20 @@ const VIP_PRICE = 99
 const POINTS_PER_YUAN = 10  // 消费1元得10积分
 const POINTS_REDEEM_RATE = 100  // 100积分=1元
 
+;(async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS mini_vip_payments (
+        id SERIAL PRIMARY KEY,
+        order_no VARCHAR(64) UNIQUE NOT NULL,
+        user_id INTEGER NOT NULL,
+        amount NUMERIC(8,2) DEFAULT 99,
+        processed_at TIMESTAMP DEFAULT NOW()
+      )
+    `)
+  } catch(e) { console.log('mini_vip_payments init:', e.message) }
+})()
+
 function calcLevel(user) {
   const now = new Date()
   if (user.vip_expire_at && new Date(user.vip_expire_at) > now) return 3
@@ -3926,6 +4037,27 @@ function calcLevel(user) {
   if (spent >= 2000) return 2
   if (spent >= 500) return 1
   return 0
+}
+
+async function releaseOrderBenefits(client, order, remark = '订单取消退回') {
+  const pointsUsed = parseInt(order.points_used || 0)
+  if (pointsUsed > 0) {
+    await client.query(`UPDATE mini_users SET points=COALESCE(points,0)+$1 WHERE id=$2`, [pointsUsed, order.user_id])
+    await client.query(
+      `INSERT INTO mini_points_log (user_id,points,type,remark,order_id,created_at)
+       VALUES ($1,$2,'refund',$3,$4,NOW())`,
+      [order.user_id, pointsUsed, remark, order.id]
+    )
+  }
+  const couponId = parseInt(order.coupon_id || 0)
+  if (couponId > 0) {
+    await client.query(
+      `UPDATE mini_user_coupons
+       SET status=0, used_at=NULL, order_id=NULL
+       WHERE id=$1 AND user_id=$2 AND order_id=$3 AND status IN (1,3)`,
+      [couponId, order.user_id, order.id]
+    )
+  }
 }
 
 // 会员信息
@@ -4013,6 +4145,17 @@ app.post('/miniapi/pay/vip-notify', async (req, res) => {
           const { sign: _, ...rest } = data
           if (wxPaySign(rest) === data.sign) {
             const userId = parseInt(data.attach)
+            const inserted = (await pool.query(
+              `INSERT INTO mini_vip_payments (order_no, user_id, amount)
+               VALUES ($1,$2,$3)
+               ON CONFLICT (order_no) DO NOTHING
+               RETURNING id`,
+              [data.out_trade_no, userId, VIP_PRICE]
+            )).rows[0]
+            if (!inserted) {
+              res.send('<xml><return_code><![CDATA[SUCCESS]]></return_code><return_msg><![CDATA[OK]]></return_msg></xml>')
+              return
+            }
             const expireAt = new Date(Date.now() + 365 * 24 * 3600 * 1000)
             await pool.query(`UPDATE mini_users SET vip_expire_at=$1, level=3 WHERE id=$2`, [expireAt, userId])
             await pool.query(`INSERT INTO mini_points_log (user_id, points, type, remark, created_at) VALUES ($1,990,'earn','购买VIP会员赠送积分',NOW())`, [userId])
@@ -4626,9 +4769,18 @@ app.post('/adminapi/mini/coupons/del', auth, async (req, res) => {
         prize_type VARCHAR(20) DEFAULT 'none',
         prize_value INTEGER DEFAULT 0,
         sector_index INTEGER DEFAULT 0,
+        use_points BOOLEAN DEFAULT FALSE,
+        points_spent INTEGER DEFAULT 0,
         spin_date DATE NOT NULL,
         created_at TIMESTAMP DEFAULT NOW()
       )
+    `)
+    await pool.query(`ALTER TABLE user_lottery ADD COLUMN IF NOT EXISTS use_points BOOLEAN DEFAULT FALSE`)
+    await pool.query(`ALTER TABLE user_lottery ADD COLUMN IF NOT EXISTS points_spent INTEGER DEFAULT 0`)
+    await pool.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS user_lottery_free_once_idx
+      ON user_lottery(user_id, spin_date)
+      WHERE COALESCE(use_points, FALSE) = FALSE
     `)
     console.log('signin & lottery tables ready')
   } catch(e) { console.log('signin/lottery init:', e.message) }
@@ -4853,6 +5005,22 @@ app.post('/adminapi/mini/broadcast', auth, async (req, res) => {
 
 // ─── 积分兑换优惠券 ───────────────────────────────────────────────────────────
 
+;(async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS mini_points_goods_redemptions (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        goods_id INTEGER NOT NULL,
+        goods_name VARCHAR(128) NOT NULL,
+        points_cost INTEGER NOT NULL,
+        status SMALLINT DEFAULT 0,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `)
+  } catch(e) { console.log('mini_points_goods_redemptions init:', e.message) }
+})()
+
 // 可兑换列表（带当前积分）
 app.get('/miniapi/points/redeemable', miniAuth, async (req, res) => {
   try {
@@ -4890,20 +5058,90 @@ app.get('/miniapi/points/redeemable', miniAuth, async (req, res) => {
 
 // 积分兑换
 app.post('/miniapi/points/redeem', miniAuth, async (req, res) => {
+  const client = await pool.connect()
   try {
     const { coupon_id } = req.body
     const uid = req.miniUser.id
-    const c = (await pool.query(`SELECT * FROM mini_coupons WHERE id=$1 AND type='points_exchange' AND status=1`, [coupon_id])).rows[0]
-    if (!c) return fail(res, '券不存在')
-    const user = (await pool.query(`SELECT points FROM mini_users WHERE id=$1`, [uid])).rows[0]
-    if ((user?.points || 0) < c.points_cost) return fail(res, `积分不足，需要${c.points_cost}分`)
+    await client.query('BEGIN')
+    const c = (await client.query(`SELECT * FROM mini_coupons WHERE id=$1 AND type='points_exchange' AND status=1 FOR UPDATE`, [coupon_id])).rows[0]
+    if (!c) {
+      await client.query('ROLLBACK')
+      return fail(res, '券不存在')
+    }
+    const user = (await client.query(`SELECT points FROM mini_users WHERE id=$1 FOR UPDATE`, [uid])).rows[0]
+    if ((user?.points || 0) < c.points_cost) {
+      await client.query('ROLLBACK')
+      return fail(res, `积分不足，需要${c.points_cost}分`)
+    }
     const expireAt = new Date(Date.now() + c.validity_days * 86400000)
-    await pool.query(`INSERT INTO mini_user_coupons (user_id, coupon_id, status, expire_at) VALUES ($1,$2,0,$3)`, [uid, c.id, expireAt])
-    await pool.query(`UPDATE mini_users SET points=points-$1 WHERE id=$2`, [c.points_cost, uid])
-    await pool.query(`UPDATE mini_coupons SET claimed_count=claimed_count+1 WHERE id=$1`, [c.id])
+    await client.query(`INSERT INTO mini_user_coupons (user_id, coupon_id, status, expire_at) VALUES ($1,$2,0,$3)`, [uid, c.id, expireAt])
+    await client.query(`UPDATE mini_users SET points=points-$1 WHERE id=$2`, [c.points_cost, uid])
+    await client.query(
+      `INSERT INTO mini_points_log (user_id,points,type,remark,created_at)
+       VALUES ($1,$2,'use',$3,NOW())`,
+      [uid, -c.points_cost, `积分兑换优惠券：${c.name}`]
+    )
+    await client.query(`UPDATE mini_coupons SET claimed_count=claimed_count+1 WHERE id=$1`, [c.id])
     const newPoints = (user.points || 0) - c.points_cost
+    await client.query('COMMIT')
     ok(res, { points: newPoints, coupon_name: c.name })
-  } catch(e) { fail(res, e.message) }
+  } catch(e) {
+    await client.query('ROLLBACK')
+    fail(res, e.message)
+  } finally {
+    client.release()
+  }
+})
+
+// 积分兑换商品
+app.post('/miniapi/points/redeem-goods', miniAuth, async (req, res) => {
+  const client = await pool.connect()
+  try {
+    const uid = req.miniUser.id
+    const goodsId = parseInt(req.body.goods_id || 0)
+    if (!goodsId) return fail(res, 'goods_id必填')
+    const g = (await client.query(
+      `SELECT id, goods_name, remark FROM goods WHERE id=$1 AND deleted_at IS NULL AND status=1`,
+      [goodsId]
+    )).rows[0]
+    if (!g) return fail(res, '商品不存在')
+    let brand = {}
+    try { brand = JSON.parse(g.remark || '{}')['__brand__'] || {} } catch {}
+    if (brand.isRedeemable !== true) return fail(res, '该商品不可积分兑换')
+    const pointsCost = parseInt(brand.pointsCost || 0)
+    if (pointsCost <= 0) return fail(res, '兑换积分配置无效')
+
+    await client.query('BEGIN')
+    const user = (await client.query(`SELECT points FROM mini_users WHERE id=$1 FOR UPDATE`, [uid])).rows[0]
+    if ((user?.points || 0) < pointsCost) {
+      await client.query('ROLLBACK')
+      return fail(res, `积分不足，需要${pointsCost}分`)
+    }
+    await client.query(`UPDATE mini_users SET points=COALESCE(points,0)-$1 WHERE id=$2`, [pointsCost, uid])
+    await client.query(
+      `INSERT INTO mini_points_log (user_id,points,type,remark,created_at)
+       VALUES ($1,$2,'use',$3,NOW())`,
+      [uid, -pointsCost, `积分兑换商品：${g.goods_name}`]
+    )
+    const row = (await client.query(
+      `INSERT INTO mini_points_goods_redemptions (user_id, goods_id, goods_name, points_cost)
+       VALUES ($1,$2,$3,$4)
+       RETURNING id`,
+      [uid, goodsId, g.goods_name, pointsCost]
+    )).rows[0]
+    await client.query('COMMIT')
+    return ok(res, {
+      id: row.id,
+      points: (user.points || 0) - pointsCost,
+      goods_name: g.goods_name,
+      message: '兑换成功，请联系客服确认领取方式',
+    })
+  } catch(e) {
+    await client.query('ROLLBACK')
+    return fail(res, e.message)
+  } finally {
+    client.release()
+  }
 })
 
 // ─── 包装二维码生成 & 扫码追踪 ────────────────────────────────────────────────
@@ -4986,7 +5224,7 @@ app.post('/miniapi/qr/scan', async (req, res) => {
 app.get('/miniapi/signin/status', miniAuth, async (req, res) => {
   try {
     const uid = req.miniUser.id
-    const today = new Date().toISOString().slice(0, 10)
+    const today = todayCN()
     const todayRow = (await pool.query(
       `SELECT points_earned, streak FROM user_signin WHERE user_id=$1 AND signin_date=$2`, [uid, today]
     )).rows[0]
@@ -5003,10 +5241,10 @@ app.get('/miniapi/signin/status', miniAuth, async (req, res) => {
 app.post('/miniapi/signin', miniAuth, async (req, res) => {
   try {
     const uid = req.miniUser.id
-    const today = new Date().toISOString().slice(0, 10)
+    const today = todayCN()
     const existing = (await pool.query(`SELECT id FROM user_signin WHERE user_id=$1 AND signin_date=$2`, [uid, today])).rows[0]
     if (existing) return fail(res, '今天已签到')
-    const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10)
+    const yesterday = new Date(Date.now() + 8 * 60 * 60 * 1000 - 86400000).toISOString().slice(0, 10)
     const y = (await pool.query(`SELECT streak FROM user_signin WHERE user_id=$1 AND signin_date=$2`, [uid, yesterday])).rows[0]
     const streak = y ? y.streak + 1 : 1
     const points = streak >= 7 ? 10 : streak >= 4 ? 8 : 5
@@ -5035,18 +5273,40 @@ app.post('/miniapi/signin', miniAuth, async (req, res) => {
 app.get('/miniapi/lottery/status', miniAuth, async (req, res) => {
   try {
     const uid = req.miniUser.id
-    const today = new Date().toISOString().slice(0, 10)
-    const row = (await pool.query(`SELECT prize_name, prize_value FROM user_lottery WHERE user_id=$1 AND spin_date=$2`, [uid, today])).rows[0]
-    ok(res, { spun_today: !!row, last_prize: row ? { name: row.prize_name, value: row.prize_value } : null })
+    const today = todayCN()
+    const freeRow = (await pool.query(
+      `SELECT id FROM user_lottery
+       WHERE user_id=$1 AND spin_date=$2 AND COALESCE(use_points,FALSE)=FALSE
+       LIMIT 1`,
+      [uid, today]
+    )).rows[0]
+    const row = (await pool.query(
+      `SELECT prize_name, prize_type, prize_value, use_points, points_spent
+       FROM user_lottery
+       WHERE user_id=$1 AND spin_date=$2
+       ORDER BY id DESC
+       LIMIT 1`,
+      [uid, today]
+    )).rows[0]
+    ok(res, {
+      spun_today: !!freeRow,
+      last_prize: row ? {
+        name: row.prize_name,
+        type: row.prize_type,
+        value: row.prize_value,
+        use_points: row.use_points,
+        points_spent: row.points_spent,
+      } : null,
+    })
   } catch(e) { fail(res, e.message) }
 })
 
 app.post('/miniapi/lottery/spin', miniAuth, async (req, res) => {
   try {
     const uid = req.miniUser.id
-    const today = new Date().toISOString().slice(0, 10)
-    const existing = (await pool.query(`SELECT id FROM user_lottery WHERE user_id=$1 AND spin_date=$2`, [uid, today])).rows[0]
-    if (existing) return fail(res, '今天已抽过奖')
+    const today = todayCN()
+    const usePoints = req.body?.use_points === true || req.body?.use_points === 'true' || req.body?.use_points === 1 || req.body?.use_points === '1'
+    const extraSpinCost = 50
     const PRIZES = [
       { name: '谢谢参与', type: 'none',   value: 0,   weight: 12 },
       { name: '5积分',   type: 'points', value: 5,   weight: 28 },
@@ -5061,22 +5321,99 @@ app.post('/miniapi/lottery/spin', miniAuth, async (req, res) => {
     let r = Math.random() * total, prizeIdx = PRIZES.length - 1
     for (let i = 0; i < PRIZES.length; i++) { r -= PRIZES[i].weight; if (r <= 0) { prizeIdx = i; break } }
     const prize = PRIZES[prizeIdx]
-    await pool.query(`INSERT INTO user_lottery (user_id, prize_name, prize_type, prize_value, sector_index, spin_date) VALUES ($1,$2,$3,$4,$5,$6)`,
-      [uid, prize.name, prize.type, prize.value, prizeIdx, today])
-    if (prize.type === 'points' && prize.value > 0) {
-      await pool.query(`UPDATE mini_users SET points=COALESCE(points,0)+$1 WHERE id=$2`, [prize.value, uid])
-    }
-    if (prize.type === 'coupon') {
-      const lc = (await pool.query(
-        `SELECT id FROM mini_coupons WHERE type='lottery' AND discount_value=$1 AND status=1 LIMIT 1`, [prize.value]
-      )).rows[0]
-      if (lc) {
-        const expireAt = new Date(Date.now() + 7 * 86400000)
-        await pool.query(`INSERT INTO mini_user_coupons (user_id, coupon_id, status, expire_at) VALUES ($1,$2,0,$3)`, [uid, lc.id, expireAt])
-        await pool.query(`UPDATE mini_coupons SET claimed_count=claimed_count+1 WHERE id=$1`, [lc.id])
+
+    const client = await pool.connect()
+    let points = null
+    try {
+      await client.query('BEGIN')
+
+      if (usePoints) {
+        const user = (await client.query(`SELECT points FROM mini_users WHERE id=$1 FOR UPDATE`, [uid])).rows[0]
+        const currentPoints = user?.points || 0
+        if (currentPoints < extraSpinCost) {
+          const err = new Error(`积分不足，需${extraSpinCost}分`)
+          err.userMessage = err.message
+          throw err
+        }
+        const updated = (await client.query(
+          `UPDATE mini_users SET points=COALESCE(points,0)-$1 WHERE id=$2 RETURNING points`,
+          [extraSpinCost, uid]
+        )).rows[0]
+        points = updated?.points || 0
+        await client.query(
+          `INSERT INTO mini_points_log (user_id,points,type,remark,created_at)
+           VALUES ($1,$2,'use','积分加抽盲盒',NOW())`,
+          [uid, -extraSpinCost]
+        )
+      } else {
+        const existing = (await client.query(
+          `SELECT id FROM user_lottery
+           WHERE user_id=$1 AND spin_date=$2 AND COALESCE(use_points,FALSE)=FALSE
+           LIMIT 1`,
+          [uid, today]
+        )).rows[0]
+        if (existing) {
+          const err = new Error('今天已抽过奖')
+          err.userMessage = err.message
+          throw err
+        }
       }
+
+      await client.query(
+        `INSERT INTO user_lottery
+         (user_id, prize_name, prize_type, prize_value, sector_index, use_points, points_spent, spin_date)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+        [uid, prize.name, prize.type, prize.value, prizeIdx, usePoints, usePoints ? extraSpinCost : 0, today]
+      )
+
+      if (prize.type === 'points' && prize.value > 0) {
+        const updated = (await client.query(
+          `UPDATE mini_users SET points=COALESCE(points,0)+$1 WHERE id=$2 RETURNING points`,
+          [prize.value, uid]
+        )).rows[0]
+        points = updated?.points || 0
+        await client.query(
+          `INSERT INTO mini_points_log (user_id,points,type,remark,created_at)
+           VALUES ($1,$2,'earn','盲盒抽奖',NOW())`,
+          [uid, prize.value]
+        )
+      }
+
+      if (prize.type === 'coupon') {
+        const lc = (await client.query(
+          `SELECT id FROM mini_coupons WHERE type='lottery' AND discount_value=$1 AND status=1 LIMIT 1`,
+          [prize.value]
+        )).rows[0]
+        if (lc) {
+          const expireAt = new Date(Date.now() + 7 * 86400000)
+          await client.query(`INSERT INTO mini_user_coupons (user_id, coupon_id, status, expire_at) VALUES ($1,$2,0,$3)`, [uid, lc.id, expireAt])
+          await client.query(`UPDATE mini_coupons SET claimed_count=claimed_count+1 WHERE id=$1`, [lc.id])
+        }
+      }
+
+      if (points === null) {
+        points = ((await client.query(`SELECT points FROM mini_users WHERE id=$1`, [uid])).rows[0]?.points) || 0
+      }
+
+      await client.query('COMMIT')
+    } catch (e) {
+      await client.query('ROLLBACK')
+      if (e.code === '23505') return fail(res, '今天已抽过奖')
+      if (e.userMessage) return fail(res, e.userMessage)
+      throw e
+    } finally {
+      client.release()
     }
-    ok(res, { prize_name: prize.name, prize_value: prize.value, prize_type: prize.type, sector_index: prizeIdx })
+
+    ok(res, {
+      prize_name: prize.name,
+      prize_value: prize.value,
+      prize_type: prize.type,
+      sector_index: prizeIdx,
+      use_points: usePoints,
+      points_spent: usePoints ? extraSpinCost : 0,
+      points,
+    })
   } catch(e) { fail(res, e.message) }
 })
 

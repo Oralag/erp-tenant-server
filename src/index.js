@@ -734,7 +734,7 @@ router.post('/shop/ContractOrder/audit', async (req, res) => {
       if (receiveAmount > 0) {
         const receiptNo = genOrderNo('SK')
         await pool.query(
-          `INSERT INTO collect_receipt (receipt_no, order_sn, contact_type, contact_name, amount, receipt_date, fund_id, fund_name, remark, status, category)
+          `INSERT INTO collect_receipt (receipt_no, order_sn, pay_type, contact_name, amount, receipt_date, fund_id, fund_name, remark, status, category)
            VALUES ($1,$2,'customer',$3,$4,$5,$6,$7,$8,1,'sale')`,
           [receiptNo, orderSn, customerName, receiveAmount, signDate, fundId, fundName, `合同${orderSn}审核自动生成`]
         )
@@ -4329,7 +4329,9 @@ app.post('/miniapi/wholesale/inquiry', async (req, res) => {
       VALUES ('新客满减券·满100减10', 'new_user', 10, 100, 30, -1, 0),
              ('新客满减券·满300减20', 'new_user', 20, 300, 30, -1, 0),
              ('生日特权券', 'birthday', 15, 50, 7, -1, 0),
-             ('签到7天专享券', 'signin7', 8, 30, 14, -1, 0)
+             ('签到7天专享券', 'signin7', 8, 30, 14, -1, 0),
+             ('抽奖券·满50减5', 'lottery', 5, 50, 7, -1, 0),
+             ('抽奖券·满100减10', 'lottery', 10, 100, 7, -1, 0)
       ON CONFLICT DO NOTHING
     `)
     console.log('mini_coupons tables ready')
@@ -4843,7 +4845,29 @@ app.get('/miniapi/points/redeemable', miniAuth, async (req, res) => {
       `SELECT id, name, discount_value, min_order, validity_days, points_cost
        FROM mini_coupons WHERE type='points_exchange' AND status=1 ORDER BY points_cost ASC`
     )).rows
-    ok(res, { points: user?.points || 0, coupons })
+    // 查询积分商城商品（remark.__brand__.isRedeemable = true）
+    const allGoods = (await pool.query(
+      `SELECT id, goods_name, images, remark, sell_price, unit_name FROM goods WHERE deleted_at IS NULL AND status=1 LIMIT 500`
+    )).rows
+    const redeemGoods = allGoods
+      .filter(g => { try { return JSON.parse(g.remark || '{}')['__brand__']?.isRedeemable === true } catch { return false } })
+      .map(g => {
+        let brand = {}
+        try { brand = JSON.parse(g.remark || '{}')['__brand__'] || {} } catch {}
+        const img = brand.image || (g.images ? g.images.split(',')[0] : '') || ''
+        return {
+          id: `goods_${g.id}`,
+          goods_id: g.id,
+          name: g.goods_name,
+          image: img ? (img.startsWith('http') ? img : `https://erp-server-xsji.onrender.com${img}`) : '',
+          points_cost: brand.pointsCost || 0,
+          description: brand.description || '',
+          type: 'goods',
+        }
+      })
+      .filter(g => g.points_cost > 0)
+      .sort((a, b) => a.points_cost - b.points_cost)
+    ok(res, { points: user?.points || 0, coupons, goods: redeemGoods })
   } catch(e) { fail(res, e.message) }
 })
 
@@ -5007,14 +5031,14 @@ app.post('/miniapi/lottery/spin', miniAuth, async (req, res) => {
     const existing = (await pool.query(`SELECT id FROM user_lottery WHERE user_id=$1 AND spin_date=$2`, [uid, today])).rows[0]
     if (existing) return fail(res, '今天已抽过奖')
     const PRIZES = [
-      { name: '谢谢参与', type: 'none', value: 0, weight: 15 },
-      { name: '5积分', type: 'points', value: 5, weight: 30 },
-      { name: '10积分', type: 'points', value: 10, weight: 25 },
-      { name: '谢谢参与', type: 'none', value: 0, weight: 10 },
-      { name: '20积分', type: 'points', value: 20, weight: 12 },
-      { name: '50积分', type: 'points', value: 50, weight: 5 },
-      { name: '10积分', type: 'points', value: 10, weight: 2 },
-      { name: '100积分', type: 'points', value: 100, weight: 1 },
+      { name: '谢谢参与', type: 'none',   value: 0,   weight: 12 },
+      { name: '5积分',   type: 'points', value: 5,   weight: 28 },
+      { name: '¥5优惠券', type: 'coupon', value: 5,   weight: 15 },
+      { name: '10积分',  type: 'points', value: 10,  weight: 22 },
+      { name: '谢谢参与', type: 'none',   value: 0,   weight: 10 },
+      { name: '50积分',  type: 'points', value: 50,  weight: 8  },
+      { name: '¥10优惠券',type: 'coupon', value: 10,  weight: 3  },
+      { name: '神秘好礼', type: 'goods',  value: 0,   weight: 2  },
     ]
     const total = PRIZES.reduce((s, p) => s + p.weight, 0)
     let r = Math.random() * total, prizeIdx = PRIZES.length - 1
@@ -5024,6 +5048,16 @@ app.post('/miniapi/lottery/spin', miniAuth, async (req, res) => {
       [uid, prize.name, prize.type, prize.value, prizeIdx, today])
     if (prize.type === 'points' && prize.value > 0) {
       await pool.query(`UPDATE mini_users SET points=COALESCE(points,0)+$1 WHERE id=$2`, [prize.value, uid])
+    }
+    if (prize.type === 'coupon') {
+      const lc = (await pool.query(
+        `SELECT id FROM mini_coupons WHERE type='lottery' AND discount_value=$1 AND status=1 LIMIT 1`, [prize.value]
+      )).rows[0]
+      if (lc) {
+        const expireAt = new Date(Date.now() + 7 * 86400000)
+        await pool.query(`INSERT INTO mini_user_coupons (user_id, coupon_id, status, expire_at) VALUES ($1,$2,0,$3)`, [uid, lc.id, expireAt])
+        await pool.query(`UPDATE mini_coupons SET claimed_count=claimed_count+1 WHERE id=$1`, [lc.id])
+      }
     }
     ok(res, { prize_name: prize.name, prize_value: prize.value, prize_type: prize.type, sector_index: prizeIdx })
   } catch(e) { fail(res, e.message) }

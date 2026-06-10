@@ -6197,7 +6197,7 @@ app.get('/miniapi/favorite/list', miniAuth, async (req, res) => {
       let brand = {}
       try { brand = JSON.parse(g.remark || '{}')['__brand__'] || {} } catch {}
       const cover = brand.image || (g.images ? g.images.split(',')[0] : '') || ''
-      return { goods_id: g.goods_id, goods_name: g.goods_name, sale_price: parseFloat(g.sale_price) || 0, unit: g.unit_name || '件', cover, created_at: g.created_at }
+      return { goods_id: g.goods_id, goods_name: g.goods_name, sale_price: parseFloat(g.sale_price) || 0, unit: g.unit || '件', cover, created_at: g.created_at }
     })
     ok(res, mapped)
   } catch(e) { fail(res, e.message) }

@@ -22,6 +22,7 @@ const WX_APPSECRET = process.env.WX_SECRET || process.env.WX_APPSECRET || ''
 // 模板ID（在微信公众平台 → 功能 → 订阅消息 里注册后填入环境变量）
 const TMPL_ORDER_SUCCESS = process.env.TMPL_ORDER_SUCCESS || ''  // 购买成功通知
 const TMPL_SHIP = process.env.TMPL_SHIP || ''                    // 发货提醒
+const TMPL_REFUND = process.env.TMPL_REFUND || ''                // 退款结果通知
 
 let _wxToken = '', _wxTokenExp = 0
 
@@ -5905,6 +5906,234 @@ app.post('/miniapi/lottery/spin', miniAuth, async (req, res) => {
       points,
     })
   } catch(e) { fail(res, e.message) }
+})
+
+// ─── 退款/售后 ──────────────────────────────────────────────────────────────
+
+;(async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS mini_refunds (
+        id SERIAL PRIMARY KEY,
+        order_id INT NOT NULL,
+        user_id INT NOT NULL,
+        reason VARCHAR(200) NOT NULL DEFAULT '',
+        images TEXT DEFAULT '',
+        status INT DEFAULT 0,
+        amount DECIMAL(10,2) DEFAULT 0,
+        note TEXT DEFAULT '',
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        handled_at TIMESTAMPTZ
+      )
+    `)
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_refunds_order ON mini_refunds(order_id)`)
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_refunds_user  ON mini_refunds(user_id)`)
+  } catch(e) { console.log('mini_refunds init:', e.message) }
+})()
+
+// 申请退款
+app.post('/miniapi/refund/apply', miniAuth, async (req, res) => {
+  try {
+    const { order_id, reason, images = '' } = req.body
+    if (!order_id || !reason) return fail(res, '请填写退款原因')
+    const order = (await pool.query(
+      `SELECT id, user_id, total_amount, status FROM mini_orders WHERE id=$1 AND deleted_at IS NULL LIMIT 1`,
+      [order_id]
+    )).rows[0]
+    if (!order) return fail(res, '订单不存在')
+    if (order.user_id !== req.miniUser.id) return fail(res, '无权操作')
+    if (order.status === 0) return fail(res, '订单未付款，可直接取消')
+    if (order.status === 4) return fail(res, '订单已取消')
+    const existing = (await pool.query(
+      `SELECT id, status FROM mini_refunds WHERE order_id=$1 AND status != 2 LIMIT 1`, [order_id]
+    )).rows[0]
+    if (existing) return fail(res, existing.status === 0 ? '退款申请处理中' : '退款已完成')
+    await pool.query(
+      `INSERT INTO mini_refunds (order_id, user_id, reason, images, amount, status) VALUES ($1,$2,$3,$4,$5,0)`,
+      [order_id, req.miniUser.id, reason, images, order.total_amount]
+    )
+    const key = process.env.SERVER_JIANG_KEY
+    if (key) {
+      const title = encodeURIComponent('🔄 新退款申请')
+      const desp = encodeURIComponent(`订单：#${order_id}\n原因：${reason}\n金额：¥${order.total_amount}`)
+      fetch(`https://sctapi.ftqq.com/${key}.send?title=${title}&desp=${desp}`).catch(() => {})
+    }
+    ok(res, { message: '退款申请已提交' })
+  } catch(e) { fail(res, e.message) }
+})
+
+// 我的退款列表
+app.get('/miniapi/refund/mine', miniAuth, async (req, res) => {
+  try {
+    const rows = (await pool.query(
+      `SELECT r.*, o.order_no, o.total_amount as order_amount
+       FROM mini_refunds r JOIN mini_orders o ON o.id=r.order_id
+       WHERE r.user_id=$1 ORDER BY r.created_at DESC`,
+      [req.miniUser.id]
+    )).rows
+    ok(res, rows)
+  } catch(e) { fail(res, e.message) }
+})
+
+// 管理端：退款列表
+app.get('/adminapi/refund/list', auth, async (req, res) => {
+  try {
+    const { status, page = 1 } = req.query
+    const offset = (page - 1) * 20
+    let where = ''
+    const params = []
+    if (status !== undefined && status !== '') { where = 'WHERE r.status=$1'; params.push(status) }
+    const rows = (await pool.query(
+      `SELECT r.*, o.order_no, u.nickname as user_name, u.phone as user_phone
+       FROM mini_refunds r
+       JOIN mini_orders o ON o.id=r.order_id
+       LEFT JOIN mini_users u ON u.id=r.user_id
+       ${where}
+       ORDER BY r.created_at DESC LIMIT 20 OFFSET ${offset}`,
+      params
+    )).rows
+    const total = (await pool.query(
+      `SELECT COUNT(*) FROM mini_refunds r ${where}`, params
+    )).rows[0].count
+    ok(res, { rows, total: parseInt(total) })
+  } catch(e) { fail(res, e.message) }
+})
+
+// 管理端：处理退款（同意/拒绝）
+app.post('/adminapi/refund/handle', auth, async (req, res) => {
+  try {
+    const { id, action, note = '' } = req.body  // action: 'approve' | 'reject'
+    if (!id || !action) return fail(res, '参数缺失')
+    const refund = (await pool.query(
+      `SELECT r.*, o.order_no, o.user_id, u.openid
+       FROM mini_refunds r
+       JOIN mini_orders o ON o.id=r.order_id
+       LEFT JOIN mini_users u ON u.id=o.user_id
+       WHERE r.id=$1 LIMIT 1`, [id]
+    )).rows[0]
+    if (!refund) return fail(res, '退款记录不存在')
+    if (refund.status !== 0) return fail(res, '该申请已处理')
+    const newStatus = action === 'approve' ? 1 : 2
+    await pool.query(
+      `UPDATE mini_refunds SET status=$1, note=$2, handled_at=NOW() WHERE id=$3`,
+      [newStatus, note, id]
+    )
+    if (action === 'approve') {
+      await pool.query(`UPDATE mini_orders SET status=4 WHERE id=$1`, [refund.order_id])
+    }
+    // 推送订阅消息给用户
+    if (refund.openid && TMPL_REFUND) {
+      const label = action === 'approve' ? '退款已同意' : '退款已拒绝'
+      sendSubscribeMsg(refund.openid, TMPL_REFUND, `pages/order/detail?id=${refund.order_id}`, {
+        thing1: { value: `订单 ${refund.order_no}` },
+        phrase2: { value: label },
+        amount3: { value: `¥${refund.amount}` },
+        thing4: { value: note || (action === 'approve' ? '将原路退回' : '申请未通过') },
+      }).catch(() => {})
+    }
+    ok(res, { message: action === 'approve' ? '已同意退款' : '已拒绝退款' })
+  } catch(e) { fail(res, e.message) }
+})
+
+// ─── 商品收藏 ──────────────────────────────────────────────────────────────
+
+;(async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS mini_favorites (
+        id SERIAL PRIMARY KEY,
+        user_id INT NOT NULL,
+        goods_id INT NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(user_id, goods_id)
+      )
+    `)
+  } catch(e) { console.log('mini_favorites init:', e.message) }
+})()
+
+// 收藏/取消收藏
+app.post('/miniapi/favorite/toggle', miniAuth, async (req, res) => {
+  try {
+    const { goods_id } = req.body
+    if (!goods_id) return fail(res, 'goods_id必填')
+    const exists = (await pool.query(
+      `SELECT id FROM mini_favorites WHERE user_id=$1 AND goods_id=$2 LIMIT 1`,
+      [req.miniUser.id, goods_id]
+    )).rows[0]
+    if (exists) {
+      await pool.query(`DELETE FROM mini_favorites WHERE user_id=$1 AND goods_id=$2`, [req.miniUser.id, goods_id])
+      ok(res, { favorited: false })
+    } else {
+      await pool.query(`INSERT INTO mini_favorites (user_id, goods_id) VALUES ($1,$2)`, [req.miniUser.id, goods_id])
+      ok(res, { favorited: true })
+    }
+  } catch(e) { fail(res, e.message) }
+})
+
+// 我的收藏列表
+app.get('/miniapi/favorite/list', miniAuth, async (req, res) => {
+  try {
+    const rows = (await pool.query(
+      `SELECT f.goods_id, f.created_at,
+              g.name as goods_name, g.sale_price, g.unit,
+              COALESCE((g.remark::jsonb->>'cover'), '') as cover
+       FROM mini_favorites f
+       JOIN shop_goods g ON g.id=f.goods_id AND g.deleted_at IS NULL
+       WHERE f.user_id=$1 ORDER BY f.created_at DESC`,
+      [req.miniUser.id]
+    )).rows
+    ok(res, rows)
+  } catch(e) { fail(res, e.message) }
+})
+
+// 查询单个商品是否已收藏
+app.get('/miniapi/favorite/check', miniAuth, async (req, res) => {
+  try {
+    const { goods_id } = req.query
+    const exists = (await pool.query(
+      `SELECT id FROM mini_favorites WHERE user_id=$1 AND goods_id=$2 LIMIT 1`,
+      [req.miniUser.id, goods_id]
+    )).rows[0]
+    ok(res, { favorited: !!exists })
+  } catch(e) { fail(res, e.message) }
+})
+
+// ─── 分销商小程序码（供小程序端调用）────────────────────────────────────────
+
+app.get('/miniapi/qr/distributor', miniAuth, async (req, res) => {
+  try {
+    const dist = (await pool.query(
+      `SELECT code FROM distributors WHERE user_id=$1 AND status=1 LIMIT 1`, [req.miniUser.id]
+    )).rows[0]
+    if (!dist) return fail(res, '您还不是分销商')
+    const token = await getWxAccessToken()
+    if (!token) return fail(res, '微信Token获取失败')
+    const wxRes = await fetch(
+      `https://api.weixin.qq.com/wxa/getwxacodeunlimit?access_token=${token}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ scene: `d=${dist.code}`, page: 'pages/index/index', width: 280, is_hyaline: true }),
+      }
+    )
+    const ct = wxRes.headers.get('content-type') || ''
+    if (ct.includes('image')) {
+      const buf = Buffer.from(await wxRes.arrayBuffer())
+      ok(res, { base64: `data:image/png;base64,${buf.toString('base64')}`, code: dist.code })
+    } else {
+      const json = await wxRes.json()
+      fail(res, json.errmsg || '生成失败')
+    }
+  } catch(e) { fail(res, e.message) }
+})
+
+// 小程序前端获取订阅消息模板ID
+app.get('/miniapi/config/tmpl-ids', (req, res) => {
+  ok(res, {
+    ship: TMPL_SHIP,
+    refund: TMPL_REFUND,
+    order_success: TMPL_ORDER_SUCCESS,
+  })
 })
 
 // ─── 404 fallback ───────────────────────────────────────────────────────────

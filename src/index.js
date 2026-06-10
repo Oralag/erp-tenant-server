@@ -3473,6 +3473,23 @@ async function transferCommission(orderId, orderNo, openid, amountYuan) {
   })
 }
 
+// 微信退款（V3）
+async function wxV3Refund(orderNo, transactionId, refundNo, amountYuan, reason) {
+  if (!WX_MCH_PRIVATE_KEY || !WX_MCH_CERT_SERIAL) return { skipped: true, reason: 'not configured' }
+  const amountFen = Math.round(amountYuan * 100)
+  if (amountFen < 1) return { skipped: true, reason: 'amount < 1 fen' }
+  const payload = {
+    out_refund_no: refundNo,
+    reason: reason || '用户申请退款',
+    amount: { refund: amountFen, total: amountFen, currency: 'CNY' },
+  }
+  if (transactionId) payload.transaction_id = transactionId
+  else payload.out_trade_no = orderNo
+  const result = await wxV3Post('/v3/refund/domestic/refunds', payload)
+  console.log('[wxV3Refund]', JSON.stringify(result))
+  return result
+}
+
 // 微信支付V2签名
 function wxPaySign(params) {
   const crypto = require('crypto')
@@ -4452,7 +4469,7 @@ app.post('/miniapi/pay/notify', async (req, res) => {
           const sign = data.sign
           const { sign: _, ...rest } = data
           if (wxPaySign(rest) === sign) {
-            const updOrder = (await pool.query(`UPDATE mini_orders SET status=1, paid_at=NOW() WHERE order_no=$1 AND status=0 RETURNING *`, [data.out_trade_no])).rows[0]
+            const updOrder = (await pool.query(`UPDATE mini_orders SET status=1, paid_at=NOW(), wx_transaction_id=$2 WHERE order_no=$1 AND status=0 RETURNING *`, [data.out_trade_no, data.transaction_id || ''])).rows[0]
             if (updOrder) {
               if (parseInt(updOrder.coupon_id || 0) > 0) {
                 await pool.query(
@@ -5908,6 +5925,60 @@ app.post('/miniapi/lottery/spin', miniAuth, async (req, res) => {
   } catch(e) { fail(res, e.message) }
 })
 
+// ─── 搜索热词 ───────────────────────────────────────────────────────────────
+
+;(async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS mini_search_log (
+        id SERIAL PRIMARY KEY,
+        keyword VARCHAR(100) NOT NULL,
+        cnt INT DEFAULT 1,
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(keyword)
+      )
+    `)
+  } catch(e) { console.log('mini_search_log init:', e.message) }
+})()
+
+app.post('/miniapi/search/log', async (req, res) => {
+  const { keyword } = req.body
+  if (!keyword || keyword.trim().length < 1) return ok(res, {})
+  pool.query(
+    `INSERT INTO mini_search_log (keyword, cnt) VALUES ($1, 1)
+     ON CONFLICT (keyword) DO UPDATE SET cnt=mini_search_log.cnt+1, updated_at=NOW()`,
+    [keyword.trim().slice(0, 50)]
+  ).catch(() => {})
+  ok(res, {})
+})
+
+app.get('/miniapi/goods/hot-search', async (req, res) => {
+  try {
+    const rows = (await pool.query(
+      `SELECT keyword FROM mini_search_log ORDER BY cnt DESC LIMIT 8`
+    )).rows.map(r => r.keyword)
+    const fallback = ['羊奶粉', '奶酪', '酥油', '黄油', '牧区礼盒', '牦牛', '马奶', '奶片']
+    const hot = rows.length >= 4 ? rows : [...new Set([...rows, ...fallback])].slice(0, 8)
+    ok(res, hot)
+  } catch(e) { fail(res, e.message) }
+})
+
+// 购物车商品有效性验证
+app.post('/miniapi/cart/validate', async (req, res) => {
+  try {
+    const { items } = req.body  // [{goods_id, spec}]
+    if (!items?.length) return ok(res, { invalid: [] })
+    const ids = items.map(i => i.goods_id)
+    const rows = (await pool.query(
+      `SELECT id FROM goods WHERE id=ANY($1) AND deleted_at IS NULL AND status=1 AND can_sale=1`,
+      [ids]
+    )).rows
+    const validIds = new Set(rows.map(r => r.id))
+    const invalid = items.filter(i => !validIds.has(i.goods_id)).map(i => i.goods_id)
+    ok(res, { invalid })
+  } catch(e) { fail(res, e.message) }
+})
+
 // ─── 退款/售后 ──────────────────────────────────────────────────────────────
 
 ;(async () => {
@@ -5928,6 +5999,9 @@ app.post('/miniapi/lottery/spin', miniAuth, async (req, res) => {
     `)
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_refunds_order ON mini_refunds(order_id)`)
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_refunds_user  ON mini_refunds(user_id)`)
+    await pool.query(`ALTER TABLE mini_refunds ADD COLUMN IF NOT EXISTS wx_refund_no VARCHAR(64) DEFAULT ''`)
+    await pool.query(`ALTER TABLE mini_refunds ADD COLUMN IF NOT EXISTS original_order_status INT DEFAULT 1`)
+    await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS wx_transaction_id VARCHAR(64) DEFAULT ''`)
   } catch(e) { console.log('mini_refunds init:', e.message) }
 })()
 
@@ -5944,14 +6018,16 @@ app.post('/miniapi/refund/apply', miniAuth, async (req, res) => {
     if (order.user_id !== req.miniUser.id) return fail(res, '无权操作')
     if (order.status === 0) return fail(res, '订单未付款，可直接取消')
     if (order.status === 4) return fail(res, '订单已取消')
+    if (order.status === 5) return fail(res, '退款申请处理中')
     const existing = (await pool.query(
       `SELECT id, status FROM mini_refunds WHERE order_id=$1 AND status != 2 LIMIT 1`, [order_id]
     )).rows[0]
     if (existing) return fail(res, existing.status === 0 ? '退款申请处理中' : '退款已完成')
     await pool.query(
-      `INSERT INTO mini_refunds (order_id, user_id, reason, images, amount, status) VALUES ($1,$2,$3,$4,$5,0)`,
-      [order_id, req.miniUser.id, reason, images, order.total_amount]
+      `INSERT INTO mini_refunds (order_id, user_id, reason, images, amount, status, original_order_status) VALUES ($1,$2,$3,$4,$5,0,$6)`,
+      [order_id, req.miniUser.id, reason, images, order.total_amount, order.status]
     )
+    await pool.query(`UPDATE mini_orders SET status=5 WHERE id=$1`, [order_id])
     const key = process.env.SERVER_JIANG_KEY
     if (key) {
       const title = encodeURIComponent('🔄 新退款申请')
@@ -5972,6 +6048,18 @@ app.get('/miniapi/refund/mine', miniAuth, async (req, res) => {
       [req.miniUser.id]
     )).rows
     ok(res, rows)
+  } catch(e) { fail(res, e.message) }
+})
+
+// 查询订单的退款状态（小程序端用，订单详情页展示）
+app.get('/miniapi/refund/order/:order_id', miniAuth, async (req, res) => {
+  try {
+    const refund = (await pool.query(
+      `SELECT id, status, amount, reason, note, created_at, handled_at, wx_refund_no
+       FROM mini_refunds WHERE order_id=$1 AND user_id=$2 ORDER BY created_at DESC LIMIT 1`,
+      [req.params.order_id, req.miniUser.id]
+    )).rows[0]
+    ok(res, refund || null)
   } catch(e) { fail(res, e.message) }
 })
 
@@ -6005,7 +6093,7 @@ app.post('/adminapi/refund/handle', auth, async (req, res) => {
     const { id, action, note = '' } = req.body  // action: 'approve' | 'reject'
     if (!id || !action) return fail(res, '参数缺失')
     const refund = (await pool.query(
-      `SELECT r.*, o.order_no, o.user_id, u.openid
+      `SELECT r.*, o.order_no, o.wx_transaction_id, o.total_amount as order_amount, o.user_id, u.openid
        FROM mini_refunds r
        JOIN mini_orders o ON o.id=r.order_id
        LEFT JOIN mini_users u ON u.id=o.user_id
@@ -6014,12 +6102,35 @@ app.post('/adminapi/refund/handle', auth, async (req, res) => {
     if (!refund) return fail(res, '退款记录不存在')
     if (refund.status !== 0) return fail(res, '该申请已处理')
     const newStatus = action === 'approve' ? 1 : 2
-    await pool.query(
-      `UPDATE mini_refunds SET status=$1, note=$2, handled_at=NOW() WHERE id=$3`,
-      [newStatus, note, id]
-    )
+
     if (action === 'approve') {
+      // 调用微信退款接口
+      const refundNo = `RF${refund.id}T${Date.now()}`
+      const wxResult = await wxV3Refund(
+        refund.order_no,
+        refund.wx_transaction_id || '',
+        refundNo,
+        parseFloat(refund.amount),
+        refund.reason
+      )
+      if (wxResult.code && wxResult.code !== 'SUCCESS' && !wxResult.skipped) {
+        return fail(res, `微信退款失败：${wxResult.message || wxResult.code}`)
+      }
+      await pool.query(
+        `UPDATE mini_refunds SET status=1, note=$1, handled_at=NOW(), wx_refund_no=$2 WHERE id=$3`,
+        [note, wxResult.refund_id || refundNo, id]
+      )
       await pool.query(`UPDATE mini_orders SET status=4 WHERE id=$1`, [refund.order_id])
+    } else {
+      // 拒绝：还原订单原始状态
+      await pool.query(
+        `UPDATE mini_refunds SET status=2, note=$1, handled_at=NOW() WHERE id=$2`,
+        [note, id]
+      )
+      await pool.query(
+        `UPDATE mini_orders SET status=$1 WHERE id=$2`,
+        [refund.original_order_status || 1, refund.order_id]
+      )
     }
     // 推送订阅消息给用户
     if (refund.openid && TMPL_REFUND) {

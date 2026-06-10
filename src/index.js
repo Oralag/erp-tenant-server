@@ -4111,12 +4111,28 @@ app.post('/adminapi/distributor/approve', auth, async (req, res) => {
     if (!id) return fail(res, 'id必填')
     const dist = (await pool.query(`SELECT * FROM distributors WHERE id=$1 LIMIT 1`, [id])).rows[0]
     if (!dist) return fail(res, '不存在')
-    // 生成唯一分销码
     const code = dist.code || `D${String(id).padStart(4,'0')}`
     await pool.query(
       `UPDATE distributors SET status=1, code=$1, commission_rate=$2, note=$3, approved_at=NOW() WHERE id=$4`,
       [code, parseFloat(commission_rate), note, id]
     )
+    // 同步到ERP客户管理（按手机号去重）
+    const existing = (await pool.query(
+      `SELECT id FROM sale_customers WHERE mobile=$1 AND deleted_at IS NULL LIMIT 1`,
+      [dist.phone]
+    )).rows[0]
+    if (existing) {
+      await pool.query(
+        `UPDATE sale_customers SET level_name='分销商', remark=CASE WHEN remark NOT LIKE '%分销码%' THEN CONCAT(remark, ' 分销码:', $1) ELSE remark END, update_time=NOW() WHERE id=$2`,
+        [code, existing.id]
+      )
+    } else {
+      await pool.query(
+        `INSERT INTO sale_customers (name, mobile, level_name, source_name, remark, status, create_time, update_time)
+         VALUES ($1, $2, '分销商', '小程序分销', $3, 1, NOW(), NOW())`,
+        [dist.name, dist.phone, `分销码:${code}`]
+      )
+    }
     return ok(res, { code })
   } catch(e) { fail(res, e.message) }
 })

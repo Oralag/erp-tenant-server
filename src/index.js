@@ -5984,7 +5984,7 @@ app.get('/adminapi/refund/list', auth, async (req, res) => {
     const params = []
     if (status !== undefined && status !== '') { where = 'WHERE r.status=$1'; params.push(status) }
     const rows = (await pool.query(
-      `SELECT r.*, o.order_no, u.nickname as user_name, u.phone as user_phone
+      `SELECT r.*, o.order_no, u.name as user_name, u.phone as user_phone
        FROM mini_refunds r
        JOIN mini_orders o ON o.id=r.order_id
        LEFT JOIN mini_users u ON u.id=r.user_id
@@ -6075,14 +6075,20 @@ app.get('/miniapi/favorite/list', miniAuth, async (req, res) => {
   try {
     const rows = (await pool.query(
       `SELECT f.goods_id, f.created_at,
-              g.name as goods_name, g.sale_price, g.unit,
-              COALESCE((g.remark::jsonb->>'cover'), '') as cover
+              g.goods_name, g.sell_price as sale_price, g.unit_name as unit,
+              g.remark, g.images
        FROM mini_favorites f
-       JOIN shop_goods g ON g.id=f.goods_id AND g.deleted_at IS NULL
+       JOIN goods g ON g.id=f.goods_id AND g.deleted_at IS NULL
        WHERE f.user_id=$1 ORDER BY f.created_at DESC`,
       [req.miniUser.id]
     )).rows
-    ok(res, rows)
+    const mapped = rows.map(g => {
+      let brand = {}
+      try { brand = JSON.parse(g.remark || '{}')['__brand__'] || {} } catch {}
+      const cover = brand.image || (g.images ? g.images.split(',')[0] : '') || ''
+      return { goods_id: g.goods_id, goods_name: g.goods_name, sale_price: parseFloat(g.sale_price) || 0, unit: g.unit_name || '件', cover, created_at: g.created_at }
+    })
+    ok(res, mapped)
   } catch(e) { fail(res, e.message) }
 })
 

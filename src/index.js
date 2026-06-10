@@ -3374,6 +3374,62 @@ const MINI_JWT_SECRET = process.env.MINI_JWT_SECRET || 'mini_secret_2024'
 const WX_SECRET = process.env.WX_SECRET || ''
 const WX_MCH_ID = process.env.WX_MCH_ID || ''
 const WX_MCH_KEY = process.env.WX_MCH_KEY || ''
+const WX_MCH_CERT_SERIAL = process.env.WX_MCH_CERT_SERIAL || ''
+const WX_API_V3_KEY = process.env.WX_API_V3_KEY || ''
+const WX_MCH_PUBLIC_KEY_ID = process.env.WX_MCH_PUBLIC_KEY_ID || ''
+// 私钥：env var 里 \n 是字面量，需替换为真实换行
+const WX_MCH_PRIVATE_KEY = (process.env.WX_MCH_PRIVATE_KEY || '').replace(/\\n/g, '\n')
+
+// WeChat Pay V3 签名与请求
+function wxV3Auth(method, urlPath, body) {
+  const crypto = require('crypto')
+  const timestamp = Math.floor(Date.now() / 1000).toString()
+  const nonce = crypto.randomBytes(16).toString('hex').toUpperCase()
+  const message = `${method}\n${urlPath}\n${timestamp}\n${nonce}\n${body}\n`
+  const sign = crypto.createSign('RSA-SHA256')
+  sign.update(message)
+  const signature = sign.sign(WX_MCH_PRIVATE_KEY, 'base64')
+  return `WECHATPAY2-SHA256-RSA2048 mchid="${WX_MCH_ID}",nonce_str="${nonce}",timestamp="${timestamp}",serial_no="${WX_MCH_CERT_SERIAL}",signature="${signature}"`
+}
+
+async function wxV3Post(urlPath, payload) {
+  const body = JSON.stringify(payload)
+  const auth = wxV3Auth('POST', urlPath, body)
+  const resp = await fetch(`https://api.mch.weixin.qq.com${urlPath}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+      'Authorization': auth,
+      'Wechatpay-Serial': WX_MCH_PUBLIC_KEY_ID,
+    },
+    body,
+  })
+  const text = await resp.text()
+  try { return JSON.parse(text) } catch { return { raw: text } }
+}
+
+async function transferCommission(orderId, orderNo, openid, amountYuan) {
+  if (!WX_MCH_PRIVATE_KEY || !WX_MCH_CERT_SERIAL) return { skipped: true, reason: 'not configured' }
+  const amountFen = Math.round(amountYuan * 100)
+  if (amountFen < 1) return { skipped: true, reason: 'amount < 1 fen' }
+  const outBatchNo = `COMM${orderId}T${Date.now()}`
+  const outDetailNo = `D${orderId}T${Date.now()}`
+  return wxV3Post('/v3/transfer/batches', {
+    appid: WX_APPID,
+    out_batch_no: outBatchNo,
+    batch_name: '分销佣金',
+    batch_remark: `订单${orderNo}佣金结算`,
+    total_amount: amountFen,
+    total_num: 1,
+    transfer_detail_list: [{
+      out_detail_no: outDetailNo,
+      transfer_amount: amountFen,
+      transfer_remark: `订单${orderNo}佣金`,
+      openid,
+    }],
+  })
+}
 
 // 微信支付V2签名
 function wxPaySign(params) {
@@ -3852,6 +3908,47 @@ app.post('/miniapi/order/cancel', miniAuth, async (req, res) => {
   }
 })
 
+// 确认收货（用户）→ 自动结算佣金
+app.post('/miniapi/order/confirm', miniAuth, async (req, res) => {
+  const { id } = req.body
+  if (!id) return fail(res, '参数缺失')
+  try {
+    const order = (await pool.query(
+      `SELECT o.*, u.openid FROM mini_orders o
+       JOIN mini_users u ON u.id=o.user_id
+       WHERE o.id=$1 AND o.user_id=$2 LIMIT 1`,
+      [id, req.miniUser.id]
+    )).rows[0]
+    if (!order) return fail(res, '订单不存在')
+    if (order.status !== 2) return fail(res, '订单未发货，无法确认')
+    await pool.query(`UPDATE mini_orders SET status=3, confirmed_at=NOW() WHERE id=$1`, [id])
+    // 自动结算分销佣金
+    const commission = parseFloat(order.commission || 0)
+    if (order.distributor_code && commission > 0) {
+      try {
+        const dist = (await pool.query(
+          `SELECT d.*, u.openid as dist_openid FROM distributors d
+           JOIN mini_users u ON u.id=d.user_id
+           WHERE d.code=$1 AND d.status=1 LIMIT 1`,
+          [order.distributor_code]
+        )).rows[0]
+        if (dist?.dist_openid) {
+          const result = await transferCommission(id, order.order_no, dist.dist_openid, commission)
+          console.log('commission transfer result:', JSON.stringify(result))
+          if (!result.skipped) {
+            await pool.query(`UPDATE mini_orders SET commission_settled=true WHERE id=$1`, [id])
+          }
+        }
+      } catch (e) {
+        console.error('commission transfer error:', e.message)
+      }
+    }
+    return ok(res, { id, status: 3 })
+  } catch (e) {
+    return fail(res, e.message)
+  }
+})
+
 // ─── 分销商系统 ───────────────────────────────────────────────────────────────
 
 ;(async () => {
@@ -3873,6 +3970,8 @@ app.post('/miniapi/order/cancel', miniAuth, async (req, res) => {
     `)
     await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS distributor_code VARCHAR(20) DEFAULT ''`)
     await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS commission NUMERIC(8,2) DEFAULT 0`)
+    await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS commission_settled BOOLEAN DEFAULT FALSE`)
+    await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS confirmed_at TIMESTAMPTZ`)
   } catch(e) { console.log('distributor init:', e.message) }
 })()
 

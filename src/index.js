@@ -3269,6 +3269,44 @@ async function migrateSaleReturnOrder() {
     ADD COLUMN IF NOT EXISTS level_id INT DEFAULT 0`)
 }
 
+// 自动确认收货：发货满7天未手动确认的订单自动完成并结算佣金
+async function autoConfirmOrders() {
+  try {
+    const rows = (await pool.query(
+      `SELECT o.*, u.openid FROM mini_orders o
+       JOIN mini_users u ON u.id=o.user_id
+       WHERE o.status=2 AND o.shipped_at IS NOT NULL
+         AND o.shipped_at < NOW() - INTERVAL '7 days'`
+    )).rows
+    for (const order of rows) {
+      await pool.query(`UPDATE mini_orders SET status=3, confirmed_at=NOW() WHERE id=$1`, [order.id])
+      const commission = parseFloat(order.commission || 0)
+      if (order.distributor_code && commission > 0) {
+        try {
+          const dist = (await pool.query(
+            `SELECT d.*, u.openid as dist_openid FROM distributors d
+             JOIN mini_users u ON u.id=d.user_id
+             WHERE d.code=$1 AND d.status=1 LIMIT 1`,
+            [order.distributor_code]
+          )).rows[0]
+          if (dist?.dist_openid) {
+            const result = await transferCommission(order.id, order.order_no, dist.dist_openid, commission)
+            if (!result.skipped) {
+              await pool.query(`UPDATE mini_orders SET commission_settled=true WHERE id=$1`, [order.id])
+            }
+          }
+        } catch (e) {
+          console.error(`auto-settle commission failed for order ${order.order_no}:`, e.message)
+        }
+      }
+      console.log(`auto-confirmed order ${order.order_no}`)
+    }
+    if (rows.length) console.log(`Auto-confirmed ${rows.length} orders`)
+  } catch (e) {
+    console.error('autoConfirmOrders error:', e.message)
+  }
+}
+
 async function start() {
   // Listen first so Render health check passes immediately (Neon cold start can take 30+ sec)
   app.listen(PORT, () => {
@@ -3279,6 +3317,9 @@ async function start() {
     await migrateSaleReturnOrder()
     await loadTableCols()
     console.log('Database ready')
+    // 每天凌晨2点跑一次自动收货
+    const cron = require('node-cron')
+    cron.schedule('0 2 * * *', autoConfirmOrders, { timezone: 'Asia/Shanghai' })
   } catch (e) {
     console.error('DB init failed (server still running):', e)
   }

@@ -6263,8 +6263,8 @@ app.post('/miniapi/dev/seed-test-order', async (req, res) => {
        ON CONFLICT (openid) DO UPDATE SET name='测试用户' RETURNING id`
     )).rows[0]
     const o = (await pool.query(
-      `INSERT INTO mini_orders (user_id, order_no, status, total_amount, address, items, paid_at)
-       VALUES ($1, 'TEST'||extract(epoch from now())::bigint, 2, 99.00, '{"name":"测试","phone":"13800138000","province":"内蒙古","city":"呼和浩特","district":"回民区","detail":"测试街道1号"}', '[{"goods_id":992,"goods_name":"测试商品","price":"99.00","qty":1}]', NOW())
+      `INSERT INTO mini_orders (user_id, order_no, status, total_amount, address, remark, paid_at)
+       VALUES ($1, 'TEST'||extract(epoch from now())::bigint, 2, 99.00, '{"name":"测试","phone":"13800138000","province":"内蒙古","city":"呼和浩特","district":"回民区","detail":"测试街道1号"}', '测试订单', NOW())
        RETURNING id, order_no`,
       [u.id]
     )).rows[0]

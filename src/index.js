@@ -4018,9 +4018,11 @@ app.post('/miniapi/order/confirm', miniAuth, async (req, res) => {
       id SERIAL PRIMARY KEY,
       name VARCHAR(50) NOT NULL,
       discount NUMERIC(5,2) DEFAULT 100,
+      commission_rate NUMERIC(5,2) DEFAULT 0,
       sort INT DEFAULT 0,
       created_at TIMESTAMPTZ DEFAULT NOW()
     )`)
+    await pool.query(`ALTER TABLE customer_levels ADD COLUMN IF NOT EXISTS commission_rate NUMERIC(5,2) DEFAULT 0`)
     await pool.query(`CREATE TABLE IF NOT EXISTS customer_level_prices (
       id SERIAL PRIMARY KEY,
       level_id INT NOT NULL,
@@ -4132,11 +4134,11 @@ app.get('/adminapi/customer-level/list', auth, async (req, res) => {
 // 新增等级
 app.post('/adminapi/customer-level/add', auth, async (req, res) => {
   try {
-    const { name, discount = 100, sort = 0 } = req.body
+    const { name, discount = 100, commission_rate = 0, sort = 0 } = req.body
     if (!name) return fail(res, '名称必填')
     const r = (await pool.query(
-      `INSERT INTO customer_levels (name, discount, sort) VALUES ($1,$2,$3) RETURNING *`,
-      [name, parseFloat(discount), parseInt(sort)]
+      `INSERT INTO customer_levels (name, discount, commission_rate, sort) VALUES ($1,$2,$3,$4) RETURNING *`,
+      [name, parseFloat(discount), parseFloat(commission_rate), parseInt(sort)]
     )).rows[0]
     return ok(res, r)
   } catch(e) { fail(res, e.message) }
@@ -4145,11 +4147,11 @@ app.post('/adminapi/customer-level/add', auth, async (req, res) => {
 // 编辑等级
 app.post('/adminapi/customer-level/edit', auth, async (req, res) => {
   try {
-    const { id, name, discount, sort } = req.body
+    const { id, name, discount, commission_rate, sort } = req.body
     if (!id) return fail(res, 'id必填')
     const r = (await pool.query(
-      `UPDATE customer_levels SET name=COALESCE($1,name), discount=COALESCE($2,discount), sort=COALESCE($3,sort) WHERE id=$4 RETURNING *`,
-      [name, discount != null ? parseFloat(discount) : null, sort != null ? parseInt(sort) : null, id]
+      `UPDATE customer_levels SET name=COALESCE($1,name), discount=COALESCE($2,discount), commission_rate=COALESCE($3,commission_rate), sort=COALESCE($4,sort) WHERE id=$5 RETURNING *`,
+      [name, discount != null ? parseFloat(discount) : null, commission_rate != null ? parseFloat(commission_rate) : null, sort != null ? parseInt(sort) : null, id]
     )).rows[0]
     return ok(res, r)
   } catch(e) { fail(res, e.message) }
@@ -4233,14 +4235,19 @@ app.get('/miniapi/level-prices', miniAuth, async (req, res) => {
 // ERP后台 — 审批通过
 app.post('/adminapi/distributor/approve', auth, async (req, res) => {
   try {
-    const { id, commission_rate = 10, note = '' } = req.body
+    const { id, note = '' } = req.body
     if (!id) return fail(res, 'id必填')
     const dist = (await pool.query(`SELECT * FROM distributors WHERE id=$1 LIMIT 1`, [id])).rows[0]
     if (!dist) return fail(res, '不存在')
     const code = dist.code || `D${String(id).padStart(4,'0')}`
+    // 从「分销商」等级取佣金率，没有则默认10
+    const level = (await pool.query(
+      `SELECT commission_rate FROM customer_levels WHERE name='分销商' LIMIT 1`
+    )).rows[0]
+    const commission_rate = level ? parseFloat(level.commission_rate) : 10
     await pool.query(
       `UPDATE distributors SET status=1, code=$1, commission_rate=$2, note=$3, approved_at=NOW() WHERE id=$4`,
-      [code, parseFloat(commission_rate), note, id]
+      [code, commission_rate, note, id]
     )
     // 同步到ERP客户管理（按手机号去重）
     const existing = (await pool.query(

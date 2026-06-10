@@ -4260,7 +4260,7 @@ app.get('/miniapi/level-prices', miniAuth, async (req, res) => {
       `SELECT goods_id, level_price FROM customer_level_prices WHERE level_id=$1`,
       [level.id]
     )).rows
-    const map: Record<number, number> = {}
+    const map = {}
     for (const p of prices) map[p.goods_id] = parseFloat(p.level_price)
     return ok(res, map)
   } catch(e) { fail(res, e.message) }

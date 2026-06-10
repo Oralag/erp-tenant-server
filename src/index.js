@@ -98,6 +98,42 @@ function ok(res, data = {}, message = '') {
   return res.json({ code: 1, data, message })
 }
 
+// ─── multi-tenant migration ──────────────────────────────────────────────────
+
+async function migrateMultiTenant() {
+  // shops 表
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS shops (
+      id SERIAL PRIMARY KEY,
+      name VARCHAR(100) NOT NULL DEFAULT '我的公司',
+      contact VARCHAR(50) DEFAULT '',
+      mobile VARCHAR(20) DEFAULT '',
+      created_at TIMESTAMP DEFAULT NOW()
+    )
+  `)
+  await pool.query(`INSERT INTO shops (id, name) VALUES (1, '默认公司') ON CONFLICT (id) DO NOTHING`)
+
+  // admins 加 shop_id
+  await pool.query(`ALTER TABLE admins ADD COLUMN IF NOT EXISTS shop_id INTEGER NOT NULL DEFAULT 1`)
+
+  // 所有业务表加 shop_id（DEFAULT 1 保证现有数据不丢）
+  const tables = [
+    'goods','goods_cate','goods_unit','goods_brand','goods_spec',
+    'sale_customers','sale_contracts','sale_out_order','sale_return_order','sale_offers','sale_samples',
+    'purchase_order','procure_inhouse','procure_return','procure_plan',
+    'stock_flow','stock_inventory','warehouses','stock_other_in','stock_other_out','stock_allocation','stock_checks',
+    'supplier','bom_order','bom_items',
+    'finance_receivable','finance_payable','collect_receipt','pay_receipt',
+    'finance_invoices','finance_statements','finance_expenses','finance_funds','finance_costs',
+    'prepay_record',
+    'retail_orders','retail_members','retail_recharge','retail_stores',
+    'depts','roles','jobs','operation_logs','sys_params',
+  ]
+  for (const t of tables) {
+    await pool.query(`ALTER TABLE IF EXISTS ${t} ADD COLUMN IF NOT EXISTS shop_id INTEGER NOT NULL DEFAULT 1`).catch(() => {})
+  }
+}
+
 // 健康检查（含DB诊断）
 app.get('/health', (req, res) => {
   res.json({ ok: true })
@@ -136,6 +172,12 @@ function buildKeywordWhere(keyword, columns, paramStart = 1) {
     params: [`%${keyword}%`],
     nextParam: paramStart + 1,
   }
+}
+
+function shopBase(req, base) {
+  const sid = parseInt(req.admin?.shop_id) || 1
+  if (!base || base === '1=1') return `shop_id=${sid}`
+  return `${base} AND shop_id=${sid}`
 }
 
 async function listQuery(res, table, { keyword, keywordCols, extra = '', extraParams = [], baseWhere = 'deleted_at IS NULL', orderBy = 'id DESC', page, list_rows, offset }) {
@@ -177,6 +219,27 @@ app.use('/adminapi', (req, res, next) => {
 
 // ─── login / auth ───────────────────────────────────────────────────────────
 
+app.post('/adminapi/login/register', async (req, res) => {
+  try {
+    const { account, password, company_name } = req.body
+    if (!account || !password) return fail(res, '账号和密码不能为空')
+    const exist = await pool.query(`SELECT id FROM admins WHERE account=$1 AND deleted_at IS NULL LIMIT 1`, [account])
+    if (exist.rows.length > 0) return fail(res, '账号已存在')
+    const shopRes = await pool.query(`INSERT INTO shops (name) VALUES ($1) RETURNING id`, [company_name || account + '的公司'])
+    const shopId = shopRes.rows[0].id
+    const hashed = await bcrypt.hash(password, 10)
+    const userRes = await pool.query(
+      `INSERT INTO admins (account, name, password, mobile, status, role_name, shop_id) VALUES ($1,$2,$3,$4,1,'超级管理员',$5) RETURNING id, account, name, shop_id`,
+      [account, account, hashed, account, shopId]
+    )
+    const user = userRes.rows[0]
+    const token = jwt.sign({ id: user.id, account: user.account, shop_id: shopId }, JWT_SECRET, { expiresIn: '7d' })
+    return ok(res, { token, userInfo: { id: user.id, name: user.name, account: user.account, shop_id: shopId, role_name: '超级管理员', permissions: ['*'] } })
+  } catch (e) {
+    return fail(res, e.message)
+  }
+})
+
 app.post('/adminapi/login/account', async (req, res) => {
   try {
     const { account, password } = req.body
@@ -201,7 +264,7 @@ app.post('/adminapi/login/account', async (req, res) => {
     }
     if (!valid) return fail(res, '密码错误')
     if (user.status !== 1) return fail(res, '账号已被禁用')
-    const token = jwt.sign({ id: user.id, account: user.account }, JWT_SECRET, { expiresIn: '7d' })
+    const token = jwt.sign({ id: user.id, account: user.account, shop_id: user.shop_id || 1 }, JWT_SECRET, { expiresIn: '7d' })
     return ok(res, {
       token,
       userInfo: {
@@ -213,6 +276,7 @@ app.post('/adminapi/login/account', async (req, res) => {
         role_id: user.role_id,
         dept_name: user.dept_name,
         mobile: user.mobile,
+        shop_id: user.shop_id || 1,
       },
     })
   } catch (e) {
@@ -274,10 +338,14 @@ function makeCRUD(router, path, table, opts = {}) {
   router.get(path + '/index', async (req, res) => {
     try {
       const { page, list_rows, offset } = pageParams(req.query)
+      const shopId = parseInt(req.admin?.shop_id) || 1
+      const baseWhereWithShop = extraListWhere && extraListWhere !== '1=1'
+        ? `${extraListWhere} AND shop_id=${shopId}`
+        : `shop_id=${shopId}`
       await listQuery(res, table, {
         keyword: req.query.keyword,
         keywordCols,
-        baseWhere: extraListWhere,
+        baseWhere: baseWhereWithShop,
         orderBy,
         page,
         list_rows,
@@ -291,6 +359,7 @@ function makeCRUD(router, path, table, opts = {}) {
   router.post(path + '/add', async (req, res) => {
     try {
       const body = filterBodyCols(table, { ...req.body })
+      body.shop_id = parseInt(req.admin?.shop_id) || 1
       const cols = Object.keys(body).filter((k) => body[k] !== undefined)
       if (cols.length === 0) {
         return fail(res, '无有效字段')
@@ -314,14 +383,15 @@ function makeCRUD(router, path, table, opts = {}) {
       if (cols.length === 0) return fail(res, '无有效字段')
       const sets = cols.map((k, i) => `${k}=$${i + 1}`)
       const vals = cols.map((k) => rest[k])
+      const shopId = parseInt(req.admin?.shop_id) || 1
       // update_time if column exists
       let sql = `UPDATE ${table} SET ${sets.join(',')}`
       try {
         const hasUpdate = await pool.query(`SELECT 1 FROM information_schema.columns WHERE table_name=$1 AND column_name='update_time'`, [table])
         if (hasUpdate.rows.length > 0) sql += `, update_time=NOW()`
       } catch {}
-      sql += ` WHERE id=$${vals.length + 1} RETURNING *`
-      const result = await pool.query(sql, [...vals, id])
+      sql += ` WHERE id=$${vals.length + 1} AND shop_id=$${vals.length + 2} RETURNING *`
+      const result = await pool.query(sql, [...vals, id, shopId])
       return ok(res, result.rows[0])
     } catch (e) {
       return fail(res, e.message)
@@ -332,10 +402,11 @@ function makeCRUD(router, path, table, opts = {}) {
     try {
       const { id } = req.body
       if (!id) return fail(res, 'id不能为空')
+      const shopId = parseInt(req.admin?.shop_id) || 1
       if (softDelete) {
-        await pool.query(`UPDATE ${table} SET deleted_at=NOW() WHERE id=$1`, [id])
+        await pool.query(`UPDATE ${table} SET deleted_at=NOW() WHERE id=$1 AND shop_id=$2`, [id, shopId])
       } else {
-        await pool.query(`DELETE FROM ${table} WHERE id=$1`, [id])
+        await pool.query(`DELETE FROM ${table} WHERE id=$1 AND shop_id=$2`, [id, shopId])
       }
       return ok(res)
     } catch (e) {
@@ -371,7 +442,7 @@ router.get('/goods/ShopGoods/index', async (req, res) => {
     await listQuery(res, 'goods', {
       keyword: req.query.keyword,
       keywordCols: ['goods_name', 'goods_sn'],
-      baseWhere: 'deleted_at IS NULL',
+      baseWhere: shopBase(req, 'deleted_at IS NULL'),
       orderBy: 'id DESC',
       page, list_rows, offset,
     })
@@ -381,15 +452,16 @@ router.get('/goods/ShopGoods/detail', auth, async (req, res) => {
   try {
     const id = parseInt(req.query.id)
     if (!id) return fail(res, 'id required')
-    const r = await pool.query('SELECT * FROM goods WHERE id=$1 AND deleted_at IS NULL LIMIT 1', [id])
+    const r = await pool.query('SELECT * FROM goods WHERE id=$1 AND deleted_at IS NULL AND shop_id=$2 LIMIT 1', [id, parseInt(req.admin?.shop_id) || 1])
     if (!r.rows[0]) return fail(res, '商品不存在')
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })
 router.post('/goods/ShopGoods/add', async (req, res) => {
   try {
-    const body = req.body
-    const cols = Object.keys(body).filter(k => GOODS_ALLOWED_COLS.has(k) && body[k] !== undefined && body[k] !== null && body[k] !== '')
+    const body = { ...req.body, shop_id: parseInt(req.admin?.shop_id) || 1 }
+    const allowedWithShop = new Set([...GOODS_ALLOWED_COLS, 'shop_id'])
+    const cols = Object.keys(body).filter(k => allowedWithShop.has(k) && body[k] !== undefined && body[k] !== null && body[k] !== '')
     if (!cols.includes('goods_name') && !body.goods_name) return fail(res, '商品名称不能为空')
     const vals = cols.map(k => body[k])
     const sql = `INSERT INTO goods (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`
@@ -405,8 +477,9 @@ router.post('/goods/ShopGoods/edit', async (req, res) => {
     if (!cols.length) return fail(res, '无有效字段')
     const sets = cols.map((k,i) => `${k}=$${i+1}`)
     const vals = cols.map(k => rest[k])
-    const sql = `UPDATE goods SET ${sets.join(',')}, update_time=NOW() WHERE id=$${vals.length+1} RETURNING *`
-    const r = await pool.query(sql, [...vals, id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    const sql = `UPDATE goods SET ${sets.join(',')}, update_time=NOW() WHERE id=$${vals.length+1} AND shop_id=$${vals.length+2} RETURNING *`
+    const r = await pool.query(sql, [...vals, id, shopId])
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })
@@ -438,7 +511,8 @@ router.post('/goods/ShopGoods/del', async (req, res) => {
   try {
     const { id } = req.body
     if (!id) return fail(res, 'id不能为空')
-    await pool.query('UPDATE goods SET deleted_at=NOW() WHERE id=$1', [id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    await pool.query('UPDATE goods SET deleted_at=NOW() WHERE id=$1 AND shop_id=$2', [id, shopId])
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
@@ -447,16 +521,17 @@ router.post('/goods/ShopGoods/del', async (req, res) => {
 router.get('/goods/ShopGoodsCate/index', async (req, res) => {
   try {
     const { page, list_rows, offset } = pageParams(req.query)
-    await listQuery(res, 'goods_cate', { keyword: req.query.keyword, keywordCols: ['name'], baseWhere: '1=1', orderBy: 'id ASC', page, list_rows, offset })
+    await listQuery(res, 'goods_cate', { keyword: req.query.keyword, keywordCols: ['name'], baseWhere: shopBase(req), orderBy: 'id ASC', page, list_rows, offset })
   } catch (e) { fail(res, e.message) }
 })
 router.post('/goods/ShopGoodsCate/add', async (req, res) => {
   try {
     const { name, parent_id = 0, sort = 0, status = 1 } = req.body
     if (!name) return fail(res, '名称不能为空')
-    const dup = await pool.query('SELECT * FROM goods_cate WHERE name=$1 AND parent_id=$2 LIMIT 1', [name, parent_id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    const dup = await pool.query('SELECT * FROM goods_cate WHERE name=$1 AND parent_id=$2 AND shop_id=$3 LIMIT 1', [name, parent_id, shopId])
     if (dup.rows.length) return ok(res, dup.rows[0])
-    const r = await pool.query('INSERT INTO goods_cate (name,parent_id,sort,status) VALUES ($1,$2,$3,$4) RETURNING *', [name, parent_id, sort, status])
+    const r = await pool.query('INSERT INTO goods_cate (name,parent_id,sort,status,shop_id) VALUES ($1,$2,$3,$4,$5) RETURNING *', [name, parent_id, sort, status, shopId])
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })
@@ -464,7 +539,8 @@ router.post('/goods/ShopGoodsCate/edit', async (req, res) => {
   try {
     const { id, name, parent_id, sort, status } = req.body
     if (!id) return fail(res, 'id不能为空')
-    const r = await pool.query('UPDATE goods_cate SET name=COALESCE($1,name), parent_id=COALESCE($2,parent_id), sort=COALESCE($3,sort), status=COALESCE($4,status) WHERE id=$5 RETURNING *', [name, parent_id, sort, status, id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    const r = await pool.query('UPDATE goods_cate SET name=COALESCE($1,name), parent_id=COALESCE($2,parent_id), sort=COALESCE($3,sort), status=COALESCE($4,status) WHERE id=$5 AND shop_id=$6 RETURNING *', [name, parent_id, sort, status, id, shopId])
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })
@@ -472,8 +548,9 @@ router.post('/goods/ShopGoodsCate/del', async (req, res) => {
   try {
     const { id } = req.body
     if (!id) return fail(res, 'id不能为空')
-    // 同时删除所有子分类
-    await pool.query('DELETE FROM goods_cate WHERE id=$1 OR parent_id=$1', [id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    // 同时删除所有子分类（限当前公司）
+    await pool.query('DELETE FROM goods_cate WHERE (id=$1 OR parent_id=$1) AND shop_id=$2', [id, shopId])
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
@@ -482,14 +559,15 @@ router.post('/goods/ShopGoodsCate/del', async (req, res) => {
 router.get('/goods/ShopUnit/index', async (req, res) => {
   try {
     const { page, list_rows, offset } = pageParams(req.query)
-    await listQuery(res, 'goods_unit', { keyword: req.query.keyword, keywordCols: ['name'], baseWhere: '1=1', orderBy: 'id ASC', page, list_rows, offset })
+    await listQuery(res, 'goods_unit', { keyword: req.query.keyword, keywordCols: ['name'], baseWhere: shopBase(req), orderBy: 'id ASC', page, list_rows, offset })
   } catch (e) { fail(res, e.message) }
 })
 router.post('/goods/ShopUnit/add', async (req, res) => {
   try {
     const { name, status = 1 } = req.body
     if (!name) return fail(res, '名称不能为空')
-    const r = await pool.query('INSERT INTO goods_unit (name,status) VALUES ($1,$2) RETURNING *', [name, status])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    const r = await pool.query('INSERT INTO goods_unit (name,status,shop_id) VALUES ($1,$2,$3) RETURNING *', [name, status, shopId])
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })
@@ -497,7 +575,8 @@ router.post('/goods/ShopUnit/edit', async (req, res) => {
   try {
     const { id, name, status } = req.body
     if (!id) return fail(res, 'id不能为空')
-    const r = await pool.query('UPDATE goods_unit SET name=COALESCE($1,name), status=COALESCE($2,status) WHERE id=$3 RETURNING *', [name, status, id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    const r = await pool.query('UPDATE goods_unit SET name=COALESCE($1,name), status=COALESCE($2,status) WHERE id=$3 AND shop_id=$4 RETURNING *', [name, status, id, shopId])
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })
@@ -505,7 +584,8 @@ router.post('/goods/ShopUnit/del', async (req, res) => {
   try {
     const { id } = req.body
     if (!id) return fail(res, 'id不能为空')
-    await pool.query('DELETE FROM goods_unit WHERE id=$1', [id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    await pool.query('DELETE FROM goods_unit WHERE id=$1 AND shop_id=$2', [id, shopId])
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
@@ -541,14 +621,15 @@ router.post('/goods/GoodsUnitConvert/save', async (req, res) => {
 router.get('/goods/ShopBrand/index', async (req, res) => {
   try {
     const { page, list_rows, offset } = pageParams(req.query)
-    await listQuery(res, 'goods_brand', { keyword: req.query.keyword, keywordCols: ['name'], baseWhere: '1=1', orderBy: 'id ASC', page, list_rows, offset })
+    await listQuery(res, 'goods_brand', { keyword: req.query.keyword, keywordCols: ['name'], baseWhere: shopBase(req), orderBy: 'id ASC', page, list_rows, offset })
   } catch (e) { fail(res, e.message) }
 })
 router.post('/goods/ShopBrand/add', async (req, res) => {
   try {
     const { name, status = 1 } = req.body
     if (!name) return fail(res, '名称不能为空')
-    const r = await pool.query('INSERT INTO goods_brand (name,status) VALUES ($1,$2) RETURNING *', [name, status])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    const r = await pool.query('INSERT INTO goods_brand (name,status,shop_id) VALUES ($1,$2,$3) RETURNING *', [name, status, shopId])
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })
@@ -556,7 +637,8 @@ router.post('/goods/ShopBrand/edit', async (req, res) => {
   try {
     const { id, name, status } = req.body
     if (!id) return fail(res, 'id不能为空')
-    const r = await pool.query('UPDATE goods_brand SET name=COALESCE($1,name), status=COALESCE($2,status) WHERE id=$3 RETURNING *', [name, status, id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    const r = await pool.query('UPDATE goods_brand SET name=COALESCE($1,name), status=COALESCE($2,status) WHERE id=$3 AND shop_id=$4 RETURNING *', [name, status, id, shopId])
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })
@@ -564,7 +646,8 @@ router.post('/goods/ShopBrand/del', async (req, res) => {
   try {
     const { id } = req.body
     if (!id) return fail(res, 'id不能为空')
-    await pool.query('DELETE FROM goods_brand WHERE id=$1', [id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    await pool.query('DELETE FROM goods_brand WHERE id=$1 AND shop_id=$2', [id, shopId])
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
@@ -573,14 +656,15 @@ router.post('/goods/ShopBrand/del', async (req, res) => {
 router.get('/goods/ShopSpec/index', async (req, res) => {
   try {
     const { page, list_rows, offset } = pageParams(req.query)
-    await listQuery(res, 'goods_spec', { keyword: req.query.keyword, keywordCols: ['name'], baseWhere: '1=1', orderBy: 'id ASC', page, list_rows, offset })
+    await listQuery(res, 'goods_spec', { keyword: req.query.keyword, keywordCols: ['name'], baseWhere: shopBase(req), orderBy: 'id ASC', page, list_rows, offset })
   } catch (e) { fail(res, e.message) }
 })
 router.post('/goods/ShopSpec/add', async (req, res) => {
   try {
     const { name, values = '', status = 1 } = req.body
     if (!name) return fail(res, '名称不能为空')
-    const r = await pool.query('INSERT INTO goods_spec (name,values,status) VALUES ($1,$2,$3) RETURNING *', [name, values, status])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    const r = await pool.query('INSERT INTO goods_spec (name,values,status,shop_id) VALUES ($1,$2,$3,$4) RETURNING *', [name, values, status, shopId])
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })
@@ -588,7 +672,8 @@ router.post('/goods/ShopSpec/edit', async (req, res) => {
   try {
     const { id, name, values, status } = req.body
     if (!id) return fail(res, 'id不能为空')
-    const r = await pool.query('UPDATE goods_spec SET name=COALESCE($1,name), values=COALESCE($2,values), status=COALESCE($3,status) WHERE id=$4 RETURNING *', [name, values, status, id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    const r = await pool.query('UPDATE goods_spec SET name=COALESCE($1,name), values=COALESCE($2,values), status=COALESCE($3,status) WHERE id=$4 AND shop_id=$5 RETURNING *', [name, values, status, id, shopId])
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })
@@ -596,7 +681,8 @@ router.post('/goods/ShopSpec/del', async (req, res) => {
   try {
     const { id } = req.body
     if (!id) return fail(res, 'id不能为空')
-    await pool.query('DELETE FROM goods_spec WHERE id=$1', [id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    await pool.query('DELETE FROM goods_spec WHERE id=$1 AND shop_id=$2', [id, shopId])
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
@@ -609,14 +695,15 @@ router.post('/goods/ShopSpec/del', async (req, res) => {
 router.get('/shop/ShopCustomer/index', async (req, res) => {
   try {
     const { page, list_rows, offset } = pageParams(req.query)
-    await listQuery(res, 'sale_customers', { keyword: req.query.keyword, keywordCols: ['name','mobile','code'], baseWhere: 'deleted_at IS NULL', orderBy: 'id DESC', page, list_rows, offset })
+    await listQuery(res, 'sale_customers', { keyword: req.query.keyword, keywordCols: ['name','mobile','code'], baseWhere: shopBase(req, 'deleted_at IS NULL'), orderBy: 'id DESC', page, list_rows, offset })
   } catch (e) { fail(res, e.message) }
 })
 router.get('/shop/ShopCustomer/detail', async (req, res) => {
   try {
     const { id } = req.query
     if (!id) return fail(res, 'id不能为空')
-    const r = await pool.query('SELECT * FROM sale_customers WHERE id=$1 AND deleted_at IS NULL', [id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    const r = await pool.query('SELECT * FROM sale_customers WHERE id=$1 AND deleted_at IS NULL AND shop_id=$2', [id, shopId])
     if (!r.rows[0]) return fail(res, '客户不存在')
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
@@ -624,7 +711,8 @@ router.get('/shop/ShopCustomer/detail', async (req, res) => {
 router.post('/shop/ShopCustomer/add', async (req, res) => {
   try {
     const b = req.body
-    const filtered = filterBodyCols('sale_customers', b); const cols = Object.keys(filtered).filter(k => filtered[k] !== undefined && filtered[k] !== null && filtered[k] !== '')
+    const filtered = filterBodyCols('sale_customers', { ...b, shop_id: parseInt(req.admin?.shop_id) || 1 })
+    const cols = Object.keys(filtered).filter(k => filtered[k] !== undefined && filtered[k] !== null && filtered[k] !== '')
     if (!cols.includes('name') && !b.name) return fail(res, '客户名称不能为空')
     const vals = cols.map(k => filtered[k])
     const r = await pool.query(`INSERT INTO sale_customers (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
@@ -639,7 +727,8 @@ router.post('/shop/ShopCustomer/edit', async (req, res) => {
     if (!cols.length) return fail(res, '无有效字段')
     const sets = cols.map((k,i) => `${k}=$${i+1}`)
     const vals = cols.map(k => rest[k])
-    const r = await pool.query(`UPDATE sale_customers SET ${sets.join(',')}, update_time=NOW() WHERE id=$${vals.length+1} RETURNING *`, [...vals, id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    const r = await pool.query(`UPDATE sale_customers SET ${sets.join(',')}, update_time=NOW() WHERE id=$${vals.length+1} AND shop_id=$${vals.length+2} RETURNING *`, [...vals, id, shopId])
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })
@@ -647,7 +736,8 @@ router.post('/shop/ShopCustomer/del', async (req, res) => {
   try {
     const { id } = req.body
     if (!id) return fail(res, 'id不能为空')
-    await pool.query('UPDATE sale_customers SET deleted_at=NOW() WHERE id=$1', [id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    await pool.query('UPDATE sale_customers SET deleted_at=NOW() WHERE id=$1 AND shop_id=$2', [id, shopId])
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
@@ -656,7 +746,8 @@ router.post('/shop/ShopCustomer/batchDel', async (req, res) => {
     const { ids } = req.body
     if (!ids || !ids.length) return fail(res, 'ids不能为空')
     const idArr = Array.isArray(ids) ? ids : ids.split(',').map(Number)
-    await pool.query(`UPDATE sale_customers SET deleted_at=NOW() WHERE id=ANY($1)`, [idArr])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    await pool.query(`UPDATE sale_customers SET deleted_at=NOW() WHERE id=ANY($1) AND shop_id=$2`, [idArr, shopId])
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
@@ -668,7 +759,7 @@ router.get('/shop/ContractOrder/index', async (req, res) => {
     const conditions = ['deleted_at IS NULL']
     if (req.query.status !== undefined && req.query.status !== '') conditions.push(`status=${parseInt(req.query.status)}`)
     if (req.query.customer_name) conditions.push(`customer_name ILIKE '%${req.query.customer_name.replace(/'/g,"''")}%'`)
-    await listQuery(res, 'sale_contracts', { keyword: req.query.keyword, keywordCols: ['order_no'], baseWhere: conditions.join(' AND '), orderBy: 'id DESC', page, list_rows, offset })
+    await listQuery(res, 'sale_contracts', { keyword: req.query.keyword, keywordCols: ['order_no'], baseWhere: shopBase(req, conditions.join(' AND ')), orderBy: 'id DESC', page, list_rows, offset })
   } catch (e) { fail(res, e.message) }
 })
 router.get('/shop/ContractOrder/detail', async (req, res) => {
@@ -682,7 +773,7 @@ router.get('/shop/ContractOrder/detail', async (req, res) => {
 })
 router.post('/shop/ContractOrder/add', async (req, res) => {
   try {
-    const b = filterBodyCols('sale_contracts', { order_no: genOrderNo('XS'), order_sn: genOrderNo('XS'), ...req.body })
+    const b = filterBodyCols('sale_contracts', { order_no: genOrderNo('XS'), order_sn: genOrderNo('XS'), ...req.body, shop_id: parseInt(req.admin?.shop_id) || 1 })
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
     const vals = cols.map(k => typeof b[k] === 'object' ? JSON.stringify(b[k]) : b[k])
     const r = await pool.query(`INSERT INTO sale_contracts (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
@@ -697,7 +788,8 @@ router.post('/shop/ContractOrder/edit', async (req, res) => {
     if (!cols.length) return fail(res, '无有效字段')
     const sets = cols.map((k,i) => `${k}=$${i+1}`)
     const vals = cols.map(k => typeof rest[k] === 'object' ? JSON.stringify(rest[k]) : rest[k])
-    const r = await pool.query(`UPDATE sale_contracts SET ${sets.join(',')} WHERE id=$${vals.length+1} RETURNING *`, [...vals, id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    const r = await pool.query(`UPDATE sale_contracts SET ${sets.join(',')} WHERE id=$${vals.length+1} AND shop_id=$${vals.length+2} RETURNING *`, [...vals, id, shopId])
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })
@@ -705,8 +797,9 @@ router.post('/shop/ContractOrder/del', async (req, res) => {
   try {
     const { id } = req.body
     if (!id) return fail(res, 'id不能为空')
+    const delShopId = parseInt(req.admin?.shop_id) || 1
     // 已审核的合同删除时，同步撤销关联收款单并扣余额（同反审核逻辑）
-    const cR = await pool.query('SELECT * FROM sale_contracts WHERE id=$1', [id])
+    const cR = await pool.query('SELECT * FROM sale_contracts WHERE id=$1 AND shop_id=$2', [id, delShopId])
     const contract = cR.rows[0]
     if (contract && Number(contract.status) === 1) {
       const orderSn = contract.order_sn || contract.order_no || ''
@@ -734,7 +827,7 @@ router.post('/shop/ContractOrder/del', async (req, res) => {
         }
       }
     }
-    await pool.query('UPDATE sale_contracts SET deleted_at=NOW() WHERE id=$1', [id])
+    await pool.query('UPDATE sale_contracts SET deleted_at=NOW() WHERE id=$1 AND shop_id=$2', [id, delShopId])
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
@@ -744,7 +837,8 @@ router.post('/shop/ContractOrder/audit', async (req, res) => {
     if (!id) return fail(res, 'id不能为空')
     const isAudit = Number(status ?? 1) === 1
 
-    const contractR = await pool.query('SELECT * FROM sale_contracts WHERE id=$1', [id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    const contractR = await pool.query('SELECT * FROM sale_contracts WHERE id=$1 AND shop_id=$2', [id, shopId])
     const contract = contractR.rows[0]
     if (!contract) return fail(res, '合同不存在')
 
@@ -804,7 +898,7 @@ router.post('/shop/ContractOrder/audit', async (req, res) => {
       }
     }
 
-    await pool.query('UPDATE sale_contracts SET status=$1 WHERE id=$2', [status ?? 1, id])
+    await pool.query('UPDATE sale_contracts SET status=$1 WHERE id=$2 AND shop_id=$3', [status ?? 1, id, shopId])
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
@@ -813,12 +907,12 @@ router.post('/shop/ContractOrder/audit', async (req, res) => {
 router.get('/shop/offerOrder/index', async (req, res) => {
   try {
     const { page, list_rows, offset } = pageParams(req.query)
-    await listQuery(res, 'sale_offers', { keyword: req.query.keyword, keywordCols: ['order_no','customer_name'], baseWhere: 'deleted_at IS NULL', orderBy: 'id DESC', page, list_rows, offset })
+    await listQuery(res, 'sale_offers', { keyword: req.query.keyword, keywordCols: ['order_no','customer_name'], baseWhere: shopBase(req, 'deleted_at IS NULL'), orderBy: 'id DESC', page, list_rows, offset })
   } catch (e) { fail(res, e.message) }
 })
 router.post('/shop/offerOrder/add', async (req, res) => {
   try {
-    const b = filterBodyCols('sale_offers', { order_no: genOrderNo('BJ'), ...req.body })
+    const b = filterBodyCols('sale_offers', { order_no: genOrderNo('BJ'), ...req.body, shop_id: parseInt(req.admin?.shop_id) || 1 })
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
     const vals = cols.map(k => typeof b[k] === 'object' ? JSON.stringify(b[k]) : b[k])
     const r = await pool.query(`INSERT INTO sale_offers (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
@@ -833,7 +927,8 @@ router.post('/shop/offerOrder/edit', async (req, res) => {
     if (!cols.length) return fail(res, '无有效字段')
     const sets = cols.map((k,i) => `${k}=$${i+1}`)
     const vals = cols.map(k => typeof rest[k] === 'object' ? JSON.stringify(rest[k]) : rest[k])
-    const r = await pool.query(`UPDATE sale_offers SET ${sets.join(',')} WHERE id=$${vals.length+1} RETURNING *`, [...vals, id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    const r = await pool.query(`UPDATE sale_offers SET ${sets.join(',')} WHERE id=$${vals.length+1} AND shop_id=$${vals.length+2} RETURNING *`, [...vals, id, shopId])
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })
@@ -841,7 +936,8 @@ router.post('/shop/offerOrder/del', async (req, res) => {
   try {
     const { id } = req.body
     if (!id) return fail(res, 'id不能为空')
-    await pool.query('UPDATE sale_offers SET deleted_at=NOW() WHERE id=$1', [id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    await pool.query('UPDATE sale_offers SET deleted_at=NOW() WHERE id=$1 AND shop_id=$2', [id, shopId])
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
@@ -849,7 +945,8 @@ router.post('/shop/offerOrder/audit', async (req, res) => {
   try {
     const { id, status } = req.body
     if (!id) return fail(res, 'id不能为空')
-    await pool.query('UPDATE sale_offers SET status=$1 WHERE id=$2', [status ?? 1, id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    await pool.query('UPDATE sale_offers SET status=$1 WHERE id=$2 AND shop_id=$3', [status ?? 1, id, shopId])
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
@@ -865,12 +962,12 @@ router.get('/stock/PurchaseOrder/index', async (req, res) => {
     const conditions = ['deleted_at IS NULL']
     if (req.query.status !== undefined && req.query.status !== '') conditions.push(`status=${parseInt(req.query.status)}`)
     if (req.query.supplier_name) conditions.push(`supplier_name ILIKE '%${req.query.supplier_name.replace(/'/g,"''")}%'`)
-    await listQuery(res, 'purchase_order', { keyword: req.query.keyword, keywordCols: ['order_no'], baseWhere: conditions.join(' AND '), orderBy: 'id DESC', page, list_rows, offset })
+    await listQuery(res, 'purchase_order', { keyword: req.query.keyword, keywordCols: ['order_no'], baseWhere: shopBase(req, conditions.join(' AND ')), orderBy: 'id DESC', page, list_rows, offset })
   } catch (e) { fail(res, e.message) }
 })
 router.post('/stock/PurchaseOrder/add', async (req, res) => {
   try {
-    const b = filterBodyCols('purchase_order', { order_no: genOrderNo('CG'), order_sn: genOrderNo('CG'), ...req.body })
+    const b = filterBodyCols('purchase_order', { order_no: genOrderNo('CG'), order_sn: genOrderNo('CG'), ...req.body, shop_id: parseInt(req.admin?.shop_id) || 1 })
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
     const vals = cols.map(k => typeof b[k] === 'object' ? JSON.stringify(b[k]) : b[k])
     const r = await pool.query(`INSERT INTO purchase_order (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
@@ -885,7 +982,8 @@ router.post('/stock/PurchaseOrder/edit', async (req, res) => {
     if (!cols.length) return fail(res, '无有效字段')
     const sets = cols.map((k,i) => `${k}=$${i+1}`)
     const vals = cols.map(k => typeof rest[k] === 'object' ? JSON.stringify(rest[k]) : rest[k])
-    const r = await pool.query(`UPDATE purchase_order SET ${sets.join(',')} WHERE id=$${vals.length+1} RETURNING *`, [...vals, id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    const r = await pool.query(`UPDATE purchase_order SET ${sets.join(',')} WHERE id=$${vals.length+1} AND shop_id=$${vals.length+2} RETURNING *`, [...vals, id, shopId])
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })
@@ -893,8 +991,9 @@ router.post('/stock/PurchaseOrder/del', async (req, res) => {
   try {
     const { id } = req.body
     if (!id) return fail(res, 'id不能为空')
+    const delPoShopId = parseInt(req.admin?.shop_id) || 1
     // 已审核的单据删除时，同步撤销关联付款单并还余额（同反审核逻辑）
-    const poR = await pool.query('SELECT * FROM purchase_order WHERE id=$1', [id])
+    const poR = await pool.query('SELECT * FROM purchase_order WHERE id=$1 AND shop_id=$2', [id, delPoShopId])
     const po = poR.rows[0]
     if (po && Number(po.status) === 1) {
       const orderNo = po.order_no || ''
@@ -920,7 +1019,7 @@ router.post('/stock/PurchaseOrder/del', async (req, res) => {
         }
       }
     }
-    await pool.query('UPDATE purchase_order SET deleted_at=NOW() WHERE id=$1', [id])
+    await pool.query('UPDATE purchase_order SET deleted_at=NOW() WHERE id=$1 AND shop_id=$2', [id, delPoShopId])
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
@@ -932,7 +1031,8 @@ router.post('/stock/PurchaseOrder/audit', async (req, res) => {
     const isAudit = newStatus === 1
 
     // 查采购单
-    const poR = await pool.query('SELECT * FROM purchase_order WHERE id=$1', [id])
+    const auditShopId2 = parseInt(req.admin?.shop_id) || 1
+    const poR = await pool.query('SELECT * FROM purchase_order WHERE id=$1 AND shop_id=$2', [id, auditShopId2])
     const po = poR.rows[0]
     if (!po) return fail(res, '采购单不存在')
 
@@ -958,9 +1058,9 @@ router.post('/stock/PurchaseOrder/audit', async (req, res) => {
           await pool.query('UPDATE finance_funds SET balance=balance-$1 WHERE id=$2', [payAmount, fundId])
           const receiptNo = genOrderNo('FK')
           await pool.query(
-            `INSERT INTO pay_receipt (receipt_no, order_sn, contact_type, contact_name, amount, pay_date, fund_id, fund_name, remark, status, category)
-             VALUES ($1,$2,'supplier',$3,$4,$5,$6,$7,$8,1,'purchase')`,
-            [receiptNo, orderNo, supplierName, payAmount, orderDate, fundId, fundName, `采购单${orderNo}审核自动生成`]
+            `INSERT INTO pay_receipt (receipt_no, order_sn, contact_type, contact_name, amount, pay_date, fund_id, fund_name, remark, status, category, shop_id)
+             VALUES ($1,$2,'supplier',$3,$4,$5,$6,$7,$8,1,'purchase',$9)`,
+            [receiptNo, orderNo, supplierName, payAmount, orderDate, fundId, fundName, `采购单${orderNo}审核自动生成`, auditShopId2]
           )
         }
       } else {
@@ -986,7 +1086,7 @@ router.post('/stock/PurchaseOrder/audit', async (req, res) => {
       }
     }
 
-    await pool.query('UPDATE purchase_order SET status=$1 WHERE id=$2', [newStatus, id])
+    await pool.query('UPDATE purchase_order SET status=$1 WHERE id=$2 AND shop_id=$3', [newStatus, id, auditShopId2])
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
@@ -995,9 +1095,10 @@ router.post('/stock/PurchaseOrder/batchDel', async (req, res) => {
     const { ids } = req.body
     if (!ids || !ids.length) return fail(res, 'ids不能为空')
     const idArr = Array.isArray(ids) ? ids : ids.split(',').map(Number)
+    const batchPoShopId = parseInt(req.admin?.shop_id) || 1
     // 对每条已审核的采购单，撤销关联付款单并还余额
     for (const id of idArr) {
-      const poR = await pool.query('SELECT * FROM purchase_order WHERE id=$1', [id])
+      const poR = await pool.query('SELECT * FROM purchase_order WHERE id=$1 AND shop_id=$2', [id, batchPoShopId])
       const po = poR.rows[0]
       if (po && Number(po.status) === 1) {
         const orderNo = po.order_no || ''
@@ -1021,7 +1122,7 @@ router.post('/stock/PurchaseOrder/batchDel', async (req, res) => {
         }
       }
     }
-    await pool.query(`UPDATE purchase_order SET deleted_at=NOW() WHERE id=ANY($1)`, [idArr])
+    await pool.query(`UPDATE purchase_order SET deleted_at=NOW() WHERE id=ANY($1) AND shop_id=$2`, [idArr, batchPoShopId])
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
@@ -1033,12 +1134,12 @@ router.get('/stock/SaleOutOrder/index', async (req, res) => {
     const conditions = ['deleted_at IS NULL']
     if (req.query.status !== undefined && req.query.status !== '') conditions.push(`status=${parseInt(req.query.status)}`)
     if (req.query.customer_name) conditions.push(`customer_name ILIKE '%${req.query.customer_name.replace(/'/g,"''")}%'`)
-    await listQuery(res, 'sale_out_order', { keyword: req.query.keyword, keywordCols: ['order_no'], baseWhere: conditions.join(' AND '), orderBy: 'id DESC', page, list_rows, offset })
+    await listQuery(res, 'sale_out_order', { keyword: req.query.keyword, keywordCols: ['order_no'], baseWhere: shopBase(req, conditions.join(' AND ')), orderBy: 'id DESC', page, list_rows, offset })
   } catch (e) { fail(res, e.message) }
 })
 router.post('/stock/SaleOutOrder/add', async (req, res) => {
   try {
-    const b = filterBodyCols('sale_out_order', { order_no: genOrderNo('XC'), order_sn: genOrderNo('XC'), ...req.body })
+    const b = filterBodyCols('sale_out_order', { order_no: genOrderNo('XC'), order_sn: genOrderNo('XC'), ...req.body, shop_id: parseInt(req.admin?.shop_id) || 1 })
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
     const vals = cols.map(k => typeof b[k] === 'object' ? JSON.stringify(b[k]) : b[k])
     const r = await pool.query(`INSERT INTO sale_out_order (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
@@ -1053,7 +1154,8 @@ router.post('/stock/SaleOutOrder/edit', async (req, res) => {
     if (!cols.length) return fail(res, '无有效字段')
     const sets = cols.map((k,i) => `${k}=$${i+1}`)
     const vals = cols.map(k => typeof rest[k] === 'object' ? JSON.stringify(rest[k]) : rest[k])
-    const r = await pool.query(`UPDATE sale_out_order SET ${sets.join(',')} WHERE id=$${vals.length+1} RETURNING *`, [...vals, id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    const r = await pool.query(`UPDATE sale_out_order SET ${sets.join(',')} WHERE id=$${vals.length+1} AND shop_id=$${vals.length+2} RETURNING *`, [...vals, id, shopId])
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })
@@ -1061,7 +1163,8 @@ router.post('/stock/SaleOutOrder/del', async (req, res) => {
   try {
     const { id } = req.body
     if (!id) return fail(res, 'id不能为空')
-    await pool.query('UPDATE sale_out_order SET deleted_at=NOW() WHERE id=$1', [id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    await pool.query('UPDATE sale_out_order SET deleted_at=NOW() WHERE id=$1 AND shop_id=$2', [id, shopId])
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
@@ -1071,7 +1174,8 @@ router.post('/stock/SaleOutOrder/audit', async (req, res) => {
     if (!id) return fail(res, 'id不能为空')
     const newStatus = status ?? 1
 
-    const r = await pool.query('SELECT * FROM sale_out_order WHERE id=$1', [id])
+    const auditSooShopId = parseInt(req.admin?.shop_id) || 1
+    const r = await pool.query('SELECT * FROM sale_out_order WHERE id=$1 AND shop_id=$2', [id, auditSooShopId])
     const order = r.rows[0]
     if (!order) return fail(res, '出库单不存在')
     if (order.status === newStatus) return ok(res)
@@ -1106,7 +1210,7 @@ router.post('/stock/SaleOutOrder/audit', async (req, res) => {
       }
     }
 
-    await pool.query('UPDATE sale_out_order SET status=$1 WHERE id=$2', [newStatus, id])
+    await pool.query('UPDATE sale_out_order SET status=$1 WHERE id=$2 AND shop_id=$3', [newStatus, id, auditSooShopId])
     return ok(res)
   } catch (e) { console.error('[SaleOutOrder audit error]', e.message); fail(res, e.message) }
 })
@@ -1115,12 +1219,12 @@ router.post('/stock/SaleOutOrder/audit', async (req, res) => {
 router.get('/stock/SaleReturnOrder/index', async (req, res) => {
   try {
     const { page, list_rows, offset } = pageParams(req.query)
-    await listQuery(res, 'sale_return_order', { keyword: req.query.keyword, keywordCols: ['order_no','customer_name'], baseWhere: '1=1', orderBy: 'id DESC', page, list_rows, offset })
+    await listQuery(res, 'sale_return_order', { keyword: req.query.keyword, keywordCols: ['order_no','customer_name'], baseWhere: shopBase(req), orderBy: 'id DESC', page, list_rows, offset })
   } catch (e) { fail(res, e.message) }
 })
 router.post('/stock/SaleReturnOrder/add', async (req, res) => {
   try {
-    const b = filterBodyCols('sale_return_order', { order_no: genOrderNo('TH'), ...req.body })
+    const b = filterBodyCols('sale_return_order', { order_no: genOrderNo('TH'), ...req.body, shop_id: parseInt(req.admin?.shop_id) || 1 })
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
     const vals = cols.map(k => typeof b[k] === 'object' ? JSON.stringify(b[k]) : b[k])
     const r = await pool.query(`INSERT INTO sale_return_order (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
@@ -1136,7 +1240,8 @@ router.post('/stock/SaleReturnOrder/edit', async (req, res) => {
     if (!cols.length) return fail(res, '无有效字段')
     const sets = cols.map((k, i) => `${k}=$${i + 1}`)
     const vals = cols.map(k => typeof rest[k] === 'object' ? JSON.stringify(rest[k]) : rest[k])
-    const r = await pool.query(`UPDATE sale_return_order SET ${sets.join(',')} WHERE id=$${vals.length + 1} RETURNING *`, [...vals, id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    const r = await pool.query(`UPDATE sale_return_order SET ${sets.join(',')} WHERE id=$${vals.length + 1} AND shop_id=$${vals.length + 2} RETURNING *`, [...vals, id, shopId])
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })
@@ -1144,7 +1249,8 @@ router.post('/stock/SaleReturnOrder/del', async (req, res) => {
   try {
     const { id } = req.body
     if (!id) return fail(res, 'id不能为空')
-    await pool.query('DELETE FROM sale_return_order WHERE id=$1', [id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    await pool.query('DELETE FROM sale_return_order WHERE id=$1 AND shop_id=$2', [id, shopId])
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
@@ -1154,7 +1260,8 @@ router.post('/stock/SaleReturnOrder/audit', async (req, res) => {
     if (!id) return fail(res, 'id不能为空')
     const newStatus = status ?? 1
 
-    const r = await pool.query('SELECT * FROM sale_return_order WHERE id=$1', [id])
+    const sroShopId = parseInt(req.admin?.shop_id) || 1
+    const r = await pool.query('SELECT * FROM sale_return_order WHERE id=$1 AND shop_id=$2', [id, sroShopId])
     const order = r.rows[0]
     if (!order) return fail(res, '退货单不存在')
     if (order.status === newStatus) return ok(res)
@@ -1192,7 +1299,7 @@ router.post('/stock/SaleReturnOrder/audit', async (req, res) => {
       }
     }
 
-    await pool.query('UPDATE sale_return_order SET status=$1 WHERE id=$2', [newStatus, id])
+    await pool.query('UPDATE sale_return_order SET status=$1 WHERE id=$2 AND shop_id=$3', [newStatus, id, sroShopId])
     return ok(res)
   } catch (e) { console.error('[SaleReturnOrder audit error]', e.message); fail(res, e.message) }
 })
@@ -1205,7 +1312,7 @@ const SAMPLE_ALLOWED_COLS = new Set([
   'paid_amount','company_cost','receipt_fund_id','receipt_fund_name',
   'expense_payment_status','expense_fund_id','expense_fund_name',
   'other_out_id','receivable_id','receipt_id','expense_id',
-  'remark','status',
+  'remark','status','shop_id',
 ])
 
 function parseGoodsInfo(value) {
@@ -1342,7 +1449,8 @@ router.get('/shop/SampleOrder/index', async (req, res) => {
   try {
     await ensureSaleSamplesTable()
     const { page, list_rows, offset } = pageParams(req.query)
-    const conditions = ['deleted_at IS NULL']
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    const conditions = ['deleted_at IS NULL', `shop_id=${shopId}`]
     const params = []
     if (req.query.status !== undefined && req.query.status !== '') {
       params.push(Number(req.query.status))
@@ -1382,6 +1490,7 @@ router.post('/shop/SampleOrder/add', async (req, res) => {
       goods_info: JSON.stringify(goodsInfo),
       receivable_amount: normalizedBody.receivable_amount ?? amounts.receivableAmount,
       company_cost: normalizedBody.company_cost ?? amounts.companyCost,
+      shop_id: parseInt(req.admin?.shop_id) || 1,
     }
     const cols = Object.keys(body).filter(k => SAMPLE_ALLOWED_COLS.has(k) && body[k] !== undefined)
     const vals = cols.map(k => body[k])
@@ -1395,7 +1504,8 @@ router.post('/shop/SampleOrder/edit', async (req, res) => {
     await ensureSaleSamplesTable()
     const { id, ...rest } = normalizeSampleBody(req.body)
     if (!id) return fail(res, 'id不能为空')
-    const old = await pool.query('SELECT status FROM sale_samples WHERE id=$1 AND deleted_at IS NULL', [id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    const old = await pool.query('SELECT status FROM sale_samples WHERE id=$1 AND deleted_at IS NULL AND shop_id=$2', [id, shopId])
     if (!old.rows.length) return fail(res, '样品单不存在')
     if (Number(old.rows[0].status) === 1) return fail(res, '已审核样品单不能编辑，请先反审核')
     const goodsInfo = rest.goods_info !== undefined ? parseGoodsInfo(rest.goods_info) : undefined
@@ -1410,7 +1520,7 @@ router.post('/shop/SampleOrder/edit', async (req, res) => {
     if (!cols.length) return fail(res, '无有效字段')
     const vals = cols.map(k => body[k])
     const sets = cols.map((k, i) => `${k}=$${i + 1}`).join(',')
-    const r = await pool.query(`UPDATE sale_samples SET ${sets}, updated_at=NOW() WHERE id=$${vals.length + 1} RETURNING *`, [...vals, id])
+    const r = await pool.query(`UPDATE sale_samples SET ${sets}, updated_at=NOW() WHERE id=$${vals.length + 1} AND shop_id=$${vals.length + 2} RETURNING *`, [...vals, id, shopId])
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })
@@ -1420,9 +1530,10 @@ router.post('/shop/SampleOrder/del', async (req, res) => {
     await ensureSaleSamplesTable()
     const { id } = req.body
     if (!id) return fail(res, 'id不能为空')
-    const r = await pool.query('SELECT status FROM sale_samples WHERE id=$1 AND deleted_at IS NULL', [id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    const r = await pool.query('SELECT status FROM sale_samples WHERE id=$1 AND deleted_at IS NULL AND shop_id=$2', [id, shopId])
     if (Number(r.rows[0]?.status) === 1) return fail(res, '请先反审核再删除')
-    await pool.query('UPDATE sale_samples SET deleted_at=NOW() WHERE id=$1', [id])
+    await pool.query('UPDATE sale_samples SET deleted_at=NOW() WHERE id=$1 AND shop_id=$2', [id, shopId])
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
@@ -1435,7 +1546,8 @@ router.post('/shop/SampleOrder/audit', async (req, res) => {
     if (!id) return fail(res, 'id不能为空')
     const newStatus = status ?? 1
     await client.query('BEGIN')
-    const r = await client.query('SELECT * FROM sale_samples WHERE id=$1 AND deleted_at IS NULL FOR UPDATE', [id])
+    const auditShopId = parseInt(req.admin?.shop_id) || 1
+    const r = await client.query('SELECT * FROM sale_samples WHERE id=$1 AND deleted_at IS NULL AND shop_id=$2 FOR UPDATE', [id, auditShopId])
     const sample = r.rows[0]
     if (!sample) throw new Error('样品单不存在')
     if (Number(sample.status) === Number(newStatus)) {
@@ -1446,9 +1558,9 @@ router.post('/shop/SampleOrder/audit', async (req, res) => {
       const goodsInfo = parseGoodsInfo(sample.goods_info)
       const amounts = calcSampleAmounts(sample, goodsInfo)
       const otherOut = await client.query(
-        `INSERT INTO stock_other_out (order_no, warehouse_id, warehouse_name, goods_info, remark, status)
-         VALUES ($1,$2,$3,$4,$5,1) RETURNING *`,
-        [sample.sample_no, sample.warehouse_id || 0, sample.warehouse_name || '', JSON.stringify(goodsInfo), `样品出库：${sample.customer_name || sample.contact_name || ''}`,],
+        `INSERT INTO stock_other_out (order_no, warehouse_id, warehouse_name, goods_info, remark, status, shop_id)
+         VALUES ($1,$2,$3,$4,$5,1,$6) RETURNING *`,
+        [sample.sample_no, sample.warehouse_id || 0, sample.warehouse_name || '', JSON.stringify(goodsInfo), `样品出库：${sample.customer_name || sample.contact_name || ''}`, auditShopId],
       )
       await applySampleStock(client, sample, goodsInfo, 'audit')
 
@@ -1462,16 +1574,16 @@ router.post('/shop/SampleOrder/audit', async (req, res) => {
       }
       if (receivableAmount > 0) {
         const rec = await client.query(
-          `INSERT INTO finance_receivable (customer_id, customer_name, order_sn, total_amount, paid_amount, un_pay_amount, due_date, status)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
-          [sample.customer_id || 0, sample.customer_name || '', sample.sample_no || '', receivableAmount, paidAmount, unpaidAmount, sample.sample_date || null, unpaidAmount > 0 ? 0 : 1],
+          `INSERT INTO finance_receivable (customer_id, customer_name, order_sn, total_amount, paid_amount, un_pay_amount, due_date, status, shop_id)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+          [sample.customer_id || 0, sample.customer_name || '', sample.sample_no || '', receivableAmount, paidAmount, unpaidAmount, sample.sample_date || null, unpaidAmount > 0 ? 0 : 1, auditShopId],
         )
         receivableId = rec.rows[0].id
       }
       if (paidAmount > 0) {
         const receipt = await client.query(
-          `INSERT INTO collect_receipt (receipt_no, order_sn, customer_id, customer_name, amount, receipt_date, pay_type, fund_id, fund_name, remark, status)
-           VALUES ($1,$2,$3,$4,$5,$6,'customer',$7,$8,$9,1) RETURNING *`,
+          `INSERT INTO collect_receipt (receipt_no, order_sn, customer_id, customer_name, amount, receipt_date, pay_type, fund_id, fund_name, remark, status, shop_id)
+           VALUES ($1,$2,$3,$4,$5,$6,'customer',$7,$8,$9,1,$10) RETURNING *`,
           [
             genOrderNo('SK'),
             sample.sample_no || '',
@@ -1482,6 +1594,7 @@ router.post('/shop/SampleOrder/audit', async (req, res) => {
             Number(sample.receipt_fund_id || 0),
             sample.receipt_fund_name || '',
             '样品单收款自动生成',
+            auditShopId,
           ],
         )
         receiptId = receipt.rows[0].id
@@ -1500,8 +1613,8 @@ router.post('/shop/SampleOrder/audit', async (req, res) => {
         }
         const expenseRemark = `${expensePaid ? '【已付款】' : '【待付款】'} 样品单 ${sample.sample_no} 自动生成`
         const exp = await client.query(
-          `INSERT INTO finance_expenses (expense_no, name, amount, expense_date, fund_id, fund_name, remark, status)
-           VALUES ($1,'样品费用',$2,$3,$4,$5,$6,1) RETURNING *`,
+          `INSERT INTO finance_expenses (expense_no, name, amount, expense_date, fund_id, fund_name, remark, status, shop_id)
+           VALUES ($1,'样品费用',$2,$3,$4,$5,$6,1,$7) RETURNING *`,
           [
             genOrderNo('FY'),
             companyCost,
@@ -1509,6 +1622,7 @@ router.post('/shop/SampleOrder/audit', async (req, res) => {
             expensePaid ? Number(sample.expense_fund_id || 0) : 0,
             expensePaid ? (sample.expense_fund_name || '') : '',
             expenseRemark,
+            auditShopId,
           ],
         )
         expenseId = exp.rows[0].id
@@ -1576,7 +1690,8 @@ router.get('/stock/StockAll/index', async (req, res) => {
   try {
     const { page, list_rows, offset } = pageParams(req.query)
     const keyword = req.query.keyword
-    let where = 'WHERE 1=1'
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    let where = `WHERE shop_id=${shopId}`
     const params = []
     if (keyword) {
       params.push(`%${keyword}%`)
@@ -1592,7 +1707,7 @@ router.get('/stock/StockAll/index', async (req, res) => {
 router.get('/stock/InOutFlow/index', async (req, res) => {
   try {
     const { page, list_rows, offset } = pageParams(req.query)
-    await listQuery(res, 'stock_flow', { keyword: req.query.keyword, keywordCols: ['goods_name','order_no'], baseWhere: '1=1', orderBy: 'id DESC', page, list_rows, offset })
+    await listQuery(res, 'stock_flow', { keyword: req.query.keyword, keywordCols: ['goods_name','order_no'], baseWhere: shopBase(req), orderBy: 'id DESC', page, list_rows, offset })
   } catch (e) { fail(res, e.message) }
 })
 
@@ -1618,14 +1733,15 @@ router.get('/stock/StockWarning/index', async (req, res) => {
 router.get('/stock/WarehouseName/index', async (req, res) => {
   try {
     const { page, list_rows, offset } = pageParams(req.query)
-    await listQuery(res, 'warehouses', { keyword: req.query.keyword, keywordCols: ['name'], baseWhere: '1=1', orderBy: 'id ASC', page, list_rows, offset })
+    await listQuery(res, 'warehouses', { keyword: req.query.keyword, keywordCols: ['name'], baseWhere: shopBase(req), orderBy: 'id ASC', page, list_rows, offset })
   } catch (e) { fail(res, e.message) }
 })
 router.post('/stock/WarehouseName/add', async (req, res) => {
   try {
     const { name, address = '', remark = '', status = 1 } = req.body
     if (!name) return fail(res, '仓库名称不能为空')
-    const r = await pool.query('INSERT INTO warehouses (name,address,remark,status) VALUES ($1,$2,$3,$4) RETURNING *', [name, address, remark, status])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    const r = await pool.query('INSERT INTO warehouses (name,address,remark,status,shop_id) VALUES ($1,$2,$3,$4,$5) RETURNING *', [name, address, remark, status, shopId])
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })
@@ -1633,7 +1749,8 @@ router.post('/stock/WarehouseName/edit', async (req, res) => {
   try {
     const { id, name, address, remark, status } = req.body
     if (!id) return fail(res, 'id不能为空')
-    const r = await pool.query('UPDATE warehouses SET name=COALESCE($1,name), address=COALESCE($2,address), remark=COALESCE($3,remark), status=COALESCE($4,status) WHERE id=$5 RETURNING *', [name, address, remark, status, id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    const r = await pool.query('UPDATE warehouses SET name=COALESCE($1,name), address=COALESCE($2,address), remark=COALESCE($3,remark), status=COALESCE($4,status) WHERE id=$5 AND shop_id=$6 RETURNING *', [name, address, remark, status, id, shopId])
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })
@@ -1641,7 +1758,8 @@ router.post('/stock/WarehouseName/del', async (req, res) => {
   try {
     const { id } = req.body
     if (!id) return fail(res, 'id不能为空')
-    await pool.query('DELETE FROM warehouses WHERE id=$1', [id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    await pool.query('DELETE FROM warehouses WHERE id=$1 AND shop_id=$2', [id, shopId])
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
@@ -1650,12 +1768,12 @@ router.post('/stock/WarehouseName/del', async (req, res) => {
 router.get('/stock/OtherIn/index', async (req, res) => {
   try {
     const { page, list_rows, offset } = pageParams(req.query)
-    await listQuery(res, 'stock_other_in', { keyword: req.query.keyword, keywordCols: ['order_no','warehouse_name'], baseWhere: '1=1', orderBy: 'id DESC', page, list_rows, offset })
+    await listQuery(res, 'stock_other_in', { keyword: req.query.keyword, keywordCols: ['order_no','warehouse_name'], baseWhere: shopBase(req), orderBy: 'id DESC', page, list_rows, offset })
   } catch (e) { fail(res, e.message) }
 })
 router.post('/stock/OtherIn/add', async (req, res) => {
   try {
-    const b = filterBodyCols('stock_other_in', { order_no: genOrderNo('RK'), ...req.body })
+    const b = filterBodyCols('stock_other_in', { order_no: genOrderNo('RK'), ...req.body, shop_id: parseInt(req.admin?.shop_id) || 1 })
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
     const vals = cols.map(k => typeof b[k] === 'object' ? JSON.stringify(b[k]) : b[k])
     const r = await pool.query(`INSERT INTO stock_other_in (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
@@ -1666,7 +1784,8 @@ router.post('/stock/OtherIn/del', async (req, res) => {
   try {
     const { id } = req.body
     if (!id) return fail(res, 'id不能为空')
-    await pool.query('DELETE FROM stock_other_in WHERE id=$1', [id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    await pool.query('DELETE FROM stock_other_in WHERE id=$1 AND shop_id=$2', [id, shopId])
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
@@ -1675,7 +1794,8 @@ router.post('/stock/OtherIn/audit', async (req, res) => {
     const { id, status } = req.body
     if (!id) return fail(res, 'id不能为空')
     const newStatus = status ?? 1
-    const r = await pool.query('SELECT * FROM stock_other_in WHERE id=$1', [id])
+    const oiAuditShopId = parseInt(req.admin?.shop_id) || 1
+    const r = await pool.query('SELECT * FROM stock_other_in WHERE id=$1 AND shop_id=$2', [id, oiAuditShopId])
     const order = r.rows[0]
     if (!order) return fail(res, '入库单不存在')
     if (order.status === newStatus) return ok(res)
@@ -1708,7 +1828,8 @@ router.post('/stock/OtherIn/audit', async (req, res) => {
           [goodsId, item.goods_name || '', warehouseId, warehouseName, 'other_in', num, 0, num, orderNo, '其他入库审核'])
       }
     }
-    await pool.query('UPDATE stock_other_in SET status=$1 WHERE id=$2', [newStatus, id])
+    const oiShopId = parseInt(req.admin?.shop_id) || 1
+    await pool.query('UPDATE stock_other_in SET status=$1 WHERE id=$2 AND shop_id=$3', [newStatus, id, oiShopId])
     return ok(res)
   } catch (e) { console.error('[OtherIn audit error]', e.message); fail(res, e.message) }
 })
@@ -1717,12 +1838,12 @@ router.post('/stock/OtherIn/audit', async (req, res) => {
 router.get('/stock/OtherOut/index', async (req, res) => {
   try {
     const { page, list_rows, offset } = pageParams(req.query)
-    await listQuery(res, 'stock_other_out', { keyword: req.query.keyword, keywordCols: ['order_no','warehouse_name'], baseWhere: '1=1', orderBy: 'id DESC', page, list_rows, offset })
+    await listQuery(res, 'stock_other_out', { keyword: req.query.keyword, keywordCols: ['order_no','warehouse_name'], baseWhere: shopBase(req), orderBy: 'id DESC', page, list_rows, offset })
   } catch (e) { fail(res, e.message) }
 })
 router.post('/stock/OtherOut/add', async (req, res) => {
   try {
-    const b = filterBodyCols('stock_other_out', { order_no: genOrderNo('CK'), ...req.body })
+    const b = filterBodyCols('stock_other_out', { order_no: genOrderNo('CK'), ...req.body, shop_id: parseInt(req.admin?.shop_id) || 1 })
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
     const vals = cols.map(k => typeof b[k] === 'object' ? JSON.stringify(b[k]) : b[k])
     const r = await pool.query(`INSERT INTO stock_other_out (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
@@ -1734,7 +1855,8 @@ router.post('/stock/OtherOut/annul', async (req, res) => {
   try {
     const { id } = req.body
     if (!id) return fail(res, 'id不能为空')
-    const r = await pool.query('SELECT * FROM stock_other_out WHERE id=$1', [id])
+    const annulShopId = parseInt(req.admin?.shop_id) || 1
+    const r = await pool.query('SELECT * FROM stock_other_out WHERE id=$1 AND shop_id=$2', [id, annulShopId])
     const order = r.rows[0]
     if (!order) return ok(res) // 已不存在，幂等
     let goodsInfo = []
@@ -1756,7 +1878,7 @@ router.post('/stock/OtherOut/annul', async (req, res) => {
     // 删除所有关联流水（order_no 匹配）
     if (orderNo) await pool.query('DELETE FROM stock_flow WHERE order_no=$1', [orderNo])
     // 删除单据
-    await pool.query('DELETE FROM stock_other_out WHERE id=$1', [id])
+    await pool.query('DELETE FROM stock_other_out WHERE id=$1 AND shop_id=$2', [id, annulShopId])
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
@@ -1764,7 +1886,8 @@ router.post('/stock/OtherOut/del', async (req, res) => {
   try {
     const { id } = req.body
     if (!id) return fail(res, 'id不能为空')
-    await pool.query('DELETE FROM stock_other_out WHERE id=$1', [id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    await pool.query('DELETE FROM stock_other_out WHERE id=$1 AND shop_id=$2', [id, shopId])
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
@@ -1773,7 +1896,8 @@ router.post('/stock/OtherOut/audit', async (req, res) => {
     const { id, status } = req.body
     if (!id) return fail(res, 'id不能为空')
     const newStatus = status ?? 1
-    const r = await pool.query('SELECT * FROM stock_other_out WHERE id=$1', [id])
+    const ooAuditShopId = parseInt(req.admin?.shop_id) || 1
+    const r = await pool.query('SELECT * FROM stock_other_out WHERE id=$1 AND shop_id=$2', [id, ooAuditShopId])
     const order = r.rows[0]
     if (!order) return fail(res, '出库单不存在')
     if (order.status === newStatus) return ok(res)
@@ -1801,7 +1925,8 @@ router.post('/stock/OtherOut/audit', async (req, res) => {
           [goodsId, item.goods_name || '', warehouseId, warehouseName, isAudit ? 'other_out' : 'other_out_reverse', change, beforeQty, afterQty, orderNo, isAudit ? '其他出库审核' : '其他出库反审核'])
       }
     }
-    await pool.query('UPDATE stock_other_out SET status=$1 WHERE id=$2', [newStatus, id])
+    const ooShopId = parseInt(req.admin?.shop_id) || 1
+    await pool.query('UPDATE stock_other_out SET status=$1 WHERE id=$2 AND shop_id=$3', [newStatus, id, ooShopId])
     return ok(res)
   } catch (e) { console.error('[OtherOut audit error]', e.message); fail(res, e.message) }
 })
@@ -1810,12 +1935,12 @@ router.post('/stock/OtherOut/audit', async (req, res) => {
 router.get('/stock/Allocation/index', async (req, res) => {
   try {
     const { page, list_rows, offset } = pageParams(req.query)
-    await listQuery(res, 'stock_allocation', { keyword: req.query.keyword, keywordCols: ['transfer_no','from_warehouse','to_warehouse'], baseWhere: '1=1', orderBy: 'id DESC', page, list_rows, offset })
+    await listQuery(res, 'stock_allocation', { keyword: req.query.keyword, keywordCols: ['transfer_no','from_warehouse','to_warehouse'], baseWhere: shopBase(req), orderBy: 'id DESC', page, list_rows, offset })
   } catch (e) { fail(res, e.message) }
 })
 router.post('/stock/Allocation/add', async (req, res) => {
   try {
-    const b = filterBodyCols('stock_allocation', { transfer_no: genOrderNo('DB'), status: 0, ...req.body })
+    const b = filterBodyCols('stock_allocation', { transfer_no: genOrderNo('DB'), status: 0, ...req.body, shop_id: parseInt(req.admin?.shop_id) || 1 })
     if (b.goods_info && typeof b.goods_info !== 'string') b.goods_info = JSON.stringify(b.goods_info)
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
     const vals = cols.map(k => b[k])
@@ -1827,11 +1952,12 @@ router.post('/stock/Allocation/edit', async (req, res) => {
   try {
     const { id, ...rest } = req.body
     if (!id) return fail(res, 'id不能为空')
+    const shopId = parseInt(req.admin?.shop_id) || 1
     const b = filterBodyCols('stock_allocation', rest)
     if (b.goods_info && typeof b.goods_info !== 'string') b.goods_info = JSON.stringify(b.goods_info)
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
     const vals = cols.map(k => b[k])
-    await pool.query(`UPDATE stock_allocation SET ${cols.map((c,i)=>`${c}=$${i+1}`)} WHERE id=$${cols.length+1}`, [...vals, id])
+    await pool.query(`UPDATE stock_allocation SET ${cols.map((c,i)=>`${c}=$${i+1}`)} WHERE id=$${cols.length+1} AND shop_id=$${cols.length+2}`, [...vals, id, shopId])
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
@@ -1841,7 +1967,8 @@ router.post('/stock/Allocation/audit', async (req, res) => {
     if (!id) return fail(res, 'id不能为空')
     const newStatus = status ?? 1
 
-    const r = await pool.query('SELECT * FROM stock_allocation WHERE id=$1', [id])
+    const allocAuditShopId = parseInt(req.admin?.shop_id) || 1
+    const r = await pool.query('SELECT * FROM stock_allocation WHERE id=$1 AND shop_id=$2', [id, allocAuditShopId])
     const order = r.rows[0]
     if (!order) return fail(res, '调拨单不存在')
     if (order.status === newStatus) return ok(res)
@@ -1894,7 +2021,8 @@ router.post('/stock/Allocation/audit', async (req, res) => {
       }
     }
 
-    await pool.query('UPDATE stock_allocation SET status=$1 WHERE id=$2', [newStatus, id])
+    const allocShopId = parseInt(req.admin?.shop_id) || 1
+    await pool.query('UPDATE stock_allocation SET status=$1 WHERE id=$2 AND shop_id=$3', [newStatus, id, allocShopId])
     return ok(res)
   } catch (e) { console.error('[Allocation audit error]', e.message); fail(res, e.message) }
 })
@@ -1902,7 +2030,8 @@ router.post('/stock/Allocation/del', async (req, res) => {
   try {
     const { id } = req.body
     if (!id) return fail(res, 'id不能为空')
-    await pool.query('DELETE FROM stock_allocation WHERE id=$1', [id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    await pool.query('DELETE FROM stock_allocation WHERE id=$1 AND shop_id=$2', [id, shopId])
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
@@ -1910,7 +2039,8 @@ router.post('/stock/Allocation/batchDel', async (req, res) => {
   try {
     const { ids } = req.body
     if (!ids || !ids.length) return fail(res, 'ids不能为空')
-    await pool.query(`DELETE FROM stock_allocation WHERE id=ANY($1)`, [ids])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    await pool.query(`DELETE FROM stock_allocation WHERE id=ANY($1) AND shop_id=$2`, [ids, shopId])
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
@@ -1919,12 +2049,12 @@ router.post('/stock/Allocation/batchDel', async (req, res) => {
 router.get('/stock/StockCheck/index', async (req, res) => {
   try {
     const { page, list_rows, offset } = pageParams(req.query)
-    await listQuery(res, 'stock_checks', { keyword: req.query.keyword, keywordCols: ['order_no','warehouse_name'], baseWhere: '1=1', orderBy: 'id DESC', page, list_rows, offset })
+    await listQuery(res, 'stock_checks', { keyword: req.query.keyword, keywordCols: ['order_no','warehouse_name'], baseWhere: shopBase(req), orderBy: 'id DESC', page, list_rows, offset })
   } catch (e) { fail(res, e.message) }
 })
 router.post('/stock/StockCheck/add', async (req, res) => {
   try {
-    const b = filterBodyCols('stock_checks', { order_no: genOrderNo('PD'), ...req.body })
+    const b = filterBodyCols('stock_checks', { order_no: genOrderNo('PD'), ...req.body, shop_id: parseInt(req.admin?.shop_id) || 1 })
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
     const vals = cols.map(k => typeof b[k] === 'object' ? JSON.stringify(b[k]) : b[k])
     const r = await pool.query(`INSERT INTO stock_checks (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
@@ -1935,7 +2065,8 @@ router.post('/stock/StockCheck/del', async (req, res) => {
   try {
     const { id } = req.body
     if (!id) return fail(res, 'id不能为空')
-    await pool.query('DELETE FROM stock_checks WHERE id=$1', [id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    await pool.query('DELETE FROM stock_checks WHERE id=$1 AND shop_id=$2', [id, shopId])
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
@@ -1948,12 +2079,12 @@ router.post('/stock/StockCheck/del', async (req, res) => {
 router.get('/procure/supplier/index', async (req, res) => {
   try {
     const { page, list_rows, offset } = pageParams(req.query)
-    await listQuery(res, 'supplier', { keyword: req.query.keyword, keywordCols: ['name','mobile'], baseWhere: 'deleted_at IS NULL', orderBy: 'id DESC', page, list_rows, offset })
+    await listQuery(res, 'supplier', { keyword: req.query.keyword, keywordCols: ['name','mobile'], baseWhere: shopBase(req, 'deleted_at IS NULL'), orderBy: 'id DESC', page, list_rows, offset })
   } catch (e) { fail(res, e.message) }
 })
 router.post('/procure/supplier/add', async (req, res) => {
   try {
-    const b = filterBodyCols('supplier', req.body)
+    const b = filterBodyCols('supplier', { ...req.body, shop_id: parseInt(req.admin?.shop_id) || 1 })
     const cols = Object.keys(b).filter(k => b[k] !== undefined && b[k] !== null)
     if (!b.name) return fail(res, '供应商名称不能为空')
     const vals = cols.map(k => b[k])
@@ -1965,11 +2096,12 @@ router.post('/procure/supplier/edit', async (req, res) => {
   try {
     const { id, ...rest } = req.body
     if (!id) return fail(res, 'id不能为空')
+    const shopId = parseInt(req.admin?.shop_id) || 1
     const cols = Object.keys(rest).filter(k => rest[k] !== undefined)
     if (!cols.length) return fail(res, '无有效字段')
     const sets = cols.map((k,i) => `${k}=$${i+1}`)
     const vals = cols.map(k => rest[k])
-    const r = await pool.query(`UPDATE supplier SET ${sets.join(',')}, update_time=NOW() WHERE id=$${vals.length+1} RETURNING *`, [...vals, id])
+    const r = await pool.query(`UPDATE supplier SET ${sets.join(',')}, update_time=NOW() WHERE id=$${vals.length+1} AND shop_id=$${vals.length+2} RETURNING *`, [...vals, id, shopId])
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })
@@ -1977,7 +2109,8 @@ router.post('/procure/supplier/del', async (req, res) => {
   try {
     const { id } = req.body
     if (!id) return fail(res, 'id不能为空')
-    await pool.query('UPDATE supplier SET deleted_at=NOW() WHERE id=$1', [id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    await pool.query('UPDATE supplier SET deleted_at=NOW() WHERE id=$1 AND shop_id=$2', [id, shopId])
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
@@ -1986,12 +2119,12 @@ router.post('/procure/supplier/del', async (req, res) => {
 router.get('/procure/ProcurePlan/index', async (req, res) => {
   try {
     const { page, list_rows, offset } = pageParams(req.query)
-    await listQuery(res, 'procure_plan', { keyword: req.query.keyword, keywordCols: ['order_no','admin_name'], baseWhere: 'deleted_at IS NULL', orderBy: 'id DESC', page, list_rows, offset })
+    await listQuery(res, 'procure_plan', { keyword: req.query.keyword, keywordCols: ['order_no','admin_name'], baseWhere: shopBase(req, 'deleted_at IS NULL'), orderBy: 'id DESC', page, list_rows, offset })
   } catch (e) { fail(res, e.message) }
 })
 router.post('/procure/ProcurePlan/add', async (req, res) => {
   try {
-    const b = filterBodyCols('procure_plan', { order_no: genOrderNo('JH'), ...req.body })
+    const b = filterBodyCols('procure_plan', { order_no: genOrderNo('JH'), ...req.body, shop_id: parseInt(req.admin?.shop_id) || 1 })
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
     const vals = cols.map(k => typeof b[k] === 'object' ? JSON.stringify(b[k]) : b[k])
     const r = await pool.query(`INSERT INTO procure_plan (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
@@ -2002,7 +2135,8 @@ router.post('/procure/ProcurePlan/del', async (req, res) => {
   try {
     const { id } = req.body
     if (!id) return fail(res, 'id不能为空')
-    await pool.query('UPDATE procure_plan SET deleted_at=NOW() WHERE id=$1', [id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    await pool.query('UPDATE procure_plan SET deleted_at=NOW() WHERE id=$1 AND shop_id=$2', [id, shopId])
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
@@ -2010,7 +2144,8 @@ router.post('/procure/ProcurePlan/audit', async (req, res) => {
   try {
     const { id, status } = req.body
     if (!id) return fail(res, 'id不能为空')
-    await pool.query('UPDATE procure_plan SET status=$1 WHERE id=$2', [status ?? 1, id])
+    const ppShopId = parseInt(req.admin?.shop_id) || 1
+    await pool.query('UPDATE procure_plan SET status=$1 WHERE id=$2 AND shop_id=$3', [status ?? 1, id, ppShopId])
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
@@ -2023,7 +2158,7 @@ router.get('/procure/ProcureInhouse/index', async (req, res) => {
     const orderId = req.query.purchase_order_id || req.query.order_id
     const extraWhere = orderId ? ` AND purchase_order_id=$1` : ''
     const extraParams = orderId ? [parseInt(orderId)] : []
-    await listQuery(res, 'procure_inhouse', { keyword: req.query.keyword, keywordCols: ['order_no','supplier_name'], baseWhere: `deleted_at IS NULL${extraWhere}`, extraParams, orderBy: 'id DESC', page, list_rows, offset })
+    await listQuery(res, 'procure_inhouse', { keyword: req.query.keyword, keywordCols: ['order_no','supplier_name'], baseWhere: shopBase(req, `deleted_at IS NULL${extraWhere}`), extraParams, orderBy: 'id DESC', page, list_rows, offset })
   } catch (e) { fail(res, e.message) }
 })
 router.post('/procure/ProcureInhouse/add', async (req, res) => {
@@ -2031,7 +2166,7 @@ router.post('/procure/ProcureInhouse/add', async (req, res) => {
     // 前端传 order_id，表字段是 purchase_order_id，做映射
     const body = { ...req.body }
     if (body.order_id && !body.purchase_order_id) { body.purchase_order_id = body.order_id; delete body.order_id }
-    const b = filterBodyCols('procure_inhouse', { order_no: genOrderNo('CGRK'), ...body })
+    const b = filterBodyCols('procure_inhouse', { order_no: genOrderNo('CGRK'), ...body, shop_id: parseInt(req.admin?.shop_id) || 1 })
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
     const vals = cols.map(k => typeof b[k] === 'object' ? JSON.stringify(b[k]) : b[k])
     const r = await pool.query(`INSERT INTO procure_inhouse (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
@@ -2042,13 +2177,14 @@ router.post('/procure/ProcureInhouse/edit', async (req, res) => {
   try {
     const { id, ...rawRest } = req.body
     if (!id) return fail(res, 'id不能为空')
+    const shopId = parseInt(req.admin?.shop_id) || 1
     const rest = filterBodyCols('procure_inhouse', rawRest)
     const cols = Object.keys(rest).filter((k) => rest[k] !== undefined)
     if (cols.length === 0) return fail(res, '无有效字段')
     const sets = cols.map((k, i) => `${k}=$${i + 1}`)
     const vals = cols.map((k) => typeof rest[k] === 'object' ? JSON.stringify(rest[k]) : rest[k])
-    const sql = `UPDATE procure_inhouse SET ${sets.join(',')} WHERE id=$${vals.length + 1} RETURNING *`
-    const result = await pool.query(sql, [...vals, id])
+    const sql = `UPDATE procure_inhouse SET ${sets.join(',')} WHERE id=$${vals.length + 1} AND shop_id=$${vals.length + 2} RETURNING *`
+    const result = await pool.query(sql, [...vals, id, shopId])
     return ok(res, result.rows[0])
   } catch (e) { fail(res, e.message) }
 })
@@ -2056,7 +2192,8 @@ router.post('/procure/ProcureInhouse/del', async (req, res) => {
   try {
     const { id } = req.body
     if (!id) return fail(res, 'id不能为空')
-    await pool.query('UPDATE procure_inhouse SET deleted_at=NOW() WHERE id=$1', [id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    await pool.query('UPDATE procure_inhouse SET deleted_at=NOW() WHERE id=$1 AND shop_id=$2', [id, shopId])
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
@@ -2067,13 +2204,14 @@ router.post('/procure/ProcureInhouse/audit', async (req, res) => {
     const newStatus = status ?? 1
 
     // 查入库单
-    const inhouseR = await pool.query('SELECT * FROM procure_inhouse WHERE id=$1', [id])
+    const inhouseR = await pool.query('SELECT * FROM procure_inhouse WHERE id=$1 AND shop_id=$2', [id, piShopId])
     const inhouse = inhouseR.rows[0]
     if (!inhouse) return fail(res, '入库单不存在')
 
     const prevStatus = inhouse.status
     // 状态无变化，直接返回
-    if (prevStatus === newStatus) { await pool.query('UPDATE procure_inhouse SET status=$1 WHERE id=$2', [newStatus, id]); return ok(res) }
+    const piShopId = parseInt(req.admin?.shop_id) || 1
+    if (prevStatus === newStatus) { await pool.query('UPDATE procure_inhouse SET status=$1 WHERE id=$2 AND shop_id=$3', [newStatus, id, piShopId]); return ok(res) }
 
     let goodsInfo = []
     try { goodsInfo = typeof inhouse.goods_info === 'string' ? JSON.parse(inhouse.goods_info) : (inhouse.goods_info || []) } catch {}
@@ -2113,7 +2251,7 @@ router.post('/procure/ProcureInhouse/audit', async (req, res) => {
         [goodsId, item.goods_name || '', warehouseId, warehouseName, isAudit ? 'procure_in' : 'procure_in_reverse', change, beforeQty, afterQty2, orderNo, isAudit ? '采购入库审核' : '采购入库反审核'])
     }
 
-    await pool.query('UPDATE procure_inhouse SET status=$1 WHERE id=$2', [newStatus, id])
+    await pool.query('UPDATE procure_inhouse SET status=$1 WHERE id=$2 AND shop_id=$3', [newStatus, id, piShopId])
     return ok(res)
   } catch (e) { console.error('[ProcureInhouse audit error]', e.message); fail(res, e.message) }
 })
@@ -2122,12 +2260,12 @@ router.post('/procure/ProcureInhouse/audit', async (req, res) => {
 router.get('/procure/ProcureReturn/index', async (req, res) => {
   try {
     const { page, list_rows, offset } = pageParams(req.query)
-    await listQuery(res, 'procure_return', { keyword: req.query.keyword, keywordCols: ['order_no','supplier_name'], baseWhere: '1=1', orderBy: 'id DESC', page, list_rows, offset })
+    await listQuery(res, 'procure_return', { keyword: req.query.keyword, keywordCols: ['order_no','supplier_name'], baseWhere: shopBase(req), orderBy: 'id DESC', page, list_rows, offset })
   } catch (e) { fail(res, e.message) }
 })
 router.post('/procure/ProcureReturn/add', async (req, res) => {
   try {
-    const b = filterBodyCols('procure_return', { order_no: genOrderNo('CGTH'), ...req.body })
+    const b = filterBodyCols('procure_return', { order_no: genOrderNo('CGTH'), ...req.body, shop_id: parseInt(req.admin?.shop_id) || 1 })
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
     const vals = cols.map(k => typeof b[k] === 'object' ? JSON.stringify(b[k]) : b[k])
     const r = await pool.query(`INSERT INTO procure_return (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
@@ -2138,8 +2276,9 @@ router.post('/procure/ProcureReturn/del', async (req, res) => {
   try {
     const { id } = req.body
     if (!id) return fail(res, 'id不能为空')
+    const shopId = parseInt(req.admin?.shop_id) || 1
     // 已审核的退货单删除时，撤销库存和资金变动
-    const retR = await pool.query('SELECT * FROM procure_return WHERE id=$1', [id])
+    const retR = await pool.query('SELECT * FROM procure_return WHERE id=$1 AND shop_id=$2', [id, shopId])
     const ret = retR.rows[0]
     if (ret && Number(ret.status) === 1) {
       let goodsInfo = []
@@ -2164,7 +2303,7 @@ router.post('/procure/ProcureReturn/del', async (req, res) => {
         }
       }
     }
-    await pool.query('DELETE FROM procure_return WHERE id=$1', [id])
+    await pool.query('DELETE FROM procure_return WHERE id=$1 AND shop_id=$2', [id, shopId])
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
@@ -2173,7 +2312,7 @@ router.post('/procure/ProcureReturn/audit', async (req, res) => {
     const { id, status } = req.body
     if (!id) return fail(res, 'id不能为空')
 
-    const retR = await pool.query('SELECT * FROM procure_return WHERE id=$1', [id])
+    const retR = await pool.query('SELECT * FROM procure_return WHERE id=$1 AND shop_id=$2', [id, prShopId])
     const ret = retR.rows[0]
     if (!ret) return fail(res, '退货单不存在')
 
@@ -2237,7 +2376,8 @@ router.post('/procure/ProcureReturn/audit', async (req, res) => {
       }
     }
 
-    await pool.query('UPDATE procure_return SET status=$1 WHERE id=$2', [status ?? 1, id])
+    const prShopId = parseInt(req.admin?.shop_id) || 1
+    await pool.query('UPDATE procure_return SET status=$1 WHERE id=$2 AND shop_id=$3', [status ?? 1, id, prShopId])
     return ok(res)
   } catch (e) { console.error('[ProcureReturn audit error]', e.message); fail(res, e.message) }
 })
@@ -2250,7 +2390,7 @@ router.post('/procure/ProcureReturn/audit', async (req, res) => {
 router.get('/finance/CollectAccounts/index', async (req, res) => {
   try {
     const { page, list_rows, offset } = pageParams(req.query)
-    await listQuery(res, 'finance_receivable', { keyword: req.query.keyword, keywordCols: ['customer_name','order_sn'], baseWhere: '1=1', orderBy: 'id DESC', page, list_rows, offset })
+    await listQuery(res, 'finance_receivable', { keyword: req.query.keyword, keywordCols: ['customer_name','order_sn'], baseWhere: shopBase(req), orderBy: 'id DESC', page, list_rows, offset })
   } catch (e) { fail(res, e.message) }
 })
 
@@ -2258,7 +2398,7 @@ router.get('/finance/CollectAccounts/index', async (req, res) => {
 router.get('/finance/PayAccounts/index', async (req, res) => {
   try {
     const { page, list_rows, offset } = pageParams(req.query)
-    await listQuery(res, 'finance_payable', { keyword: req.query.keyword, keywordCols: ['supplier_name','order_sn'], baseWhere: '1=1', orderBy: 'id DESC', page, list_rows, offset })
+    await listQuery(res, 'finance_payable', { keyword: req.query.keyword, keywordCols: ['supplier_name','order_sn'], baseWhere: shopBase(req), orderBy: 'id DESC', page, list_rows, offset })
   } catch (e) { fail(res, e.message) }
 })
 
@@ -2267,23 +2407,25 @@ router.post('/finance/CollectReceipt/edit', async (req, res) => {
   try {
     const { id, ...fields } = req.body
     if (!id) return fail(res, 'id不能为空')
+    const shopId = parseInt(req.admin?.shop_id) || 1
     const cols = Object.keys(fields)
     if (!cols.length) return fail(res, '无更新字段')
     const sets = cols.map((k, i) => `${k}=$${i + 2}`).join(',')
-    const vals = [id, ...cols.map(k => fields[k])]
-    const r = await pool.query(`UPDATE collect_receipt SET ${sets} WHERE id=$1 RETURNING *`, vals)
+    const vals = [id, ...cols.map(k => fields[k]), shopId]
+    const r = await pool.query(`UPDATE collect_receipt SET ${sets} WHERE id=$1 AND shop_id=$${vals.length} RETURNING *`, vals)
     ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })
 router.get('/finance/CollectReceipt/index', async (req, res) => {
   try {
     const { page, list_rows, offset } = pageParams(req.query)
-    await listQuery(res, 'collect_receipt', { keyword: req.query.keyword, keywordCols: ['receipt_no','customer_name'], baseWhere: 'deleted_at IS NULL', orderBy: 'id DESC', page, list_rows, offset })
+    await listQuery(res, 'collect_receipt', { keyword: req.query.keyword, keywordCols: ['receipt_no','customer_name'], baseWhere: shopBase(req, 'deleted_at IS NULL'), orderBy: 'id DESC', page, list_rows, offset })
   } catch (e) { fail(res, e.message) }
 })
 router.post('/finance/CollectReceipt/add', async (req, res) => {
   try {
-    const b = filterBodyCols('collect_receipt', { receipt_no: genOrderNo('SK'), ...req.body })
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    const b = filterBodyCols('collect_receipt', { receipt_no: genOrderNo('SK'), ...req.body, shop_id: shopId })
     // 防重复：同一客户+同一金额+同一销售单已存在则拒绝
     const custName = b.customer_name || b.contact_name || ''
     const receiptDate = b.receipt_date ? String(b.receipt_date).slice(0, 10) : new Date().toISOString().slice(0, 10)
@@ -2291,8 +2433,8 @@ router.post('/finance/CollectReceipt/add', async (req, res) => {
     const orderSn = b.order_sn || ''
     if (custName && amount > 0 && orderSn) {
       const dupCheck = await pool.query(
-        `SELECT id, receipt_no FROM collect_receipt WHERE contact_name=$1 AND amount=$2 AND order_sn=$3 AND deleted_at IS NULL LIMIT 1`,
-        [custName, amount, orderSn]
+        `SELECT id, receipt_no FROM collect_receipt WHERE contact_name=$1 AND amount=$2 AND order_sn=$3 AND deleted_at IS NULL AND shop_id=$4 LIMIT 1`,
+        [custName, amount, orderSn, shopId]
       )
       if (dupCheck.rows.length > 0) {
         return fail(res, `重复收款：该客户"${custName}"的销售单${orderSn}已有一笔相同金额¥${amount}的收款单（单号${dupCheck.rows[0].receipt_no}），请勿重复提交`)
@@ -2312,8 +2454,9 @@ router.post('/finance/CollectReceipt/del', async (req, res) => {
   try {
     const { id } = req.body
     if (!id) return fail(res, 'id不能为空')
-    const r = await pool.query('SELECT fund_id, amount FROM collect_receipt WHERE id=$1', [id])
-    await pool.query('UPDATE collect_receipt SET deleted_at=NOW() WHERE id=$1', [id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    const r = await pool.query('SELECT fund_id, amount FROM collect_receipt WHERE id=$1 AND shop_id=$2', [id, shopId])
+    await pool.query('UPDATE collect_receipt SET deleted_at=NOW() WHERE id=$1 AND shop_id=$2', [id, shopId])
     if (r.rows[0]?.fund_id && Number(r.rows[0]?.amount)) {
       await pool.query('UPDATE finance_funds SET balance=balance-$1, update_time=NOW() WHERE id=$2', [Number(r.rows[0].amount), r.rows[0].fund_id])
     }
@@ -2325,12 +2468,13 @@ router.post('/finance/CollectReceipt/del', async (req, res) => {
 router.get('/finance/PayReceipt/index', async (req, res) => {
   try {
     const { page, list_rows, offset } = pageParams(req.query)
-    await listQuery(res, 'pay_receipt', { keyword: req.query.keyword, keywordCols: ['receipt_no','contact_name'], baseWhere: 'deleted_at IS NULL', orderBy: 'id DESC', page, list_rows, offset })
+    await listQuery(res, 'pay_receipt', { keyword: req.query.keyword, keywordCols: ['receipt_no','contact_name'], baseWhere: shopBase(req, 'deleted_at IS NULL'), orderBy: 'id DESC', page, list_rows, offset })
   } catch (e) { fail(res, e.message) }
 })
 router.post('/finance/PayReceipt/add', async (req, res) => {
   try {
-    const b = filterBodyCols('pay_receipt', { receipt_no: genOrderNo('FK'), ...req.body })
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    const b = filterBodyCols('pay_receipt', { receipt_no: genOrderNo('FK'), ...req.body, shop_id: shopId })
     // 防重复：同一供应商+同一金额+同一天+同一采购单已存在则拒绝
     const supName = b.supplier_name || b.contact_name || ''
     const payDate = b.pay_date ? String(b.pay_date).slice(0, 10) : new Date().toISOString().slice(0, 10)
@@ -2338,8 +2482,8 @@ router.post('/finance/PayReceipt/add', async (req, res) => {
     const orderSn = b.order_sn || ''
     if (supName && amount > 0 && orderSn) {
       const dupCheck = await pool.query(
-        `SELECT id, receipt_no FROM pay_receipt WHERE contact_name=$1 AND amount=$2 AND order_sn=$3 AND deleted_at IS NULL LIMIT 1`,
-        [supName, amount, orderSn]
+        `SELECT id, receipt_no FROM pay_receipt WHERE contact_name=$1 AND amount=$2 AND order_sn=$3 AND deleted_at IS NULL AND shop_id=$4 LIMIT 1`,
+        [supName, amount, orderSn, shopId]
       )
       if (dupCheck.rows.length > 0) {
         return fail(res, `重复付款：该供应商"${supName}"的采购单${orderSn}已有一笔相同金额¥${amount}的付款单（单号${dupCheck.rows[0].receipt_no}），请勿重复提交`)
@@ -2359,12 +2503,13 @@ router.post('/finance/PayReceipt/edit', async (req, res) => {
   try {
     const { id, ...fields } = req.body
     if (!id) return fail(res, 'id不能为空')
+    const shopId = parseInt(req.admin?.shop_id) || 1
     const allowed = ['contact_type', 'contact_name', 'remark', 'pay_date', 'fund_id', 'fund_name', 'category']
     const updates = Object.keys(fields).filter(k => allowed.includes(k) && fields[k] !== undefined)
     if (updates.length === 0) return fail(res, '没有可更新的字段')
     const sets = updates.map((k, i) => `${k}=$${i + 1}`)
-    const vals = [...updates.map(k => fields[k]), id]
-    await pool.query(`UPDATE pay_receipt SET ${sets.join(',')} WHERE id=$${vals.length}`, vals)
+    const vals = [...updates.map(k => fields[k]), id, shopId]
+    await pool.query(`UPDATE pay_receipt SET ${sets.join(',')} WHERE id=$${vals.length - 1} AND shop_id=$${vals.length}`, vals)
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
@@ -2372,8 +2517,9 @@ router.post('/finance/PayReceipt/del', async (req, res) => {
   try {
     const { id } = req.body
     if (!id) return fail(res, 'id不能为空')
-    const r = await pool.query('SELECT fund_id, amount FROM pay_receipt WHERE id=$1', [id])
-    await pool.query('UPDATE pay_receipt SET deleted_at=NOW() WHERE id=$1', [id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    const r = await pool.query('SELECT fund_id, amount FROM pay_receipt WHERE id=$1 AND shop_id=$2', [id, shopId])
+    await pool.query('UPDATE pay_receipt SET deleted_at=NOW() WHERE id=$1 AND shop_id=$2', [id, shopId])
     if (r.rows[0]?.fund_id && Number(r.rows[0]?.amount)) {
       await pool.query('UPDATE finance_funds SET balance=balance+$1, update_time=NOW() WHERE id=$2', [Number(r.rows[0].amount), r.rows[0].fund_id])
     }
@@ -2385,12 +2531,12 @@ router.post('/finance/PayReceipt/del', async (req, res) => {
 router.get('/finance/Invoice/index', async (req, res) => {
   try {
     const { page, list_rows, offset } = pageParams(req.query)
-    await listQuery(res, 'finance_invoices', { keyword: req.query.keyword, keywordCols: ['invoice_no','customer_name'], baseWhere: 'deleted_at IS NULL', orderBy: 'id DESC', page, list_rows, offset })
+    await listQuery(res, 'finance_invoices', { keyword: req.query.keyword, keywordCols: ['invoice_no','customer_name'], baseWhere: shopBase(req, 'deleted_at IS NULL'), orderBy: 'id DESC', page, list_rows, offset })
   } catch (e) { fail(res, e.message) }
 })
 router.post('/finance/Invoice/add', async (req, res) => {
   try {
-    const b = filterBodyCols('finance_invoices', { invoice_no: genOrderNo('FP'), ...req.body })
+    const b = filterBodyCols('finance_invoices', { invoice_no: genOrderNo('FP'), ...req.body, shop_id: parseInt(req.admin?.shop_id) || 1 })
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
     const vals = cols.map(k => b[k])
     const r = await pool.query(`INSERT INTO finance_invoices (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
@@ -2401,7 +2547,8 @@ router.post('/finance/Invoice/del', async (req, res) => {
   try {
     const { id } = req.body
     if (!id) return fail(res, 'id不能为空')
-    await pool.query('UPDATE finance_invoices SET deleted_at=NOW() WHERE id=$1', [id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    await pool.query('UPDATE finance_invoices SET deleted_at=NOW() WHERE id=$1 AND shop_id=$2', [id, shopId])
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
@@ -2410,12 +2557,12 @@ router.post('/finance/Invoice/del', async (req, res) => {
 router.get('/finance/Statement/index', async (req, res) => {
   try {
     const { page, list_rows, offset } = pageParams(req.query)
-    await listQuery(res, 'finance_statements', { keyword: req.query.keyword, keywordCols: ['statement_no','customer_name'], baseWhere: 'deleted_at IS NULL', orderBy: 'id DESC', page, list_rows, offset })
+    await listQuery(res, 'finance_statements', { keyword: req.query.keyword, keywordCols: ['statement_no','customer_name'], baseWhere: shopBase(req, 'deleted_at IS NULL'), orderBy: 'id DESC', page, list_rows, offset })
   } catch (e) { fail(res, e.message) }
 })
 router.post('/finance/Statement/add', async (req, res) => {
   try {
-    const b = filterBodyCols('finance_statements', { statement_no: genOrderNo('DZ'), ...req.body })
+    const b = filterBodyCols('finance_statements', { statement_no: genOrderNo('DZ'), ...req.body, shop_id: parseInt(req.admin?.shop_id) || 1 })
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
     const vals = cols.map(k => b[k])
     const r = await pool.query(`INSERT INTO finance_statements (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
@@ -2426,7 +2573,8 @@ router.post('/finance/Statement/del', async (req, res) => {
   try {
     const { id } = req.body
     if (!id) return fail(res, 'id不能为空')
-    await pool.query('UPDATE finance_statements SET deleted_at=NOW() WHERE id=$1', [id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    await pool.query('UPDATE finance_statements SET deleted_at=NOW() WHERE id=$1 AND shop_id=$2', [id, shopId])
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
@@ -2435,13 +2583,14 @@ router.post('/finance/Statement/del', async (req, res) => {
 router.get('/finance/Expense/index', async (req, res) => {
   try {
     const { page, list_rows, offset } = pageParams(req.query)
-    await listQuery(res, 'finance_expenses', { keyword: req.query.keyword, keywordCols: ['expense_no','name'], baseWhere: '1=1', orderBy: 'id DESC', page, list_rows, offset })
+    await listQuery(res, 'finance_expenses', { keyword: req.query.keyword, keywordCols: ['expense_no','name'], baseWhere: shopBase(req, '1=1'), orderBy: 'id DESC', page, list_rows, offset })
   } catch (e) { fail(res, e.message) }
 })
 router.post('/finance/Expense/add', async (req, res) => {
   try {
-    const ALLOWED = new Set(['expense_no','name','amount','expense_date','fund_id','fund_name','remark','status','contact_name','pay_date'])
-    const b = { expense_no: genOrderNo('FY'), ...req.body }
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    const ALLOWED = new Set(['expense_no','name','amount','expense_date','fund_id','fund_name','remark','status','contact_name','pay_date','shop_id'])
+    const b = { expense_no: genOrderNo('FY'), ...req.body, shop_id: shopId }
     const cols = Object.keys(b).filter(k => ALLOWED.has(k) && b[k] !== undefined)
     const vals = cols.map(k => b[k])
     const r = await pool.query(`INSERT INTO finance_expenses (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
@@ -2456,12 +2605,13 @@ router.post('/finance/Expense/del', async (req, res) => {
   try {
     const { id } = req.body
     if (!id) return fail(res, 'id不能为空')
+    const shopId = parseInt(req.admin?.shop_id) || 1
     // 还余额
-    const r = await pool.query('SELECT fund_id, amount FROM finance_expenses WHERE id=$1', [id])
+    const r = await pool.query('SELECT fund_id, amount FROM finance_expenses WHERE id=$1 AND shop_id=$2', [id, shopId])
     if (r.rows[0]?.fund_id && Number(r.rows[0]?.amount)) {
       await pool.query('UPDATE finance_funds SET balance=balance+$1, update_time=NOW() WHERE id=$2', [Number(r.rows[0].amount), r.rows[0].fund_id])
     }
-    await pool.query('DELETE FROM finance_expenses WHERE id=$1', [id])
+    await pool.query('DELETE FROM finance_expenses WHERE id=$1 AND shop_id=$2', [id, shopId])
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
@@ -2470,7 +2620,7 @@ router.post('/finance/Expense/del', async (req, res) => {
 router.get('/finance/Fund/index', async (req, res) => {
   try {
     const { page, list_rows, offset } = pageParams(req.query)
-    await listQuery(res, 'finance_funds', { keyword: req.query.keyword, keywordCols: ['name'], baseWhere: 'deleted_at IS NULL', orderBy: 'id ASC', page, list_rows, offset })
+    await listQuery(res, 'finance_funds', { keyword: req.query.keyword, keywordCols: ['name'], baseWhere: shopBase(req, 'deleted_at IS NULL'), orderBy: 'id ASC', page, list_rows, offset })
   } catch (e) { fail(res, e.message) }
 })
 const FUND_ALLOWED_COLS = new Set(['name','fund_type','balance','bank_name','bank_account','remark','status'])
@@ -2482,9 +2632,11 @@ function normalizeFundBody(b) {
 }
 router.post('/finance/Fund/add', async (req, res) => {
   try {
-    const b = normalizeFundBody({ ...req.body })
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    const b = normalizeFundBody({ ...req.body, shop_id: shopId })
     if (!b.name) return fail(res, '账户名称不能为空')
-    const cols = Object.keys(b).filter(k => FUND_ALLOWED_COLS.has(k) && b[k] !== undefined)
+    const FUND_ALLOWED_WITH_SHOP = new Set([...FUND_ALLOWED_COLS, 'shop_id'])
+    const cols = Object.keys(b).filter(k => FUND_ALLOWED_WITH_SHOP.has(k) && b[k] !== undefined)
     const vals = cols.map(k => b[k])
     const r = await pool.query(`INSERT INTO finance_funds (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
     return ok(res, r.rows[0])
@@ -2494,12 +2646,13 @@ router.post('/finance/Fund/edit', async (req, res) => {
   try {
     const { id, ...rest } = req.body
     if (!id) return fail(res, 'id不能为空')
+    const shopId = parseInt(req.admin?.shop_id) || 1
     const b = normalizeFundBody({ ...rest })
     const cols = Object.keys(b).filter(k => FUND_ALLOWED_COLS.has(k) && b[k] !== undefined)
     if (!cols.length) return fail(res, '无有效字段')
     const sets = cols.map((k,i) => `${k}=$${i+1}`)
     const vals = cols.map(k => b[k])
-    const r = await pool.query(`UPDATE finance_funds SET ${sets.join(',')}, update_time=NOW() WHERE id=$${vals.length+1} RETURNING *`, [...vals, id])
+    const r = await pool.query(`UPDATE finance_funds SET ${sets.join(',')}, update_time=NOW() WHERE id=$${vals.length+1} AND shop_id=$${vals.length+2} RETURNING *`, [...vals, id, shopId])
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })
@@ -2507,7 +2660,8 @@ router.post('/finance/Fund/del', async (req, res) => {
   try {
     const { id } = req.body
     if (!id) return fail(res, 'id不能为空')
-    await pool.query('UPDATE finance_funds SET deleted_at=NOW() WHERE id=$1', [id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    await pool.query('UPDATE finance_funds SET deleted_at=NOW() WHERE id=$1 AND shop_id=$2', [id, shopId])
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
@@ -2524,23 +2678,24 @@ router.get('/finance/FundFlow/index', async (req, res) => {
       params.push(`%${keyword}%`)
       where += ` AND (contact_name ILIKE $1 OR receipt_no ILIKE $1)`
     }
+    const shopId = parseInt(req.admin?.shop_id) || 1
     const unionSql = `
       SELECT id, receipt_no AS flow_no, 'collect' AS flow_type, contact_name, amount, receipt_date AS flow_date, fund_name, remark, created_at
       FROM (
         SELECT id, receipt_no, customer_name AS contact_name, amount, receipt_date, fund_name, remark, created_at
-        FROM collect_receipt WHERE deleted_at IS NULL
+        FROM collect_receipt WHERE deleted_at IS NULL AND shop_id=${shopId}
         UNION ALL
         SELECT id, receipt_no, contact_name, amount, pay_date AS receipt_date, fund_name, remark, created_at
-        FROM pay_receipt WHERE deleted_at IS NULL
+        FROM pay_receipt WHERE deleted_at IS NULL AND shop_id=${shopId}
       ) t
       ${where}
       ORDER BY created_at DESC
       LIMIT $${params.length+1} OFFSET $${params.length+2}
     `
     const countSql = `SELECT COUNT(*) FROM (
-      SELECT id FROM collect_receipt WHERE deleted_at IS NULL
+      SELECT id FROM collect_receipt WHERE deleted_at IS NULL AND shop_id=${shopId}
       UNION ALL
-      SELECT id FROM pay_receipt WHERE deleted_at IS NULL
+      SELECT id FROM pay_receipt WHERE deleted_at IS NULL AND shop_id=${shopId}
     ) t`
     const [countR, rowsR] = await Promise.all([pool.query(countSql), pool.query(unionSql, [...params, list_rows, offset])])
     return ok(res, { rows: rowsR.rows, total: parseInt(countR.rows[0].count), page, list_rows })
@@ -2551,12 +2706,12 @@ router.get('/finance/FundFlow/index', async (req, res) => {
 router.get('/finance/Cost/index', async (req, res) => {
   try {
     const { page, list_rows, offset } = pageParams(req.query)
-    await listQuery(res, 'finance_costs', { keyword: req.query.keyword, keywordCols: ['cost_no','name'], baseWhere: '1=1', orderBy: 'id DESC', page, list_rows, offset })
+    await listQuery(res, 'finance_costs', { keyword: req.query.keyword, keywordCols: ['cost_no','name'], baseWhere: shopBase(req, '1=1'), orderBy: 'id DESC', page, list_rows, offset })
   } catch (e) { fail(res, e.message) }
 })
 router.post('/finance/Cost/add', async (req, res) => {
   try {
-    const b = filterBodyCols('finance_costs', { cost_no: genOrderNo('CB'), ...req.body })
+    const b = filterBodyCols('finance_costs', { cost_no: genOrderNo('CB'), ...req.body, shop_id: parseInt(req.admin?.shop_id) || 1 })
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
     const vals = cols.map(k => b[k])
     const r = await pool.query(`INSERT INTO finance_costs (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
@@ -2567,7 +2722,8 @@ router.post('/finance/Cost/del', async (req, res) => {
   try {
     const { id } = req.body
     if (!id) return fail(res, 'id不能为空')
-    await pool.query('DELETE FROM finance_costs WHERE id=$1', [id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    await pool.query('DELETE FROM finance_costs WHERE id=$1 AND shop_id=$2', [id, shopId])
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
@@ -2576,12 +2732,12 @@ router.post('/finance/Cost/del', async (req, res) => {
 router.get('/finance/Prepay/index', async (req, res) => {
   try {
     const { page, list_rows, offset } = pageParams(req.query)
-    await listQuery(res, 'prepay_record', { keyword: req.query.keyword, keywordCols: ['order_sn','customer_name','supplier_name'], baseWhere: '1=1', orderBy: 'id DESC', page, list_rows, offset })
+    await listQuery(res, 'prepay_record', { keyword: req.query.keyword, keywordCols: ['order_sn','customer_name','supplier_name'], baseWhere: shopBase(req, '1=1'), orderBy: 'id DESC', page, list_rows, offset })
   } catch (e) { fail(res, e.message) }
 })
 router.post('/finance/Prepay/create', async (req, res) => {
   try {
-    const b = filterBodyCols('prepay_record', { order_sn: genOrderNo('YF'), ...req.body })
+    const b = filterBodyCols('prepay_record', { order_sn: genOrderNo('YF'), ...req.body, shop_id: parseInt(req.admin?.shop_id) || 1 })
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
     const vals = cols.map(k => b[k])
     const r = await pool.query(`INSERT INTO prepay_record (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
@@ -2596,12 +2752,13 @@ router.post('/finance/Prepay/del', async (req, res) => {
   try {
     const { id } = req.body
     if (!id) return fail(res, 'id不能为空')
+    const shopId = parseInt(req.admin?.shop_id) || 1
     // 还余额
-    const r = await pool.query('SELECT fund_id, amount FROM prepay_record WHERE id=$1', [id])
+    const r = await pool.query('SELECT fund_id, amount FROM prepay_record WHERE id=$1 AND shop_id=$2', [id, shopId])
     if (r.rows[0]?.fund_id && Number(r.rows[0]?.amount)) {
       await pool.query('UPDATE finance_funds SET balance=balance+$1, update_time=NOW() WHERE id=$2', [Number(r.rows[0].amount), r.rows[0].fund_id])
     }
-    await pool.query('DELETE FROM prepay_record WHERE id=$1', [id])
+    await pool.query('DELETE FROM prepay_record WHERE id=$1 AND shop_id=$2', [id, shopId])
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
@@ -2614,7 +2771,7 @@ router.post('/finance/Prepay/del', async (req, res) => {
 router.get('/retail/order/index', async (req, res) => {
   try {
     const { page, list_rows, offset } = pageParams(req.query)
-    await listQuery(res, 'retail_orders', { keyword: req.query.keyword, keywordCols: ['order_sn','member_name'], baseWhere: '1=1', orderBy: 'id DESC', page, list_rows, offset })
+    await listQuery(res, 'retail_orders', { keyword: req.query.keyword, keywordCols: ['order_sn','member_name'], baseWhere: shopBase(req, '1=1'), orderBy: 'id DESC', page, list_rows, offset })
   } catch (e) { fail(res, e.message) }
 })
 router.post('/retail/order/add', async (req, res) => {
@@ -2623,7 +2780,7 @@ router.post('/retail/order/add', async (req, res) => {
     await pool.query(`ALTER TABLE retail_orders ADD COLUMN IF NOT EXISTS store_id INT DEFAULT 0`)
     await pool.query(`ALTER TABLE retail_orders ADD COLUMN IF NOT EXISTS store_name VARCHAR(100) DEFAULT ''`)
     await loadTableCols()
-    const b = filterBodyCols('retail_orders', { order_sn: genOrderNo('LS'), ...req.body })
+    const b = filterBodyCols('retail_orders', { order_sn: genOrderNo('LS'), ...req.body, shop_id: parseInt(req.admin?.shop_id) || 1 })
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
     const vals = cols.map(k => typeof b[k] === 'object' ? JSON.stringify(b[k]) : b[k])
     const r = await pool.query(`INSERT INTO retail_orders (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
@@ -2635,18 +2792,19 @@ router.post('/retail/order/edit', async (req, res) => {
     const { id, goods_info, order_date, member_id, member_name, store_id, store_name, pay_type, remark, total_amount, discount_amount, pay_amount } = req.body
     if (!id) return fail(res, '缺少零售单 ID')
     if (!goods_info) return fail(res, '缺少 goods_info')
-    const row = await pool.query('SELECT status FROM retail_orders WHERE id=$1', [id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    const row = await pool.query('SELECT status FROM retail_orders WHERE id=$1 AND shop_id=$2', [id, shopId])
     if (!row.rows.length) return fail(res, '订单不存在')
     if (Number(row.rows[0].status) === 1) return fail(res, '已审核订单不可编辑，请先反审核')
     const goodsStr = typeof goods_info === 'string' ? goods_info : JSON.stringify(goods_info)
     await pool.query(
       `UPDATE retail_orders SET goods_info=$1, total_amount=$2, discount_amount=$3, pay_amount=$4,
        order_date=$5, member_id=$6, member_name=$7, store_id=$8, store_name=$9, pay_type=$10, remark=$11
-       WHERE id=$12`,
+       WHERE id=$12 AND shop_id=$13`,
       [goodsStr, total_amount??0, discount_amount??0, pay_amount??0,
-       order_date||null, member_id||0, member_name||'', store_id||0, store_name||'', pay_type||'cash', remark||'', id]
+       order_date||null, member_id||0, member_name||'', store_id||0, store_name||'', pay_type||'cash', remark||'', id, shopId]
     )
-    const r = await pool.query('SELECT * FROM retail_orders WHERE id=$1', [id])
+    const r = await pool.query('SELECT * FROM retail_orders WHERE id=$1 AND shop_id=$2', [id, shopId])
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })
@@ -2656,7 +2814,8 @@ router.post('/retail/order/audit', async (req, res) => {
     if (!id) return fail(res, 'id不能为空')
     const s = parseInt(status)
     if (s !== 0 && s !== 1) return fail(res, 'status必须是0或1')
-    await pool.query('UPDATE retail_orders SET status=$1 WHERE id=$2', [s, id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    await pool.query('UPDATE retail_orders SET status=$1 WHERE id=$2 AND shop_id=$3', [s, id, shopId])
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
@@ -2664,7 +2823,8 @@ router.post('/retail/order/del', async (req, res) => {
   try {
     const { id } = req.body
     if (!id) return fail(res, 'id不能为空')
-    await pool.query('DELETE FROM retail_orders WHERE id=$1', [id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    await pool.query('DELETE FROM retail_orders WHERE id=$1 AND shop_id=$2', [id, shopId])
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
@@ -2672,8 +2832,9 @@ router.post('/retail/order/batchDel', async (req, res) => {
   try {
     const { ids } = req.body
     if (!ids || !ids.length) return fail(res, 'ids不能为空')
+    const shopId = parseInt(req.admin?.shop_id) || 1
     const idArr = Array.isArray(ids) ? ids : ids.split(',').map(Number)
-    await pool.query(`DELETE FROM retail_orders WHERE id=ANY($1)`, [idArr])
+    await pool.query(`DELETE FROM retail_orders WHERE id=ANY($1) AND shop_id=$2`, [idArr, shopId])
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
@@ -2682,12 +2843,12 @@ router.post('/retail/order/batchDel', async (req, res) => {
 router.get('/retail/member/index', async (req, res) => {
   try {
     const { page, list_rows, offset } = pageParams(req.query)
-    await listQuery(res, 'retail_members', { keyword: req.query.keyword, keywordCols: ['name','mobile'], baseWhere: '1=1', orderBy: 'id DESC', page, list_rows, offset })
+    await listQuery(res, 'retail_members', { keyword: req.query.keyword, keywordCols: ['name','mobile'], baseWhere: shopBase(req, '1=1'), orderBy: 'id DESC', page, list_rows, offset })
   } catch (e) { fail(res, e.message) }
 })
 router.post('/retail/member/add', async (req, res) => {
   try {
-    const b = filterBodyCols('retail_members', req.body)
+    const b = filterBodyCols('retail_members', { ...req.body, shop_id: parseInt(req.admin?.shop_id) || 1 })
     if (!b.name && !b.mobile) return fail(res, '姓名或手机号不能为空')
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
     const vals = cols.map(k => b[k])
@@ -2699,11 +2860,12 @@ router.post('/retail/member/edit', async (req, res) => {
   try {
     const { id, ...rest } = req.body
     if (!id) return fail(res, 'id不能为空')
+    const shopId = parseInt(req.admin?.shop_id) || 1
     const cols = Object.keys(rest).filter(k => rest[k] !== undefined)
     if (!cols.length) return fail(res, '无有效字段')
     const sets = cols.map((k,i) => `${k}=$${i+1}`)
     const vals = cols.map(k => rest[k])
-    const r = await pool.query(`UPDATE retail_members SET ${sets.join(',')} WHERE id=$${vals.length+1} RETURNING *`, [...vals, id])
+    const r = await pool.query(`UPDATE retail_members SET ${sets.join(',')} WHERE id=$${vals.length+1} AND shop_id=$${vals.length+2} RETURNING *`, [...vals, id, shopId])
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })
@@ -2711,7 +2873,8 @@ router.post('/retail/member/del', async (req, res) => {
   try {
     const { id } = req.body
     if (!id) return fail(res, 'id不能为空')
-    await pool.query('DELETE FROM retail_members WHERE id=$1', [id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    await pool.query('DELETE FROM retail_members WHERE id=$1 AND shop_id=$2', [id, shopId])
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
@@ -2720,12 +2883,12 @@ router.post('/retail/member/del', async (req, res) => {
 router.get('/retail/recharge/index', async (req, res) => {
   try {
     const { page, list_rows, offset } = pageParams(req.query)
-    await listQuery(res, 'retail_recharge', { keyword: req.query.keyword, keywordCols: ['recharge_no','member_name'], baseWhere: '1=1', orderBy: 'id DESC', page, list_rows, offset })
+    await listQuery(res, 'retail_recharge', { keyword: req.query.keyword, keywordCols: ['recharge_no','member_name'], baseWhere: shopBase(req, '1=1'), orderBy: 'id DESC', page, list_rows, offset })
   } catch (e) { fail(res, e.message) }
 })
 router.post('/retail/recharge/add', async (req, res) => {
   try {
-    const b = filterBodyCols('retail_recharge', { recharge_no: genOrderNo('CZ'), ...req.body })
+    const b = filterBodyCols('retail_recharge', { recharge_no: genOrderNo('CZ'), ...req.body, shop_id: parseInt(req.admin?.shop_id) || 1 })
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
     const vals = cols.map(k => b[k])
     const r = await pool.query(`INSERT INTO retail_recharge (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
@@ -2736,7 +2899,8 @@ router.post('/retail/recharge/del', async (req, res) => {
   try {
     const { id } = req.body
     if (!id) return fail(res, 'id不能为空')
-    await pool.query('DELETE FROM retail_recharge WHERE id=$1', [id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    await pool.query('DELETE FROM retail_recharge WHERE id=$1 AND shop_id=$2', [id, shopId])
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
@@ -2751,7 +2915,7 @@ router.get('/retail/store/index', async (req, res) => {
       if (parseInt(r.rows[0].count) === 0) {
         return ok(res, { rows: [], total: 0, page: 1, list_rows: 20 })
       }
-      await listQuery(res, 'retail_stores', { keyword: req.query.keyword, keywordCols: ['name'], baseWhere: '1=1', orderBy: 'id ASC', page, list_rows, offset })
+      await listQuery(res, 'retail_stores', { keyword: req.query.keyword, keywordCols: ['name'], baseWhere: shopBase(req, '1=1'), orderBy: 'id ASC', page, list_rows, offset })
     } catch {
       return ok(res, { rows: [], total: 0, page: 1, list_rows: 20 })
     }
@@ -2759,10 +2923,12 @@ router.get('/retail/store/index', async (req, res) => {
 })
 router.post('/retail/store/add', async (req, res) => {
   try {
-    await pool.query(`CREATE TABLE IF NOT EXISTS retail_stores (id SERIAL PRIMARY KEY, name VARCHAR(100) NOT NULL, address TEXT DEFAULT '', tel VARCHAR(20) DEFAULT '', remark TEXT DEFAULT '', status INT DEFAULT 1, created_at TIMESTAMP DEFAULT NOW())`)
+    await pool.query(`CREATE TABLE IF NOT EXISTS retail_stores (id SERIAL PRIMARY KEY, name VARCHAR(100) NOT NULL, address TEXT DEFAULT '', tel VARCHAR(20) DEFAULT '', remark TEXT DEFAULT '', status INT DEFAULT 1, shop_id INTEGER NOT NULL DEFAULT 1, created_at TIMESTAMP DEFAULT NOW())`)
+    await pool.query(`ALTER TABLE retail_stores ADD COLUMN IF NOT EXISTS shop_id INTEGER NOT NULL DEFAULT 1`).catch(() => {})
+    const shopId = parseInt(req.admin?.shop_id) || 1
     const b = req.body
     if (!b.name) return fail(res, '门店名称不能为空')
-    const r = await pool.query('INSERT INTO retail_stores (name,address,tel,remark,status) VALUES ($1,$2,$3,$4,$5) RETURNING *', [b.name, b.address||'', b.tel||'', b.remark||'', b.status||1])
+    const r = await pool.query('INSERT INTO retail_stores (name,address,tel,remark,status,shop_id) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *', [b.name, b.address||'', b.tel||'', b.remark||'', b.status||1, shopId])
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })
@@ -2770,7 +2936,8 @@ router.post('/retail/store/edit', async (req, res) => {
   try {
     const { id, name, address, tel, remark, status } = req.body
     if (!id) return fail(res, 'id不能为空')
-    const r = await pool.query('UPDATE retail_stores SET name=COALESCE($1,name), address=COALESCE($2,address), tel=COALESCE($3,tel), remark=COALESCE($4,remark), status=COALESCE($5,status) WHERE id=$6 RETURNING *', [name, address, tel, remark, status, id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    const r = await pool.query('UPDATE retail_stores SET name=COALESCE($1,name), address=COALESCE($2,address), tel=COALESCE($3,tel), remark=COALESCE($4,remark), status=COALESCE($5,status) WHERE id=$6 AND shop_id=$7 RETURNING *', [name, address, tel, remark, status, id, shopId])
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })
@@ -2778,7 +2945,8 @@ router.post('/retail/store/del', async (req, res) => {
   try {
     const { id } = req.body
     if (!id) return fail(res, 'id不能为空')
-    await pool.query('DELETE FROM retail_stores WHERE id=$1', [id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    await pool.query('DELETE FROM retail_stores WHERE id=$1 AND shop_id=$2', [id, shopId])
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
@@ -2791,7 +2959,7 @@ router.post('/retail/store/del', async (req, res) => {
 router.get('/setting/admin/index', async (req, res) => {
   try {
     const { page, list_rows, offset } = pageParams(req.query)
-    await listQuery(res, 'admins', { keyword: req.query.keyword, keywordCols: ['name','account','mobile'], baseWhere: 'deleted_at IS NULL', orderBy: 'id ASC', page, list_rows, offset })
+    await listQuery(res, 'admins', { keyword: req.query.keyword, keywordCols: ['name','account','mobile'], baseWhere: shopBase(req, 'deleted_at IS NULL'), orderBy: 'id ASC', page, list_rows, offset })
   } catch (e) { fail(res, e.message) }
 })
 router.post('/setting/admin/add', async (req, res) => {
@@ -2799,8 +2967,9 @@ router.post('/setting/admin/add', async (req, res) => {
     const b = req.body
     if (!b.account) return fail(res, '账号不能为空')
     if (!b.password) return fail(res, '密码不能为空')
+    const shopId = parseInt(req.admin?.shop_id) || 1
     const hashedPwd = await bcrypt.hash(b.password, 10)
-    const data = { ...b, password: hashedPwd }
+    const data = { ...b, password: hashedPwd, shop_id: shopId }
     const cols = Object.keys(data).filter(k => data[k] !== undefined)
     const vals = cols.map(k => data[k])
     const r = await pool.query(`INSERT INTO admins (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING id, name, account, role_name, dept_name, mobile, status`, vals)
@@ -2814,13 +2983,14 @@ router.post('/setting/admin/edit', async (req, res) => {
   try {
     const { id, password, ...rest } = req.body
     if (!id) return fail(res, 'id不能为空')
+    const shopId = parseInt(req.admin?.shop_id) || 1
     const data = { ...rest }
     if (password) data.password = await bcrypt.hash(password, 10)
     const cols = Object.keys(data).filter(k => data[k] !== undefined)
     if (!cols.length) return fail(res, '无有效字段')
     const sets = cols.map((k,i) => `${k}=$${i+1}`)
     const vals = cols.map(k => data[k])
-    const r = await pool.query(`UPDATE admins SET ${sets.join(',')}, update_time=NOW() WHERE id=$${vals.length+1} RETURNING id, name, account, role_name, status`, [...vals, id])
+    const r = await pool.query(`UPDATE admins SET ${sets.join(',')}, update_time=NOW() WHERE id=$${vals.length+1} AND shop_id=$${vals.length+2} RETURNING id, name, account, role_name, status`, [...vals, id, shopId])
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })
@@ -2828,7 +2998,8 @@ router.post('/setting/admin/del', async (req, res) => {
   try {
     const { id } = req.body
     if (!id) return fail(res, 'id不能为空')
-    await pool.query('UPDATE admins SET deleted_at=NOW() WHERE id=$1', [id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    await pool.query('UPDATE admins SET deleted_at=NOW() WHERE id=$1 AND shop_id=$2', [id, shopId])
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
@@ -2837,14 +3008,15 @@ router.post('/setting/admin/del', async (req, res) => {
 router.get('/setting/dept/index', async (req, res) => {
   try {
     const { page, list_rows, offset } = pageParams(req.query)
-    await listQuery(res, 'depts', { keyword: req.query.keyword, keywordCols: ['name'], baseWhere: '1=1', orderBy: 'sort ASC, id ASC', page, list_rows, offset })
+    await listQuery(res, 'depts', { keyword: req.query.keyword, keywordCols: ['name'], baseWhere: shopBase(req, '1=1'), orderBy: 'sort ASC, id ASC', page, list_rows, offset })
   } catch (e) { fail(res, e.message) }
 })
 router.post('/setting/dept/add', async (req, res) => {
   try {
     const { name, parent_id = 0, sort = 0, status = 1 } = req.body
     if (!name) return fail(res, '部门名称不能为空')
-    const r = await pool.query('INSERT INTO depts (name,parent_id,sort,status) VALUES ($1,$2,$3,$4) RETURNING *', [name, parent_id, sort, status])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    const r = await pool.query('INSERT INTO depts (name,parent_id,sort,status,shop_id) VALUES ($1,$2,$3,$4,$5) RETURNING *', [name, parent_id, sort, status, shopId])
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })
@@ -2852,7 +3024,8 @@ router.post('/setting/dept/edit', async (req, res) => {
   try {
     const { id, name, parent_id, sort, status } = req.body
     if (!id) return fail(res, 'id不能为空')
-    const r = await pool.query('UPDATE depts SET name=COALESCE($1,name), parent_id=COALESCE($2,parent_id), sort=COALESCE($3,sort), status=COALESCE($4,status) WHERE id=$5 RETURNING *', [name, parent_id, sort, status, id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    const r = await pool.query('UPDATE depts SET name=COALESCE($1,name), parent_id=COALESCE($2,parent_id), sort=COALESCE($3,sort), status=COALESCE($4,status) WHERE id=$5 AND shop_id=$6 RETURNING *', [name, parent_id, sort, status, id, shopId])
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })
@@ -2860,7 +3033,8 @@ router.post('/setting/dept/del', async (req, res) => {
   try {
     const { id } = req.body
     if (!id) return fail(res, 'id不能为空')
-    await pool.query('DELETE FROM depts WHERE id=$1', [id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    await pool.query('DELETE FROM depts WHERE id=$1 AND shop_id=$2', [id, shopId])
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
@@ -2869,14 +3043,15 @@ router.post('/setting/dept/del', async (req, res) => {
 router.get('/setting/role/index', async (req, res) => {
   try {
     const { page, list_rows, offset } = pageParams(req.query)
-    await listQuery(res, 'roles', { keyword: req.query.keyword, keywordCols: ['name'], baseWhere: '1=1', orderBy: 'id ASC', page, list_rows, offset })
+    await listQuery(res, 'roles', { keyword: req.query.keyword, keywordCols: ['name'], baseWhere: shopBase(req, '1=1'), orderBy: 'id ASC', page, list_rows, offset })
   } catch (e) { fail(res, e.message) }
 })
 router.post('/setting/role/add', async (req, res) => {
   try {
     const { name, permissions = '', status = 1 } = req.body
     if (!name) return fail(res, '角色名称不能为空')
-    const r = await pool.query('INSERT INTO roles (name,permissions,status) VALUES ($1,$2,$3) RETURNING *', [name, permissions, status])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    const r = await pool.query('INSERT INTO roles (name,permissions,status,shop_id) VALUES ($1,$2,$3,$4) RETURNING *', [name, permissions, status, shopId])
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })
@@ -2884,7 +3059,8 @@ router.post('/setting/role/edit', async (req, res) => {
   try {
     const { id, name, permissions, status } = req.body
     if (!id) return fail(res, 'id不能为空')
-    const r = await pool.query('UPDATE roles SET name=COALESCE($1,name), permissions=COALESCE($2,permissions), status=COALESCE($3,status) WHERE id=$4 RETURNING *', [name, permissions, status, id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    const r = await pool.query('UPDATE roles SET name=COALESCE($1,name), permissions=COALESCE($2,permissions), status=COALESCE($3,status) WHERE id=$4 AND shop_id=$5 RETURNING *', [name, permissions, status, id, shopId])
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })
@@ -2892,7 +3068,8 @@ router.post('/setting/role/del', async (req, res) => {
   try {
     const { id } = req.body
     if (!id) return fail(res, 'id不能为空')
-    await pool.query('DELETE FROM roles WHERE id=$1', [id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    await pool.query('DELETE FROM roles WHERE id=$1 AND shop_id=$2', [id, shopId])
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
@@ -2901,14 +3078,15 @@ router.post('/setting/role/del', async (req, res) => {
 router.get('/setting/jobs/index', async (req, res) => {
   try {
     const { page, list_rows, offset } = pageParams(req.query)
-    await listQuery(res, 'jobs', { keyword: req.query.keyword, keywordCols: ['name'], baseWhere: '1=1', orderBy: 'id ASC', page, list_rows, offset })
+    await listQuery(res, 'jobs', { keyword: req.query.keyword, keywordCols: ['name'], baseWhere: shopBase(req, '1=1'), orderBy: 'id ASC', page, list_rows, offset })
   } catch (e) { fail(res, e.message) }
 })
 router.post('/setting/jobs/add', async (req, res) => {
   try {
     const { name, dept_id = 0, status = 1 } = req.body
     if (!name) return fail(res, '职位名称不能为空')
-    const r = await pool.query('INSERT INTO jobs (name,dept_id,status) VALUES ($1,$2,$3) RETURNING *', [name, dept_id, status])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    const r = await pool.query('INSERT INTO jobs (name,dept_id,status,shop_id) VALUES ($1,$2,$3,$4) RETURNING *', [name, dept_id, status, shopId])
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })
@@ -2916,7 +3094,8 @@ router.post('/setting/jobs/edit', async (req, res) => {
   try {
     const { id, name, dept_id, status } = req.body
     if (!id) return fail(res, 'id不能为空')
-    const r = await pool.query('UPDATE jobs SET name=COALESCE($1,name), dept_id=COALESCE($2,dept_id), status=COALESCE($3,status) WHERE id=$4 RETURNING *', [name, dept_id, status, id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    const r = await pool.query('UPDATE jobs SET name=COALESCE($1,name), dept_id=COALESCE($2,dept_id), status=COALESCE($3,status) WHERE id=$4 AND shop_id=$5 RETURNING *', [name, dept_id, status, id, shopId])
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })
@@ -2924,7 +3103,8 @@ router.post('/setting/jobs/del', async (req, res) => {
   try {
     const { id } = req.body
     if (!id) return fail(res, 'id不能为空')
-    await pool.query('DELETE FROM jobs WHERE id=$1', [id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    await pool.query('DELETE FROM jobs WHERE id=$1 AND shop_id=$2', [id, shopId])
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
@@ -2968,7 +3148,7 @@ router.post('/setting/company/edit', async (req, res) => {
 router.get('/setting/operationLog/index', async (req, res) => {
   try {
     const { page, list_rows, offset } = pageParams(req.query)
-    await listQuery(res, 'operation_logs', { keyword: req.query.keyword, keywordCols: ['admin_name','action'], baseWhere: '1=1', orderBy: 'id DESC', page, list_rows, offset })
+    await listQuery(res, 'operation_logs', { keyword: req.query.keyword, keywordCols: ['admin_name','action'], baseWhere: shopBase(req, '1=1'), orderBy: 'id DESC', page, list_rows, offset })
   } catch (e) { fail(res, e.message) }
 })
 
@@ -2976,14 +3156,21 @@ router.get('/setting/operationLog/index', async (req, res) => {
 router.get('/setting/params/index', async (req, res) => {
   try {
     const { page, list_rows, offset } = pageParams(req.query)
-    await listQuery(res, 'sys_params', { keyword: req.query.keyword, keywordCols: ['key','value'], baseWhere: '1=1', orderBy: 'id ASC', page, list_rows, offset })
+    await listQuery(res, 'sys_params', { keyword: req.query.keyword, keywordCols: ['key','value'], baseWhere: shopBase(req, '1=1'), orderBy: 'id ASC', page, list_rows, offset })
   } catch (e) { fail(res, e.message) }
 })
 router.post('/setting/params/edit', async (req, res) => {
   try {
     const { key, value } = req.body
     if (!key) return fail(res, 'key不能为空')
-    await pool.query('INSERT INTO sys_params (key,value) VALUES ($1,$2) ON CONFLICT (key) DO UPDATE SET value=$2', [key, value])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    // Try to update existing record for this shop first; insert if not found
+    const existingParam = await pool.query('SELECT id FROM sys_params WHERE key=$1 AND shop_id=$2 LIMIT 1', [key, shopId])
+    if (existingParam.rows.length > 0) {
+      await pool.query('UPDATE sys_params SET value=$1 WHERE key=$2 AND shop_id=$3', [value, key, shopId])
+    } else {
+      await pool.query('INSERT INTO sys_params (key,value,shop_id) VALUES ($1,$2,$3)', [key, value, shopId])
+    }
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
@@ -3317,6 +3504,7 @@ async function start() {
     await initDb()
     await migrateSaleReturnOrder()
     await loadTableCols()
+    await migrateMultiTenant()
     console.log('Database ready')
     // 每天凌晨2点跑一次自动收货
     const cron = require('node-cron')
@@ -3331,9 +3519,10 @@ router.get('/goods/BomGoods/index', async (req, res) => {
   try {
     const { page, list_rows, offset } = pageParams(req.query)
     const keyword = req.query.keyword || ''
+    const shopId = parseInt(req.admin?.shop_id) || 1
     const where = keyword
-      ? `deleted_at IS NULL AND (goods_name ILIKE $1 OR goods_sn ILIKE $1 OR bom_code ILIKE $1)`
-      : `deleted_at IS NULL`
+      ? `deleted_at IS NULL AND shop_id=${shopId} AND (goods_name ILIKE $1 OR goods_sn ILIKE $1 OR bom_code ILIKE $1)`
+      : `deleted_at IS NULL AND shop_id=${shopId}`
     const params = keyword ? [`%${keyword}%`] : []
     const count = await pool.query(`SELECT COUNT(*) FROM bom_order WHERE ${where}`, params)
     const rows = await pool.query(
@@ -3348,7 +3537,8 @@ router.get('/goods/BomGoods/detail', async (req, res) => {
   try {
     const { id } = req.query
     if (!id) return fail(res, 'id不能为空')
-    const bom = await pool.query('SELECT * FROM bom_order WHERE id=$1 AND deleted_at IS NULL', [id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    const bom = await pool.query('SELECT * FROM bom_order WHERE id=$1 AND deleted_at IS NULL AND shop_id=$2', [id, shopId])
     if (!bom.rows.length) return fail(res, 'BOM不存在')
     const items = await pool.query('SELECT * FROM bom_items WHERE bom_id=$1 ORDER BY id ASC', [id])
     return ok(res, { ...bom.rows[0], items: items.rows })
@@ -3359,13 +3549,14 @@ router.post('/goods/BomGoods/add', async (req, res) => {
   try {
     const { goods_name, goods_sn, spec, unit_name, remark, items = [] } = req.body
     if (!goods_name) return fail(res, '商品名称不能为空')
-    const countR = await pool.query('SELECT COUNT(*) FROM bom_order WHERE deleted_at IS NULL')
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    const countR = await pool.query('SELECT COUNT(*) FROM bom_order WHERE deleted_at IS NULL AND shop_id=$1', [shopId])
     const sn = parseInt(countR.rows[0].count) + 1
     const bomCode = 'BOM' + String(sn).padStart(6, '0')
     const r = await pool.query(
-      `INSERT INTO bom_order (bom_code, goods_name, goods_sn, spec, unit_name, remark)
-       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
-      [bomCode, goods_name, goods_sn || '', spec || '', unit_name || '', remark || '']
+      `INSERT INTO bom_order (bom_code, goods_name, goods_sn, spec, unit_name, remark, shop_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+      [bomCode, goods_name, goods_sn || '', spec || '', unit_name || '', remark || '', shopId]
     )
     const bomId = r.rows[0].id
     for (const item of items) {
@@ -3383,9 +3574,10 @@ router.post('/goods/BomGoods/edit', async (req, res) => {
   try {
     const { id, goods_name, goods_sn, spec, unit_name, remark, items } = req.body
     if (!id) return fail(res, 'id不能为空')
+    const shopId = parseInt(req.admin?.shop_id) || 1
     await pool.query(
-      `UPDATE bom_order SET goods_name=$1, goods_sn=$2, spec=$3, unit_name=$4, remark=$5, update_time=NOW() WHERE id=$6`,
-      [goods_name || '', goods_sn || '', spec || '', unit_name || '', remark || '', id]
+      `UPDATE bom_order SET goods_name=$1, goods_sn=$2, spec=$3, unit_name=$4, remark=$5, update_time=NOW() WHERE id=$6 AND shop_id=$7`,
+      [goods_name || '', goods_sn || '', spec || '', unit_name || '', remark || '', id, shopId]
     )
     if (Array.isArray(items)) {
       await pool.query('DELETE FROM bom_items WHERE bom_id=$1', [id])
@@ -3405,7 +3597,8 @@ router.post('/goods/BomGoods/del', async (req, res) => {
   try {
     const { id } = req.body
     if (!id) return fail(res, 'id不能为空')
-    await pool.query('UPDATE bom_order SET deleted_at=NOW() WHERE id=$1', [id])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    await pool.query('UPDATE bom_order SET deleted_at=NOW() WHERE id=$1 AND shop_id=$2', [id, shopId])
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })

@@ -4045,18 +4045,28 @@ app.post('/miniapi/distributor/apply', miniAuth, async (req, res) => {
     const { name, phone, reason } = req.body
     if (!name || !phone) return fail(res, '请填写姓名和手机号')
     const exists = (await pool.query(`SELECT id, status FROM distributors WHERE user_id=$1 LIMIT 1`, [req.miniUser.id])).rows[0]
+    const notifyAdmin = (applicantName, applicantPhone, applicantReason) => {
+      const key = process.env.SERVER_JIANG_KEY
+      if (!key) return
+      const title = encodeURIComponent('🔔 新分销商申请')
+      const desp = encodeURIComponent(`姓名：${applicantName}\n手机：${applicantPhone}\n申请理由：${applicantReason || '无'}`)
+      fetch(`https://sctapi.ftqq.com/${key}.send?title=${title}&desp=${desp}`).catch(() => {})
+    }
+
     if (exists) {
       if (exists.status === 0) return fail(res, '您的申请正在审核中')
       if (exists.status === 1) return fail(res, '您已是分销商')
       // rejected → allow re-apply
       await pool.query(`UPDATE distributors SET name=$1, phone=$2, apply_reason=$3, status=0, created_at=NOW(), note='' WHERE id=$4`,
         [name, phone, reason || '', exists.id])
+      notifyAdmin(name, phone, reason)
       return ok(res, { status: 0 })
     }
     await pool.query(
       `INSERT INTO distributors (user_id, name, phone, apply_reason, status, created_at) VALUES ($1,$2,$3,$4,0,NOW())`,
       [req.miniUser.id, name, phone, reason || '']
     )
+    notifyAdmin(name, phone, reason)
     return ok(res, { status: 0 })
   } catch(e) { fail(res, e.message) }
 })

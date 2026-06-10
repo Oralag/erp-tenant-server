@@ -6259,7 +6259,7 @@ app.post('/miniapi/dev/seed-test-order', async (req, res) => {
   const jwt = require('jsonwebtoken')
   try {
     const u = (await pool.query(
-      `INSERT INTO mini_users (openid, name, avatar) VALUES ('dev_test_openid', '测试用户', '')
+      `INSERT INTO mini_users (openid, name) VALUES ('dev_test_openid', '测试用户')
        ON CONFLICT (openid) DO UPDATE SET name='测试用户' RETURNING id`
     )).rows[0]
     const o = (await pool.query(

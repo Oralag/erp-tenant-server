@@ -3652,7 +3652,7 @@ app.get('/miniapi/goods/detail/:id', async (req, res) => {
 // 创建订单
 app.post('/miniapi/order/create', miniAuth, async (req, res) => {
   try {
-    const { items, address, remark } = req.body
+    const { items, address, remark, distributor_code } = req.body
     if (!items || items.length === 0) return fail(res, '订单不能为空')
 
     // 服务端重新计算总价，不信任客户端传值
@@ -3735,10 +3735,22 @@ app.post('/miniapi/order/create', miniAuth, async (req, res) => {
         }
       }
 
+      // 分销商佣金
+      let distCode = '', distCommission = 0
+      if (distributor_code) {
+        const distRow = (await client.query(
+          `SELECT code, commission_rate FROM distributors WHERE code=$1 AND status=1 LIMIT 1`, [distributor_code]
+        )).rows[0]
+        if (distRow) {
+          distCode = distRow.code
+          distCommission = Math.round(serverTotal * parseFloat(distRow.commission_rate) / 100 * 100) / 100
+        }
+      }
+
       const r = await client.query(
-        `INSERT INTO mini_orders (order_no, user_id, total_amount, original_amount, discount, points_used, coupon_id, coupon_deduct, address, remark, status, created_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,0,NOW()) RETURNING *`,
-        [orderNo, req.miniUser.id, serverTotal, originalTotal, discount, usePoints, userCouponId || 0, couponDeduct, JSON.stringify(address || {}), remark || '']
+        `INSERT INTO mini_orders (order_no, user_id, total_amount, original_amount, discount, points_used, coupon_id, coupon_deduct, address, remark, distributor_code, commission, status, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,0,NOW()) RETURNING *`,
+        [orderNo, req.miniUser.id, serverTotal, originalTotal, discount, usePoints, userCouponId || 0, couponDeduct, JSON.stringify(address || {}), remark || '', distCode, distCommission]
       )
       order = r.rows[0]
 
@@ -3838,6 +3850,155 @@ app.post('/miniapi/order/cancel', miniAuth, async (req, res) => {
   } finally {
     client.release()
   }
+})
+
+// ─── 分销商系统 ───────────────────────────────────────────────────────────────
+
+;(async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS distributors (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER,
+        name VARCHAR(100) DEFAULT '',
+        phone VARCHAR(20) DEFAULT '',
+        code VARCHAR(20) UNIQUE,
+        commission_rate NUMERIC(5,2) DEFAULT 10.0,
+        status INTEGER DEFAULT 0,
+        apply_reason TEXT DEFAULT '',
+        note TEXT DEFAULT '',
+        created_at TIMESTAMP DEFAULT NOW(),
+        approved_at TIMESTAMP
+      )
+    `)
+    await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS distributor_code VARCHAR(20) DEFAULT ''`)
+    await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS commission NUMERIC(8,2) DEFAULT 0`)
+  } catch(e) { console.log('distributor init:', e.message) }
+})()
+
+// 申请成为分销商
+app.post('/miniapi/distributor/apply', miniAuth, async (req, res) => {
+  try {
+    const { name, phone, reason } = req.body
+    if (!name || !phone) return fail(res, '请填写姓名和手机号')
+    const exists = (await pool.query(`SELECT id, status FROM distributors WHERE user_id=$1 LIMIT 1`, [req.miniUser.id])).rows[0]
+    if (exists) {
+      if (exists.status === 0) return fail(res, '您的申请正在审核中')
+      if (exists.status === 1) return fail(res, '您已是分销商')
+      // rejected → allow re-apply
+      await pool.query(`UPDATE distributors SET name=$1, phone=$2, apply_reason=$3, status=0, created_at=NOW(), note='' WHERE id=$4`,
+        [name, phone, reason || '', exists.id])
+      return ok(res, { status: 0 })
+    }
+    await pool.query(
+      `INSERT INTO distributors (user_id, name, phone, apply_reason, status, created_at) VALUES ($1,$2,$3,$4,0,NOW())`,
+      [req.miniUser.id, name, phone, reason || '']
+    )
+    return ok(res, { status: 0 })
+  } catch(e) { fail(res, e.message) }
+})
+
+// 查询自己的分销商状态 + 统计
+app.get('/miniapi/distributor/me', miniAuth, async (req, res) => {
+  try {
+    const dist = (await pool.query(`SELECT * FROM distributors WHERE user_id=$1 LIMIT 1`, [req.miniUser.id])).rows[0]
+    if (!dist) return ok(res, null)
+    if (dist.status !== 1) return ok(res, { status: dist.status, id: dist.id })
+    // 统计佣金
+    const stats = (await pool.query(
+      `SELECT COUNT(*) as order_count,
+              COALESCE(SUM(commission),0) as total_commission,
+              COALESCE(SUM(CASE WHEN status>=3 THEN commission ELSE 0 END),0) as settled_commission
+       FROM mini_orders WHERE distributor_code=$1 AND status!=4 AND deleted_at IS NULL`,
+      [dist.code]
+    )).rows[0]
+    return ok(res, {
+      status: dist.status,
+      id: dist.id,
+      name: dist.name,
+      code: dist.code,
+      commission_rate: dist.commission_rate,
+      order_count: parseInt(stats.order_count),
+      total_commission: parseFloat(stats.total_commission),
+      settled_commission: parseFloat(stats.settled_commission),
+      pending_commission: parseFloat(stats.total_commission) - parseFloat(stats.settled_commission),
+    })
+  } catch(e) { fail(res, e.message) }
+})
+
+// 分销商自己的订单明细
+app.get('/miniapi/distributor/orders', miniAuth, async (req, res) => {
+  try {
+    const dist = (await pool.query(`SELECT code FROM distributors WHERE user_id=$1 AND status=1 LIMIT 1`, [req.miniUser.id])).rows[0]
+    if (!dist) return fail(res, '非分销商')
+    const { page = 1, list_rows = 20 } = req.query
+    const offset = (parseInt(page)-1)*parseInt(list_rows)
+    const total = parseInt((await pool.query(
+      `SELECT COUNT(*) FROM mini_orders WHERE distributor_code=$1 AND status!=4 AND deleted_at IS NULL`, [dist.code]
+    )).rows[0].count)
+    const rows = (await pool.query(
+      `SELECT id, order_no, total_amount, commission, status, created_at FROM mini_orders
+       WHERE distributor_code=$1 AND status!=4 AND deleted_at IS NULL
+       ORDER BY id DESC LIMIT $2 OFFSET $3`,
+      [dist.code, parseInt(list_rows), offset]
+    )).rows
+    return ok(res, { total, rows })
+  } catch(e) { fail(res, e.message) }
+})
+
+// ERP后台 — 分销商列表
+app.get('/adminapi/distributor/list', auth, async (req, res) => {
+  try {
+    const { status, page = 1, list_rows = 20 } = req.query
+    const offset = (parseInt(page)-1)*parseInt(list_rows)
+    const where = status !== undefined ? `WHERE status=${parseInt(status)}` : ''
+    const total = parseInt((await pool.query(`SELECT COUNT(*) FROM distributors ${where}`)).rows[0].count)
+    const rows = (await pool.query(
+      `SELECT d.*,
+        (SELECT COUNT(*) FROM mini_orders WHERE distributor_code=d.code AND status!=4 AND deleted_at IS NULL) as order_count,
+        COALESCE((SELECT SUM(commission) FROM mini_orders WHERE distributor_code=d.code AND status!=4 AND deleted_at IS NULL),0) as total_commission
+       FROM distributors d ${where} ORDER BY d.id DESC LIMIT $1 OFFSET $2`,
+      [parseInt(list_rows), offset]
+    )).rows
+    return ok(res, { total, rows })
+  } catch(e) { fail(res, e.message) }
+})
+
+// ERP后台 — 审批通过
+app.post('/adminapi/distributor/approve', auth, async (req, res) => {
+  try {
+    const { id, commission_rate = 10, note = '' } = req.body
+    if (!id) return fail(res, 'id必填')
+    const dist = (await pool.query(`SELECT * FROM distributors WHERE id=$1 LIMIT 1`, [id])).rows[0]
+    if (!dist) return fail(res, '不存在')
+    // 生成唯一分销码
+    const code = dist.code || `D${String(id).padStart(4,'0')}`
+    await pool.query(
+      `UPDATE distributors SET status=1, code=$1, commission_rate=$2, note=$3, approved_at=NOW() WHERE id=$4`,
+      [code, parseFloat(commission_rate), note, id]
+    )
+    return ok(res, { code })
+  } catch(e) { fail(res, e.message) }
+})
+
+// ERP后台 — 拒绝
+app.post('/adminapi/distributor/reject', auth, async (req, res) => {
+  try {
+    const { id, note = '' } = req.body
+    if (!id) return fail(res, 'id必填')
+    await pool.query(`UPDATE distributors SET status=2, note=$1 WHERE id=$2`, [note, id])
+    return ok(res)
+  } catch(e) { fail(res, e.message) }
+})
+
+// ERP后台 — 修改佣金比例
+app.post('/adminapi/distributor/edit', auth, async (req, res) => {
+  try {
+    const { id, commission_rate } = req.body
+    if (!id) return fail(res, 'id必填')
+    await pool.query(`UPDATE distributors SET commission_rate=$1 WHERE id=$2`, [parseFloat(commission_rate), id])
+    return ok(res)
+  } catch(e) { fail(res, e.message) }
 })
 
 // ─── 小程序订单管理（ERP后台用，使用adminapi auth）─────────────────────────────

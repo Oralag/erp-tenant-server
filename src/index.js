@@ -3836,11 +3836,17 @@ app.post('/miniapi/order/create', miniAuth, async (req, res) => {
       let distCode = '', distCommission = 0
       if (distributor_code) {
         const distRow = (await client.query(
-          `SELECT code, commission_rate FROM distributors WHERE code=$1 AND status=1 LIMIT 1`, [distributor_code]
+          `SELECT d.code, cl.commission_rate
+           FROM distributors d
+           LEFT JOIN sale_customers c ON c.mobile=d.phone AND c.deleted_at IS NULL
+           LEFT JOIN customer_levels cl ON cl.name=c.level_name
+           WHERE d.code=$1 AND d.status=1 LIMIT 1`, [distributor_code]
         )).rows[0]
         if (distRow) {
           distCode = distRow.code
-          distCommission = Math.round(serverTotal * parseFloat(distRow.commission_rate) / 100 * 100) / 100
+          // 优先用等级的实时佣金率，等级未设置则用 distributors 表里的静态值
+          const rate = distRow.commission_rate != null ? parseFloat(distRow.commission_rate) : 0
+          distCommission = Math.round(serverTotal * rate / 100 * 100) / 100
         }
       }
 

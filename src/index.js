@@ -6253,26 +6253,6 @@ app.get('/miniapi/config/tmpl-ids', (req, res) => {
   })
 })
 
-// ─── DEV TEST (临时端点，测完删除) ───────────────────────────────────────────
-app.post('/miniapi/dev/seed-test-order', async (req, res) => {
-  if (process.env.NODE_ENV === 'production' && !process.env.ALLOW_SEED) return fail(res, 'disabled')
-  const jwt = require('jsonwebtoken')
-  try {
-    const u = (await pool.query(
-      `INSERT INTO mini_users (openid, name) VALUES ('dev_test_openid', '测试用户')
-       ON CONFLICT (openid) DO UPDATE SET name='测试用户' RETURNING id`
-    )).rows[0]
-    const o = (await pool.query(
-      `INSERT INTO mini_orders (user_id, order_no, status, total_amount, address, remark, paid_at)
-       VALUES ($1, 'TEST'||extract(epoch from now())::bigint, 2, 99.00, '{"name":"测试","phone":"13800138000","province":"内蒙古","city":"呼和浩特","district":"回民区","detail":"测试街道1号"}', '测试订单', NOW())
-       RETURNING id, order_no`,
-      [u.id]
-    )).rows[0]
-    const token = jwt.sign({ id: u.id, openid: 'dev_test_openid' }, process.env.MINI_JWT_SECRET || 'mini_secret_2024', { expiresIn: '2h' })
-    ok(res, { user_id: u.id, order_id: o.id, order_no: o.order_no, token })
-  } catch(e) { fail(res, e.message) }
-})
-
 // ─── 404 fallback ───────────────────────────────────────────────────────────
 app.use((req, res) => {
   res.status(404).json({ code: 0, message: `路由不存在: ${req.method} ${req.path}` })

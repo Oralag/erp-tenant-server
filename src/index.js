@@ -4013,6 +4013,21 @@ app.post('/miniapi/order/confirm', miniAuth, async (req, res) => {
     await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS commission NUMERIC(8,2) DEFAULT 0`)
     await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS commission_settled BOOLEAN DEFAULT FALSE`)
     await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS confirmed_at TIMESTAMPTZ`)
+    // 客户等级价格表
+    await pool.query(`CREATE TABLE IF NOT EXISTS customer_levels (
+      id SERIAL PRIMARY KEY,
+      name VARCHAR(50) NOT NULL,
+      discount NUMERIC(5,2) DEFAULT 100,
+      sort INT DEFAULT 0,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )`)
+    await pool.query(`CREATE TABLE IF NOT EXISTS customer_level_prices (
+      id SERIAL PRIMARY KEY,
+      level_id INT NOT NULL,
+      goods_id INT NOT NULL,
+      level_price NUMERIC(10,2) NOT NULL DEFAULT 0,
+      UNIQUE(level_id, goods_id)
+    )`)
   } catch(e) { console.log('distributor init:', e.message) }
 })()
 
@@ -4101,6 +4116,117 @@ app.get('/adminapi/distributor/list', auth, async (req, res) => {
       [parseInt(list_rows), offset]
     )).rows
     return ok(res, { total, rows })
+  } catch(e) { fail(res, e.message) }
+})
+
+// ─── 客户等级 & 等级价格 ──────────────────────────────────────────────────────
+
+// 等级列表
+app.get('/adminapi/customer-level/list', auth, async (req, res) => {
+  try {
+    const rows = (await pool.query(`SELECT * FROM customer_levels ORDER BY sort ASC, id ASC`)).rows
+    return ok(res, rows)
+  } catch(e) { fail(res, e.message) }
+})
+
+// 新增等级
+app.post('/adminapi/customer-level/add', auth, async (req, res) => {
+  try {
+    const { name, discount = 100, sort = 0 } = req.body
+    if (!name) return fail(res, '名称必填')
+    const r = (await pool.query(
+      `INSERT INTO customer_levels (name, discount, sort) VALUES ($1,$2,$3) RETURNING *`,
+      [name, parseFloat(discount), parseInt(sort)]
+    )).rows[0]
+    return ok(res, r)
+  } catch(e) { fail(res, e.message) }
+})
+
+// 编辑等级
+app.post('/adminapi/customer-level/edit', auth, async (req, res) => {
+  try {
+    const { id, name, discount, sort } = req.body
+    if (!id) return fail(res, 'id必填')
+    const r = (await pool.query(
+      `UPDATE customer_levels SET name=COALESCE($1,name), discount=COALESCE($2,discount), sort=COALESCE($3,sort) WHERE id=$4 RETURNING *`,
+      [name, discount != null ? parseFloat(discount) : null, sort != null ? parseInt(sort) : null, id]
+    )).rows[0]
+    return ok(res, r)
+  } catch(e) { fail(res, e.message) }
+})
+
+// 删除等级
+app.post('/adminapi/customer-level/del', auth, async (req, res) => {
+  try {
+    const { id } = req.body
+    await pool.query(`DELETE FROM customer_levels WHERE id=$1`, [id])
+    await pool.query(`DELETE FROM customer_level_prices WHERE level_id=$1`, [id])
+    return ok(res)
+  } catch(e) { fail(res, e.message) }
+})
+
+// 查某等级的所有商品价格
+app.get('/adminapi/customer-level/prices', auth, async (req, res) => {
+  try {
+    const { level_id } = req.query
+    if (!level_id) return fail(res, 'level_id必填')
+    const rows = (await pool.query(
+      `SELECT p.*, g.goods_name, g.goods_sn, g.unit_name, g.sell_price
+       FROM customer_level_prices p
+       LEFT JOIN goods g ON g.id=p.goods_id
+       WHERE p.level_id=$1 ORDER BY p.id ASC`,
+      [level_id]
+    )).rows
+    return ok(res, rows)
+  } catch(e) { fail(res, e.message) }
+})
+
+// 批量保存等级商品价格（upsert）
+app.post('/adminapi/customer-level/prices/save', auth, async (req, res) => {
+  try {
+    const { level_id, goods_id, level_price } = req.body
+    if (!level_id || !goods_id) return fail(res, '参数缺失')
+    await pool.query(
+      `INSERT INTO customer_level_prices (level_id, goods_id, level_price)
+       VALUES ($1,$2,$3)
+       ON CONFLICT (level_id, goods_id) DO UPDATE SET level_price=$3`,
+      [level_id, goods_id, parseFloat(level_price)]
+    )
+    return ok(res)
+  } catch(e) { fail(res, e.message) }
+})
+
+// 删除等级某商品价格
+app.post('/adminapi/customer-level/prices/del', auth, async (req, res) => {
+  try {
+    const { level_id, goods_id } = req.body
+    await pool.query(`DELETE FROM customer_level_prices WHERE level_id=$1 AND goods_id=$2`, [level_id, goods_id])
+    return ok(res)
+  } catch(e) { fail(res, e.message) }
+})
+
+// 小程序用：根据用户openid获取其等级价格表
+app.get('/miniapi/level-prices', miniAuth, async (req, res) => {
+  try {
+    const customer = (await pool.query(
+      `SELECT c.level_name FROM sale_customers c
+       JOIN mini_users u ON u.phone=c.mobile
+       WHERE u.id=$1 AND c.deleted_at IS NULL LIMIT 1`,
+      [req.miniUser.id]
+    )).rows[0]
+    if (!customer) return ok(res, {})
+    const level = (await pool.query(
+      `SELECT id FROM customer_levels WHERE name=$1 LIMIT 1`,
+      [customer.level_name]
+    )).rows[0]
+    if (!level) return ok(res, {})
+    const prices = (await pool.query(
+      `SELECT goods_id, level_price FROM customer_level_prices WHERE level_id=$1`,
+      [level.id]
+    )).rows
+    const map: Record<number, number> = {}
+    for (const p of prices) map[p.goods_id] = parseFloat(p.level_price)
+    return ok(res, map)
   } catch(e) { fail(res, e.message) }
 })
 

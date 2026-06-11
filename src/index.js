@@ -128,6 +128,7 @@ async function migrateMultiTenant() {
     'prepay_record',
     'retail_orders','retail_members','retail_recharge','retail_stores',
     'depts','roles','jobs','operation_logs','sys_params',
+    'company_info',
   ]
   for (const t of tables) {
     await pool.query(`ALTER TABLE IF EXISTS ${t} ADD COLUMN IF NOT EXISTS shop_id INTEGER NOT NULL DEFAULT 1`).catch(() => {})
@@ -3112,10 +3113,11 @@ router.post('/setting/jobs/del', async (req, res) => {
 // setting/company
 router.get('/setting/company/detail', async (req, res) => {
   try {
-    const r = await pool.query('SELECT * FROM company_info LIMIT 1')
+    const sid = getShopId(req)
+    const r = await pool.query('SELECT * FROM company_info WHERE shop_id=$1 LIMIT 1', [sid])
     if (!r.rows[0]) {
-      await pool.query("INSERT INTO company_info (name) VALUES ('我的公司')")
-      const r2 = await pool.query('SELECT * FROM company_info LIMIT 1')
+      await pool.query("INSERT INTO company_info (name, shop_id) VALUES ('我的公司', $1)", [sid])
+      const r2 = await pool.query('SELECT * FROM company_info WHERE shop_id=$1 LIMIT 1', [sid])
       return ok(res, r2.rows[0])
     }
     return ok(res, r.rows[0])
@@ -3123,23 +3125,19 @@ router.get('/setting/company/detail', async (req, res) => {
 })
 router.post('/setting/company/edit', async (req, res) => {
   try {
-    const { id, ...rest } = req.body
+    const sid = getShopId(req)
+    const { id, shop_id: _s, ...rest } = req.body
     const cols = Object.keys(rest).filter(k => rest[k] !== undefined)
     if (!cols.length) return fail(res, '无有效字段')
     const sets = cols.map((k,i) => `${k}=$${i+1}`)
     const vals = cols.map(k => rest[k])
-    if (id) {
-      await pool.query(`UPDATE company_info SET ${sets.join(',')} WHERE id=$${vals.length+1}`, [...vals, id])
+    const existing = await pool.query('SELECT id FROM company_info WHERE shop_id=$1 LIMIT 1', [sid])
+    if (existing.rows[0]) {
+      await pool.query(`UPDATE company_info SET ${sets.join(',')} WHERE id=$${vals.length+1} AND shop_id=$${vals.length+2}`, [...vals, existing.rows[0].id, sid])
     } else {
-      // upsert on first record
-      const existing = await pool.query('SELECT id FROM company_info LIMIT 1')
-      if (existing.rows[0]) {
-        await pool.query(`UPDATE company_info SET ${sets.join(',')} WHERE id=$${vals.length+1}`, [...vals, existing.rows[0].id])
-      } else {
-        await pool.query(`INSERT INTO company_info (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)})`, vals)
-      }
+      await pool.query(`INSERT INTO company_info (${cols.join(',')}, shop_id) VALUES (${cols.map((_,i)=>`$${i+1}`)}, $${cols.length+1})`, [...vals, sid])
     }
-    const r = await pool.query('SELECT * FROM company_info LIMIT 1')
+    const r = await pool.query('SELECT * FROM company_info WHERE shop_id=$1 LIMIT 1', [sid])
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })

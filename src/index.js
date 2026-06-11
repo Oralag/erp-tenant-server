@@ -112,6 +112,7 @@ async function migrateMultiTenant() {
     )
   `)
   await pool.query(`INSERT INTO shops (id, name) VALUES (1, '默认公司') ON CONFLICT (id) DO NOTHING`)
+  await pool.query(`SELECT setval('shops_id_seq', GREATEST(1, (SELECT MAX(id) FROM shops)))`).catch(() => {})
 
   // admins 加 shop_id
   await pool.query(`ALTER TABLE admins ADD COLUMN IF NOT EXISTS shop_id INTEGER NOT NULL DEFAULT 1`)

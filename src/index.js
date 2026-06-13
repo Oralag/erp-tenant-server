@@ -3540,6 +3540,34 @@ router.post('/stock/SaleExchangeOrder/audit', async (req, res) => {
       }
     }
 
+    // 应收账款处理
+    const diffAmount = parseFloat(order.diff_amount) || 0
+    if (isAudit) {
+      // 审核：差价 > 0 则客户需补款，生成应收记录
+      if (diffAmount > 0) {
+        const rec = await pool.query(
+          `INSERT INTO finance_receivable (customer_id, customer_name, order_sn, total_amount, paid_amount, un_pay_amount, due_date, status, shop_id)
+           VALUES ($1,$2,$3,$4,0,$4,null,0,$5) RETURNING id`,
+          [order.customer_id || 0, order.customer_name || '', orderNo, diffAmount, shopId]
+        )
+        await pool.query('UPDATE sale_exchange_order SET receivable_id=$1 WHERE id=$2', [rec.rows[0].id, id])
+      } else if (diffAmount < 0) {
+        // 差价 < 0 表示应退客户：生成一条负向应收（金额为绝对值，标注为换货退款）
+        const rec = await pool.query(
+          `INSERT INTO finance_receivable (customer_id, customer_name, order_sn, total_amount, paid_amount, un_pay_amount, due_date, status, remark, shop_id)
+           VALUES ($1,$2,$3,$4,0,$4,null,0,'换货退款',$5) RETURNING id`,
+          [order.customer_id || 0, order.customer_name || '', orderNo, Math.abs(diffAmount), shopId]
+        )
+        await pool.query('UPDATE sale_exchange_order SET receivable_id=$1 WHERE id=$2', [rec.rows[0].id, id])
+      }
+    } else {
+      // 反审核：删除审核时创建的应收记录
+      if (order.receivable_id) {
+        await pool.query('DELETE FROM finance_receivable WHERE id=$1 AND shop_id=$2', [order.receivable_id, shopId])
+        await pool.query('UPDATE sale_exchange_order SET receivable_id=0 WHERE id=$1', [id])
+      }
+    }
+
     await pool.query('UPDATE sale_exchange_order SET status=$1 WHERE id=$2 AND shop_id=$3', [newStatus, id, shopId])
     return ok(res)
   } catch (e) { console.error('[SaleExchangeOrder audit error]', e.message); fail(res, e.message) }
@@ -3566,6 +3594,7 @@ async function migrateSaleExchangeOrder() {
       freight_amount NUMERIC(12,2) DEFAULT 0,
       freight_bearer VARCHAR(20) DEFAULT 'seller',
       expense_amount NUMERIC(12,2) DEFAULT 0,
+      receivable_id INTEGER DEFAULT 0,
       reason TEXT DEFAULT '',
       remark TEXT DEFAULT '',
       status INTEGER DEFAULT 0,
@@ -3577,7 +3606,8 @@ async function migrateSaleExchangeOrder() {
   await pool.query(`ALTER TABLE sale_exchange_order
     ADD COLUMN IF NOT EXISTS freight_amount NUMERIC(12,2) DEFAULT 0,
     ADD COLUMN IF NOT EXISTS freight_bearer VARCHAR(20) DEFAULT 'seller',
-    ADD COLUMN IF NOT EXISTS expense_amount NUMERIC(12,2) DEFAULT 0
+    ADD COLUMN IF NOT EXISTS expense_amount NUMERIC(12,2) DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS receivable_id INTEGER DEFAULT 0
   `).catch(() => {})
 }
 

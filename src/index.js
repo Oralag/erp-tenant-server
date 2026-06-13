@@ -2200,6 +2200,7 @@ router.post('/procure/ProcureInhouse/audit', async (req, res) => {
     const { id, status } = req.body
     if (!id) return fail(res, 'id不能为空')
     const newStatus = status ?? 1
+    const piShopId = parseInt(req.admin?.shop_id) || 1
 
     // 查入库单
     const inhouseR = await pool.query('SELECT * FROM procure_inhouse WHERE id=$1 AND shop_id=$2', [id, piShopId])
@@ -2208,7 +2209,6 @@ router.post('/procure/ProcureInhouse/audit', async (req, res) => {
 
     const prevStatus = inhouse.status
     // 状态无变化，直接返回
-    const piShopId = parseInt(req.admin?.shop_id) || 1
     if (prevStatus === newStatus) { await pool.query('UPDATE procure_inhouse SET status=$1 WHERE id=$2 AND shop_id=$3', [newStatus, id, piShopId]); return ok(res) }
 
     let goodsInfo = []

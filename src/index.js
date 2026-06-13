@@ -3439,6 +3439,139 @@ app.post('/browser', async (req, res) => {
 
 // ─── start ──────────────────────────────────────────────────────────────────
 
+// SaleExchangeOrder
+router.get('/stock/SaleExchangeOrder/index', async (req, res) => {
+  try {
+    const { page, list_rows, offset } = pageParams(req.query)
+    const conditions = ['deleted_at IS NULL']
+    if (req.query.status !== undefined && req.query.status !== '') conditions.push(`status=${parseInt(req.query.status)}`)
+    if (req.query.customer_name) conditions.push(`customer_name ILIKE '%${req.query.customer_name.replace(/'/g,"''")}%'`)
+    await listQuery(res, 'sale_exchange_order', { keyword: req.query.keyword, keywordCols: ['order_no', 'customer_name'], baseWhere: shopBase(req, conditions.join(' AND ')), orderBy: 'id DESC', page, list_rows, offset })
+  } catch (e) { fail(res, e.message) }
+})
+router.post('/stock/SaleExchangeOrder/add', async (req, res) => {
+  try {
+    const b = filterBodyCols('sale_exchange_order', { order_no: genOrderNo('HH'), ...req.body, shop_id: parseInt(req.admin?.shop_id) || 1 })
+    const cols = Object.keys(b).filter(k => b[k] !== undefined)
+    const vals = cols.map(k => typeof b[k] === 'object' ? JSON.stringify(b[k]) : b[k])
+    const r = await pool.query(`INSERT INTO sale_exchange_order (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
+    return ok(res, r.rows[0])
+  } catch (e) { fail(res, e.message) }
+})
+router.post('/stock/SaleExchangeOrder/edit', async (req, res) => {
+  try {
+    const { id, ...rawRest } = req.body
+    if (!id) return fail(res, 'id不能为空')
+    const rest = filterBodyCols('sale_exchange_order', rawRest)
+    const cols = Object.keys(rest).filter(k => rest[k] !== undefined)
+    if (!cols.length) return fail(res, '无有效字段')
+    const sets = cols.map((k, i) => `${k}=$${i+1}`)
+    const vals = cols.map(k => typeof rest[k] === 'object' ? JSON.stringify(rest[k]) : rest[k])
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    const r = await pool.query(`UPDATE sale_exchange_order SET ${sets.join(',')} WHERE id=$${vals.length+1} AND shop_id=$${vals.length+2} RETURNING *`, [...vals, id, shopId])
+    return ok(res, r.rows[0])
+  } catch (e) { fail(res, e.message) }
+})
+router.post('/stock/SaleExchangeOrder/del', async (req, res) => {
+  try {
+    const { id } = req.body
+    if (!id) return fail(res, 'id不能为空')
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    await pool.query('UPDATE sale_exchange_order SET deleted_at=NOW() WHERE id=$1 AND shop_id=$2', [id, shopId])
+    return ok(res)
+  } catch (e) { fail(res, e.message) }
+})
+router.post('/stock/SaleExchangeOrder/audit', async (req, res) => {
+  try {
+    const { id, status } = req.body
+    if (!id) return fail(res, 'id不能为空')
+    const newStatus = status ?? 1
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    const r = await pool.query('SELECT * FROM sale_exchange_order WHERE id=$1 AND shop_id=$2', [id, shopId])
+    const order = r.rows[0]
+    if (!order) return fail(res, '换货单不存在')
+    if (order.status === newStatus) return ok(res)
+
+    let returnGoods = []
+    let exchangeGoods = []
+    try { returnGoods = typeof order.return_goods_info === 'string' ? JSON.parse(order.return_goods_info) : (order.return_goods_info || []) } catch {}
+    try { exchangeGoods = typeof order.exchange_goods_info === 'string' ? JSON.parse(order.exchange_goods_info) : (order.exchange_goods_info || []) } catch {}
+
+    const warehouseId = order.warehouse_id || 0
+    const warehouseName = order.warehouse_name || ''
+    const orderNo = order.order_no || ''
+    const isAudit = newStatus === 1
+
+    // 退货商品：审核时入库(+1)，反审核时出库(-1)
+    for (const item of returnGoods) {
+      const goodsId = item.goods_id || 0
+      if (!goodsId) continue
+      const num = parseFloat(item.num) || 0
+      if (num <= 0) continue
+      const change = isAudit ? num : -num
+      const existing = await pool.query('SELECT * FROM stock_inventory WHERE goods_id=$1 AND warehouse_id=$2', [goodsId, warehouseId])
+      if (existing.rows.length > 0) {
+        const beforeQty = parseFloat(existing.rows[0].qty) || 0
+        const afterQty = Math.max(0, beforeQty + change)
+        await pool.query('UPDATE stock_inventory SET qty=$1, goods_name=$2, unit_name=$3, update_time=NOW() WHERE goods_id=$4 AND warehouse_id=$5', [afterQty, item.goods_name || '', item.unit_name || '', goodsId, warehouseId])
+        await pool.query('INSERT INTO stock_flow (goods_id, goods_name, warehouse_id, warehouse_name, type, qty, before_qty, after_qty, order_no, remark) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)',
+          [goodsId, item.goods_name || '', warehouseId, warehouseName, isAudit ? 'exchange_return_in' : 'exchange_return_in_reverse', change, beforeQty, afterQty, orderNo, isAudit ? '换货退入审核' : '换货退入反审核'])
+      } else if (isAudit && warehouseId) {
+        await pool.query('INSERT INTO stock_inventory (goods_id, goods_name, goods_code, unit_name, warehouse_id, warehouse_name, qty) VALUES ($1,$2,$3,$4,$5,$6,$7)', [goodsId, item.goods_name || '', item.goods_sn || '', item.unit_name || '', warehouseId, warehouseName, num])
+        await pool.query('INSERT INTO stock_flow (goods_id, goods_name, warehouse_id, warehouse_name, type, qty, before_qty, after_qty, order_no, remark) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)',
+          [goodsId, item.goods_name || '', warehouseId, warehouseName, 'exchange_return_in', num, 0, num, orderNo, '换货退入审核'])
+      }
+    }
+
+    // 换出商品：审核时出库(-1)，反审核时入库(+1)
+    for (const item of exchangeGoods) {
+      const goodsId = item.goods_id || 0
+      if (!goodsId) continue
+      const num = parseFloat(item.num) || 0
+      if (num <= 0) continue
+      const change = isAudit ? -num : num
+      const existing = await pool.query('SELECT * FROM stock_inventory WHERE goods_id=$1 AND warehouse_id=$2', [goodsId, warehouseId])
+      if (existing.rows.length > 0) {
+        const beforeQty = parseFloat(existing.rows[0].qty) || 0
+        const afterQty = Math.max(0, beforeQty + change)
+        await pool.query('UPDATE stock_inventory SET qty=$1, goods_name=$2, unit_name=$3, update_time=NOW() WHERE goods_id=$4 AND warehouse_id=$5', [afterQty, item.goods_name || '', item.unit_name || '', goodsId, warehouseId])
+        await pool.query('INSERT INTO stock_flow (goods_id, goods_name, warehouse_id, warehouse_name, type, qty, before_qty, after_qty, order_no, remark) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)',
+          [goodsId, item.goods_name || '', warehouseId, warehouseName, isAudit ? 'exchange_out' : 'exchange_out_reverse', change, beforeQty, afterQty, orderNo, isAudit ? '换货发出审核' : '换货发出反审核'])
+      }
+    }
+
+    await pool.query('UPDATE sale_exchange_order SET status=$1 WHERE id=$2 AND shop_id=$3', [newStatus, id, shopId])
+    return ok(res)
+  } catch (e) { console.error('[SaleExchangeOrder audit error]', e.message); fail(res, e.message) }
+})
+
+async function migrateSaleExchangeOrder() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS sale_exchange_order (
+      id SERIAL PRIMARY KEY,
+      order_no VARCHAR(100) DEFAULT '',
+      shop_id INTEGER NOT NULL DEFAULT 1,
+      customer_id INTEGER DEFAULT 0,
+      customer_name VARCHAR(200) DEFAULT '',
+      contact_name VARCHAR(100) DEFAULT '',
+      admin_name VARCHAR(100) DEFAULT '',
+      warehouse_id INTEGER DEFAULT 0,
+      warehouse_name VARCHAR(100) DEFAULT '',
+      exchange_date VARCHAR(20) DEFAULT '',
+      return_goods_info JSONB DEFAULT '[]',
+      exchange_goods_info JSONB DEFAULT '[]',
+      return_amount NUMERIC(12,2) DEFAULT 0,
+      exchange_amount NUMERIC(12,2) DEFAULT 0,
+      diff_amount NUMERIC(12,2) DEFAULT 0,
+      reason TEXT DEFAULT '',
+      remark TEXT DEFAULT '',
+      status INTEGER DEFAULT 0,
+      created_at TIMESTAMP DEFAULT NOW(),
+      deleted_at TIMESTAMP
+    )
+  `)
+}
+
 async function migrateSaleReturnOrder() {
   await pool.query(`ALTER TABLE sale_return_order
     ADD COLUMN IF NOT EXISTS return_amount NUMERIC(12,2) DEFAULT 0,
@@ -3498,6 +3631,7 @@ async function start() {
   try {
     await initDb()
     await migrateSaleReturnOrder()
+    await migrateSaleExchangeOrder()
     await loadTableCols()
     await migrateMultiTenant()
     console.log('Database ready')

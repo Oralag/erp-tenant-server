@@ -3563,6 +3563,9 @@ async function migrateSaleExchangeOrder() {
       return_amount NUMERIC(12,2) DEFAULT 0,
       exchange_amount NUMERIC(12,2) DEFAULT 0,
       diff_amount NUMERIC(12,2) DEFAULT 0,
+      freight_amount NUMERIC(12,2) DEFAULT 0,
+      freight_bearer VARCHAR(20) DEFAULT 'seller',
+      expense_amount NUMERIC(12,2) DEFAULT 0,
       reason TEXT DEFAULT '',
       remark TEXT DEFAULT '',
       status INTEGER DEFAULT 0,
@@ -3570,6 +3573,12 @@ async function migrateSaleExchangeOrder() {
       deleted_at TIMESTAMP
     )
   `)
+  // 已有表补列
+  await pool.query(`ALTER TABLE sale_exchange_order
+    ADD COLUMN IF NOT EXISTS freight_amount NUMERIC(12,2) DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS freight_bearer VARCHAR(20) DEFAULT 'seller',
+    ADD COLUMN IF NOT EXISTS expense_amount NUMERIC(12,2) DEFAULT 0
+  `).catch(() => {})
 }
 
 async function migrateSaleReturnOrder() {

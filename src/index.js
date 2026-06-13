@@ -3616,7 +3616,9 @@ async function migrateSaleExchangeOrder() {
     ADD COLUMN IF NOT EXISTS receivable_id INTEGER DEFAULT 0,
     ADD COLUMN IF NOT EXISTS fee_items JSONB DEFAULT '[]',
     ADD COLUMN IF NOT EXISTS source_order_id INTEGER DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS source_order_no VARCHAR(100) DEFAULT ''
+    ADD COLUMN IF NOT EXISTS source_order_no VARCHAR(100) DEFAULT '',
+    ADD COLUMN IF NOT EXISTS exchange_source_order_id INTEGER DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS exchange_source_order_no VARCHAR(100) DEFAULT ''
   `).catch(() => {})
 }
 

@@ -3545,7 +3545,10 @@ router.post('/stock/SaleExchangeOrder/audit', async (req, res) => {
     const freightAmount = parseFloat(order.freight_amount) || 0
     const freightBearer = order.freight_bearer || 'seller'
     const buyerFreight = freightBearer === 'buyer' ? freightAmount : freightBearer === 'half' ? freightAmount / 2 : 0
-    const receivableAmount = diffAmount + buyerFreight  // 差价 + 买方运费 = 客户实际应付
+    // fee_items 中 bearer='seller' 表示对方承担，计入应收
+    const feeItems = Array.isArray(order.fee_items) ? order.fee_items : []
+    const sellerFees = feeItems.filter(f => f.bearer === 'seller').reduce((s, f) => s + (parseFloat(f.amount) || 0), 0)
+    const receivableAmount = diffAmount + buyerFreight + sellerFees
     if (isAudit) {
       if (receivableAmount > 0) {
         const rec = await pool.query(

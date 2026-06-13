@@ -3542,21 +3542,24 @@ router.post('/stock/SaleExchangeOrder/audit', async (req, res) => {
 
     // 应收账款处理
     const diffAmount = parseFloat(order.diff_amount) || 0
+    const freightAmount = parseFloat(order.freight_amount) || 0
+    const freightBearer = order.freight_bearer || 'seller'
+    const buyerFreight = freightBearer === 'buyer' ? freightAmount : freightBearer === 'half' ? freightAmount / 2 : 0
+    const receivableAmount = diffAmount + buyerFreight  // 差价 + 买方运费 = 客户实际应付
     if (isAudit) {
-      // 审核：差价 > 0 则客户需补款，生成应收记录
-      if (diffAmount > 0) {
+      if (receivableAmount > 0) {
         const rec = await pool.query(
           `INSERT INTO finance_receivable (customer_id, customer_name, order_sn, total_amount, paid_amount, un_pay_amount, due_date, status, shop_id)
            VALUES ($1,$2,$3,$4,0,$4,null,0,$5) RETURNING id`,
-          [order.customer_id || 0, order.customer_name || '', orderNo, diffAmount, shopId]
+          [order.customer_id || 0, order.customer_name || '', orderNo, receivableAmount, shopId]
         )
         await pool.query('UPDATE sale_exchange_order SET receivable_id=$1 WHERE id=$2', [rec.rows[0].id, id])
-      } else if (diffAmount < 0) {
-        // 差价 < 0 表示应退客户：生成一条负向应收（金额为绝对值，标注为换货退款）
+      } else if (receivableAmount < 0) {
+        // 应退客户：生成带"换货退款"标注的应收记录
         const rec = await pool.query(
           `INSERT INTO finance_receivable (customer_id, customer_name, order_sn, total_amount, paid_amount, un_pay_amount, due_date, status, remark, shop_id)
            VALUES ($1,$2,$3,$4,0,$4,null,0,'换货退款',$5) RETURNING id`,
-          [order.customer_id || 0, order.customer_name || '', orderNo, Math.abs(diffAmount), shopId]
+          [order.customer_id || 0, order.customer_name || '', orderNo, Math.abs(receivableAmount), shopId]
         )
         await pool.query('UPDATE sale_exchange_order SET receivable_id=$1 WHERE id=$2', [rec.rows[0].id, id])
       }
@@ -3607,7 +3610,8 @@ async function migrateSaleExchangeOrder() {
     ADD COLUMN IF NOT EXISTS freight_amount NUMERIC(12,2) DEFAULT 0,
     ADD COLUMN IF NOT EXISTS freight_bearer VARCHAR(20) DEFAULT 'seller',
     ADD COLUMN IF NOT EXISTS expense_amount NUMERIC(12,2) DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS receivable_id INTEGER DEFAULT 0
+    ADD COLUMN IF NOT EXISTS receivable_id INTEGER DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS fee_items JSONB DEFAULT '[]'
   `).catch(() => {})
 }
 

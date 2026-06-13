@@ -485,26 +485,22 @@ router.post('/goods/ShopGoods/edit', async (req, res) => {
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })
-// 安全合并 __brand__ 字段 — 用 jsonb || 在 DB 层合并，绝不覆盖其他字段
+// 安全合并 __brand__ 字段 — 在 JS 层做 merge，避免 remark 非 JSON 时 ::jsonb cast 报错
 router.post('/goods/ShopGoods/patchBrand', auth, async (req, res) => {
   try {
     const { id, brand_fields } = req.body
     if (!id) return fail(res, 'id不能为空')
     if (!brand_fields || typeof brand_fields !== 'object') return fail(res, 'brand_fields必须是对象')
-    // 读出现有 remark，在 DB 层做 jsonb merge
-    const r = await pool.query(`
-      UPDATE goods
-      SET remark = (
-        COALESCE(remark::jsonb, '{}'::jsonb) ||
-        jsonb_build_object('__brand__',
-          COALESCE((remark::jsonb -> '__brand__'), '{}'::jsonb) || $1::jsonb
-        )
-      )::text,
-      update_time = NOW()
-      WHERE id = $2
-      RETURNING id, remark
-    `, [JSON.stringify(brand_fields), id])
-    if (!r.rows[0]) return fail(res, '商品不存在')
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    const existing = await pool.query('SELECT remark FROM goods WHERE id=$1 AND shop_id=$2', [id, shopId])
+    if (!existing.rows[0]) return fail(res, '商品不存在')
+    let remarkObj = {}
+    try { remarkObj = JSON.parse(existing.rows[0].remark || '{}') } catch {}
+    remarkObj.__brand__ = { ...(remarkObj.__brand__ || {}), ...brand_fields }
+    const r = await pool.query(
+      'UPDATE goods SET remark=$1, update_time=NOW() WHERE id=$2 AND shop_id=$3 RETURNING id, remark',
+      [JSON.stringify(remarkObj), id, shopId]
+    )
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })

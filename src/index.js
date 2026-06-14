@@ -3632,7 +3632,9 @@ async function migrateSaleReturnOrder() {
     ADD COLUMN IF NOT EXISTS reason TEXT DEFAULT '',
     ADD COLUMN IF NOT EXISTS order_sn VARCHAR(100) DEFAULT '',
     ADD COLUMN IF NOT EXISTS sale_out_order_id INT DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS level_id INT DEFAULT 0`)
+    ADD COLUMN IF NOT EXISTS level_id INT DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS fund_id INT DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS fund_name VARCHAR(100) DEFAULT ''`)
 }
 
 // 自动确认收货：发货满7天未手动确认的订单自动完成并结算佣金
@@ -3684,6 +3686,8 @@ async function start() {
     await migrateSaleExchangeOrder()
     await loadTableCols()
     await migrateMultiTenant()
+    // 补填历史退货单 fund 信息（一次性，幂等）
+    await pool.query(`UPDATE sale_return_order SET fund_id=58, fund_name='公司收入账号' WHERE id=51 AND fund_id=0`).catch(() => {})
     console.log('Database ready')
     // 每天凌晨2点跑一次自动收货
     const cron = require('node-cron')

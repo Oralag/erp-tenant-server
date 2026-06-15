@@ -2767,6 +2767,7 @@ router.post('/finance/Prepay/del', async (req, res) => {
 
 // retail/order
 router.get('/retail/order/index', async (req, res) => {
+  try { await pool.query(`ALTER TABLE retail_orders ADD COLUMN IF NOT EXISTS fee_items JSONB DEFAULT '[]'`) } catch {}
   try {
     const { page, list_rows, offset } = pageParams(req.query)
     await listQuery(res, 'retail_orders', { keyword: req.query.keyword, keywordCols: ['order_sn','member_name'], baseWhere: shopBase(req, '1=1'), orderBy: 'id DESC', page, list_rows, offset })
@@ -2777,6 +2778,7 @@ router.post('/retail/order/add', async (req, res) => {
     await pool.query(`ALTER TABLE retail_orders ADD COLUMN IF NOT EXISTS discount_amount NUMERIC(12,2) DEFAULT 0`)
     await pool.query(`ALTER TABLE retail_orders ADD COLUMN IF NOT EXISTS store_id INT DEFAULT 0`)
     await pool.query(`ALTER TABLE retail_orders ADD COLUMN IF NOT EXISTS store_name VARCHAR(100) DEFAULT ''`)
+    await pool.query(`ALTER TABLE retail_orders ADD COLUMN IF NOT EXISTS fee_items JSONB DEFAULT '[]'`)
     await loadTableCols()
     const b = filterBodyCols('retail_orders', { order_sn: genOrderNo('LS'), ...req.body, shop_id: parseInt(req.admin?.shop_id) || 1 })
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
@@ -2787,21 +2789,39 @@ router.post('/retail/order/add', async (req, res) => {
 })
 router.post('/retail/order/edit', async (req, res) => {
   try {
-    const { id, goods_info, order_date, member_id, member_name, store_id, store_name, pay_type, remark, total_amount, discount_amount, pay_amount } = req.body
+    const { id, goods_info, order_date, member_id, member_name, store_id, store_name, pay_type, remark, total_amount, discount_amount, pay_amount, fee_items } = req.body
     if (!id) return fail(res, '缺少零售单 ID')
     if (!goods_info) return fail(res, '缺少 goods_info')
     const shopId = parseInt(req.admin?.shop_id) || 1
     const row = await pool.query('SELECT status FROM retail_orders WHERE id=$1 AND shop_id=$2', [id, shopId])
     if (!row.rows.length) return fail(res, '订单不存在')
     if (Number(row.rows[0].status) === 1) return fail(res, '已审核订单不可编辑，请先反审核')
+    await pool.query(`ALTER TABLE retail_orders ADD COLUMN IF NOT EXISTS fee_items JSONB DEFAULT '[]'`)
     const goodsStr = typeof goods_info === 'string' ? goods_info : JSON.stringify(goods_info)
+    const feeStr = fee_items === undefined ? null : (typeof fee_items === 'string' ? fee_items : JSON.stringify(fee_items))
     await pool.query(
       `UPDATE retail_orders SET goods_info=$1, total_amount=$2, discount_amount=$3, pay_amount=$4,
-       order_date=$5, member_id=$6, member_name=$7, store_id=$8, store_name=$9, pay_type=$10, remark=$11
-       WHERE id=$12 AND shop_id=$13`,
+       order_date=$5, member_id=$6, member_name=$7, store_id=$8, store_name=$9, pay_type=$10, remark=$11,
+       fee_items = COALESCE($12::jsonb, fee_items)
+       WHERE id=$13 AND shop_id=$14`,
       [goodsStr, total_amount??0, discount_amount??0, pay_amount??0,
-       order_date||null, member_id||0, member_name||'', store_id||0, store_name||'', pay_type||'cash', remark||'', id, shopId]
+       order_date||null, member_id||0, member_name||'', store_id||0, store_name||'', pay_type||'cash', remark||'', feeStr, id, shopId]
     )
+    const r = await pool.query('SELECT * FROM retail_orders WHERE id=$1 AND shop_id=$2', [id, shopId])
+    return ok(res, r.rows[0])
+  } catch (e) { fail(res, e.message) }
+})
+// 单独保存附加费用：已审核订单也可以改，不触发库存/资金
+router.post('/retail/order/saveFees', async (req, res) => {
+  try {
+    const { id, fee_items } = req.body
+    if (!id) return fail(res, '缺少零售单 ID')
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    const row = await pool.query('SELECT id FROM retail_orders WHERE id=$1 AND shop_id=$2', [id, shopId])
+    if (!row.rows.length) return fail(res, '订单不存在')
+    await pool.query(`ALTER TABLE retail_orders ADD COLUMN IF NOT EXISTS fee_items JSONB DEFAULT '[]'`)
+    const feeStr = typeof fee_items === 'string' ? fee_items : JSON.stringify(fee_items || [])
+    await pool.query('UPDATE retail_orders SET fee_items=$1 WHERE id=$2 AND shop_id=$3', [feeStr, id, shopId])
     const r = await pool.query('SELECT * FROM retail_orders WHERE id=$1 AND shop_id=$2', [id, shopId])
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }

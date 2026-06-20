@@ -4934,13 +4934,25 @@ app.get('/adminapi/wxpay/v3-health', auth, async (req, res) => {
       WX_MCH_PUBLIC_KEY_ID: WX_MCH_PUBLIC_KEY_ID || '未配置',
     }
     // 调微信 /v3/certificates 测签名是否被接受
+    // 公钥模式下此接口返回 404 RESOURCE_NOT_EXISTS 是预期行为（说明微信认证通过，只是不再发证书）
     let signTest = { ok: false }
     try {
       const result = await wxV3Get('/v3/certificates')
-      signTest.ok = result.status === 200
       signTest.status = result.status
-      if (result.status !== 200) signTest.error = result.body
-      else signTest.note = '签名被微信接受，V3 凭证有效'
+      const isPublicKeyMode = result.status === 404 && result.body?.code === 'RESOURCE_NOT_EXISTS'
+      if (result.status === 200) {
+        signTest.ok = true
+        signTest.note = '签名通过，平台已下发证书（证书模式）'
+      } else if (isPublicKeyMode) {
+        signTest.ok = true
+        signTest.note = '签名通过，当前为公钥模式（404 是预期行为）'
+      } else if (result.status === 401) {
+        signTest.error = '签名验证失败，请检查 WX_MCH_PRIVATE_KEY / WX_MCH_CERT_SERIAL'
+        signTest.detail = result.body
+      } else {
+        signTest.error = '未知状态'
+        signTest.detail = result.body
+      }
     } catch (e) {
       signTest.error = e.message
     }

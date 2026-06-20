@@ -4163,8 +4163,13 @@ app.get('/miniapi/goods/detail/:id', async (req, res) => {
 // 创建订单
 app.post('/miniapi/order/create', miniAuth, async (req, res) => {
   try {
-    const { items, address, remark, distributor_code } = req.body
+    const { items, address, remark, distributor_code, delivery_type, store_id } = req.body
+    const deliveryType = parseInt(delivery_type ?? 0)
     if (!items || items.length === 0) return fail(res, '订单不能为空')
+    // 物流/跑腿需要地址；自提不需要
+    if (deliveryType !== 2) {
+      if (!address || !address.name || !address.phone || !address.detail) return fail(res, '请填写收货地址')
+    }
 
     // 服务端重新计算总价，不信任客户端传值
     const goodsIds = items.map(i => i.goods_id).filter(Boolean)
@@ -4264,10 +4269,16 @@ app.post('/miniapi/order/create', miniAuth, async (req, res) => {
         }
       }
 
+      // 自提时查门店信息
+      let storeRow = null
+      if (deliveryType === 2 && store_id) {
+        storeRow = (await client.query(`SELECT id, name, address FROM retail_stores WHERE id=$1 AND status=1`, [parseInt(store_id)])).rows[0]
+      }
+
       const r = await client.query(
-        `INSERT INTO mini_orders (order_no, user_id, total_amount, original_amount, discount, points_used, coupon_id, coupon_deduct, address, remark, distributor_code, commission, status, created_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,0,NOW()) RETURNING *`,
-        [orderNo, req.miniUser.id, serverTotal, originalTotal, discount, usePoints, userCouponId || 0, couponDeduct, JSON.stringify(address || {}), remark || '', distCode, distCommission]
+        `INSERT INTO mini_orders (order_no, user_id, total_amount, original_amount, discount, points_used, coupon_id, coupon_deduct, address, remark, distributor_code, commission, delivery_type, store_id, store_name, store_address, status, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,0,NOW()) RETURNING *`,
+        [orderNo, req.miniUser.id, serverTotal, originalTotal, discount, usePoints, userCouponId || 0, couponDeduct, JSON.stringify(address || {}), remark || '', distCode, distCommission, deliveryType, storeRow?.id || 0, storeRow?.name || '', storeRow?.address || '']
       )
       order = r.rows[0]
 
@@ -4728,9 +4739,21 @@ app.post('/adminapi/distributor/edit', auth, async (req, res) => {
     await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS express_company VARCHAR(50) DEFAULT ''`)
     await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS tracking_no VARCHAR(100) DEFAULT ''`)
     await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS shipped_at TIMESTAMP`)
-    // status: 0=待支付 1=待发货 2=已发货 3=已完成 4=已取消
+    // delivery_type: 0=物流发货 1=跑腿送货 2=自提
+    await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS delivery_type INT DEFAULT 0`)
+    await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS store_id INT DEFAULT 0`)
+    await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS store_name VARCHAR(100) DEFAULT ''`)
+    await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS store_address TEXT DEFAULT ''`)
   } catch(e) { console.log('mini_orders alter:', e.message) }
 })()
+
+// 门店列表（小程序端，无需登录）
+app.get('/miniapi/stores', async (req, res) => {
+  try {
+    const r = await pool.query(`SELECT id, name, address, tel FROM retail_stores WHERE status=1 ORDER BY id ASC`)
+    return ok(res, r.rows)
+  } catch (e) { fail(res, e.message) }
+})
 
 // 订单列表（ERP后台）
 app.get('/adminapi/mini/orders', auth, async (req, res) => {
@@ -4761,12 +4784,17 @@ app.post('/adminapi/mini/order/ship', auth, async (req, res) => {
   try {
     const { order_id, express_company, tracking_no } = req.body
     if (!order_id) return fail(res, '缺少订单ID')
-    if (!tracking_no) return fail(res, '请填写快递单号')
+    // 查订单的配送类型
+    const orderRow = (await pool.query(`SELECT delivery_type FROM mini_orders WHERE id=$1 AND status=1`, [order_id])).rows[0]
+    if (!orderRow) return fail(res, '订单不存在或状态不是待发货')
+    const deliveryType = parseInt(orderRow.delivery_type ?? 0)
+    // 物流发货必须有快递单号
+    if (deliveryType === 0 && !tracking_no) return fail(res, '请填写快递单号')
     const r = await pool.query(
       `UPDATE mini_orders SET status=2, express_company=$1, tracking_no=$2, shipped_at=NOW() WHERE id=$3 AND status=1 RETURNING *`,
-      [express_company || '', tracking_no, order_id]
+      [express_company || '', tracking_no || '', order_id]
     )
-    if (!r.rows[0]) return fail(res, '订单不存在或状态不是待发货')
+    if (!r.rows[0]) return fail(res, '操作失败')
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })

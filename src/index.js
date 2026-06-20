@@ -4103,6 +4103,7 @@ app.get('/miniapi/goods/list', async (req, res) => {
     const goodsIds = pageSlice.map(g => g.id)
     let salesMap = {}
     let reviewMap = {}
+    let stockMap = {}
     if (goodsIds.length) {
       const salesRows = (await pool.query(
         `SELECT i.goods_id, COALESCE(SUM(i.qty),0) as total FROM mini_order_items i JOIN mini_orders o ON o.id=i.order_id WHERE i.goods_id=ANY($1) AND o.status>=1 GROUP BY i.goods_id`,
@@ -4114,12 +4115,18 @@ app.get('/miniapi/goods/list', async (req, res) => {
         [goodsIds]
       )).rows
       revRows.forEach(r => { reviewMap[r.goods_id] = { avg: parseFloat(r.avg), cnt: parseInt(r.cnt) } })
+      const stockRows = (await pool.query(
+        `SELECT goods_id, COALESCE(SUM(qty),0) as total FROM stock_inventory WHERE goods_id=ANY($1) GROUP BY goods_id`,
+        [goodsIds]
+      )).rows
+      stockRows.forEach(r => { stockMap[r.goods_id] = parseInt(r.total) })
     }
     const pageData = pageSlice.map(g => {
       const item = parseBrandGoods(g)
       item.sales_count = (salesMap[g.id] || 0) + item.baseSales
       item.avg_rating = reviewMap[g.id]?.avg || 0
       item.review_count = reviewMap[g.id]?.cnt || 0
+      item.stock = stockMap[g.id] || 0
       return item
     })
     return ok(res, { rows: pageData, total, page: pageNum, list_rows: pageSize })
@@ -4133,8 +4140,7 @@ app.get('/miniapi/goods/detail/:id', async (req, res) => {
     if (!r.rows[0]) return fail(res, '商品不存在')
     const goods = parseBrandGoods(r.rows[0])
     const stock = await pool.query(`SELECT COALESCE(SUM(qty),0) as total FROM stock_inventory WHERE goods_id=$1`, [r.rows[0].id])
-    const actualStock = parseInt(stock.rows[0].total)
-    goods.stock = actualStock > 0 ? actualStock : 999
+    goods.stock = parseInt(stock.rows[0].total)
     // 销量统计
     const salesRow = (await pool.query(
       `SELECT COALESCE(SUM(i.qty),0) as total FROM mini_order_items i JOIN mini_orders o ON o.id=i.order_id WHERE i.goods_id=$1 AND o.status>=1`,

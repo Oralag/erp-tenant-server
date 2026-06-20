@@ -4849,6 +4849,26 @@ app.post('/adminapi/mini/order/ship', auth, async (req, res) => {
   } catch (e) { fail(res, e.message) }
 })
 
+// 自提核销（ERP后台店员操作）：status=2 → 3，标记已被取货
+app.post('/adminapi/mini/order/pickup-confirm', auth, async (req, res) => {
+  try {
+    const { order_id } = req.body
+    if (!order_id) return fail(res, '缺少订单ID')
+    const orderRow = (await pool.query(
+      `SELECT delivery_type, status FROM mini_orders WHERE id=$1 AND deleted_at IS NULL`, [order_id]
+    )).rows[0]
+    if (!orderRow) return fail(res, '订单不存在')
+    if (parseInt(orderRow.delivery_type) !== 2) return fail(res, '仅自提订单可核销')
+    if (orderRow.status !== 2) return fail(res, '订单状态不是已备货，无法核销')
+    const r = await pool.query(
+      `UPDATE mini_orders SET status=3, confirmed_at=NOW() WHERE id=$1 AND status=2 AND delivery_type=2 RETURNING *`,
+      [order_id]
+    )
+    if (!r.rows[0]) return fail(res, '操作失败（可能已被核销）')
+    return ok(res, r.rows[0])
+  } catch (e) { fail(res, e.message) }
+})
+
 // 订单详情（ERP后台）
 app.get('/adminapi/mini/order/:id', auth, async (req, res) => {
   try {

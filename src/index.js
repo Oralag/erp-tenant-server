@@ -4275,6 +4275,28 @@ app.post('/miniapi/order/create', miniAuth, async (req, res) => {
         storeRow = (await client.query(`SELECT id, name, address FROM retail_stores WHERE id=$1 AND status=1`, [parseInt(store_id)])).rows[0]
       }
 
+      // 锁库存 + 校验 + 扣减（防超卖）
+      const stockSnapshot = []
+      for (const item of validItems) {
+        const inv = (await client.query(
+          `SELECT qty, warehouse_id, warehouse_name FROM stock_inventory
+           WHERE goods_id=$1 ORDER BY warehouse_id ASC LIMIT 1 FOR UPDATE`,
+          [item.goods_id]
+        )).rows[0]
+        if (!inv) {
+          const err = new Error(`商品「${item.goods_name}」库存未维护，请联系商家`)
+          err.userMessage = err.message
+          throw err
+        }
+        const before = parseFloat(inv.qty)
+        if (before < item.qty) {
+          const err = new Error(`商品「${item.goods_name}」库存不足，剩余 ${before}`)
+          err.userMessage = err.message
+          throw err
+        }
+        stockSnapshot.push({ ...item, warehouse_id: inv.warehouse_id, warehouse_name: inv.warehouse_name, before })
+      }
+
       const r = await client.query(
         `INSERT INTO mini_orders (order_no, user_id, total_amount, original_amount, discount, points_used, coupon_id, coupon_deduct, address, remark, distributor_code, commission, delivery_type, store_id, store_name, store_address, status, created_at)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,0,NOW()) RETURNING *`,
@@ -4286,6 +4308,20 @@ app.post('/miniapi/order/create', miniAuth, async (req, res) => {
         await client.query(
           `INSERT INTO mini_order_items (order_id, goods_id, goods_name, spec, price, qty) VALUES ($1,$2,$3,$4,$5,$6)`,
           [order.id, item.goods_id, item.goods_name, item.spec, item.price, item.qty]
+        )
+      }
+
+      // 真正扣库存 + 写流水
+      for (const s of stockSnapshot) {
+        const after = s.before - parseFloat(s.qty)
+        await client.query(
+          `UPDATE stock_inventory SET qty=$1, update_time=NOW() WHERE goods_id=$2 AND warehouse_id=$3`,
+          [after, s.goods_id, s.warehouse_id]
+        )
+        await client.query(
+          `INSERT INTO stock_flow (goods_id, goods_name, warehouse_id, warehouse_name, type, qty, before_qty, after_qty, order_no, remark)
+           VALUES ($1,$2,$3,$4,'mini_order',$5,$6,$7,$8,'小程序下单扣减')`,
+          [s.goods_id, s.goods_name, s.warehouse_id, s.warehouse_name || '', -parseFloat(s.qty), s.before, after, orderNo]
         )
       }
 
@@ -4893,6 +4929,16 @@ app.post('/miniapi/pay/notify', async (req, res) => {
           const sign = data.sign
           const { sign: _, ...rest } = data
           if (wxPaySign(rest) === sign) {
+            // 校验金额：防止伪造低额回调
+            const expectedOrder = (await pool.query(`SELECT total_amount FROM mini_orders WHERE order_no=$1 LIMIT 1`, [data.out_trade_no])).rows[0]
+            if (!expectedOrder) {
+              return res.send('<xml><return_code><![CDATA[FAIL]]></return_code><return_msg><![CDATA[ORDER_NOT_FOUND]]></return_msg></xml>')
+            }
+            const expectedFen = Math.round(parseFloat(expectedOrder.total_amount) * 100)
+            if (parseInt(data.total_fee) !== expectedFen) {
+              console.error('[pay/notify] amount mismatch', { order_no: data.out_trade_no, expected: expectedFen, got: data.total_fee })
+              return res.send('<xml><return_code><![CDATA[FAIL]]></return_code><return_msg><![CDATA[AMOUNT_MISMATCH]]></return_msg></xml>')
+            }
             const updOrder = (await pool.query(`UPDATE mini_orders SET status=1, paid_at=NOW(), wx_transaction_id=$2 WHERE order_no=$1 AND status=0 RETURNING *`, [data.out_trade_no, data.transaction_id || ''])).rows[0]
             if (updOrder) {
               if (parseInt(updOrder.coupon_id || 0) > 0) {
@@ -4974,12 +5020,18 @@ function calcLevel(user) {
 async function releaseOrderBenefits(client, order, remark = '订单取消退回') {
   const pointsUsed = parseInt(order.points_used || 0)
   if (pointsUsed > 0) {
-    await client.query(`UPDATE mini_users SET points=COALESCE(points,0)+$1 WHERE id=$2`, [pointsUsed, order.user_id])
-    await client.query(
-      `INSERT INTO mini_points_log (user_id,points,type,remark,order_id,created_at)
-       VALUES ($1,$2,'refund',$3,$4,NOW())`,
-      [order.user_id, pointsUsed, remark, order.id]
-    )
+    // 防重：已经返过积分就不再返
+    const existed = (await client.query(
+      `SELECT id FROM mini_points_log WHERE order_id=$1 AND type='refund' LIMIT 1`, [order.id]
+    )).rows[0]
+    if (!existed) {
+      await client.query(`UPDATE mini_users SET points=COALESCE(points,0)+$1 WHERE id=$2`, [pointsUsed, order.user_id])
+      await client.query(
+        `INSERT INTO mini_points_log (user_id,points,type,remark,order_id,created_at)
+         VALUES ($1,$2,'refund',$3,$4,NOW())`,
+        [order.user_id, pointsUsed, remark, order.id]
+      )
+    }
   }
   const couponId = parseInt(order.coupon_id || 0)
   if (couponId > 0) {
@@ -4989,6 +5041,35 @@ async function releaseOrderBenefits(client, order, remark = '订单取消退回'
        WHERE id=$1 AND user_id=$2 AND order_id=$3 AND status IN (1,3)`,
       [couponId, order.user_id, order.id]
     )
+  }
+  // 回滚库存（防重：检查 stock_flow 是否已存在该订单的回滚记录）
+  const orderNo = order.order_no || ''
+  if (orderNo) {
+    const restored = (await client.query(
+      `SELECT id FROM stock_flow WHERE order_no=$1 AND type='mini_refund' LIMIT 1`, [orderNo]
+    )).rows[0]
+    if (!restored) {
+      const items = (await client.query(`SELECT goods_id, goods_name, qty FROM mini_order_items WHERE order_id=$1`, [order.id])).rows
+      for (const it of items) {
+        if (!it.goods_id || !it.qty) continue
+        const inv = (await client.query(
+          `SELECT qty, warehouse_id, warehouse_name FROM stock_inventory WHERE goods_id=$1 ORDER BY warehouse_id ASC LIMIT 1 FOR UPDATE`,
+          [it.goods_id]
+        )).rows[0]
+        if (!inv) continue
+        const before = parseFloat(inv.qty)
+        const after = before + parseFloat(it.qty)
+        await client.query(
+          `UPDATE stock_inventory SET qty=$1, update_time=NOW() WHERE goods_id=$2 AND warehouse_id=$3`,
+          [after, it.goods_id, inv.warehouse_id]
+        )
+        await client.query(
+          `INSERT INTO stock_flow (goods_id, goods_name, warehouse_id, warehouse_name, type, qty, before_qty, after_qty, order_no, remark)
+           VALUES ($1,$2,$3,$4,'mini_refund',$5,$6,$7,$8,$9)`,
+          [it.goods_id, it.goods_name || '', inv.warehouse_id, inv.warehouse_name || '', parseFloat(it.qty), before, after, orderNo, remark]
+        )
+      }
+    }
   }
 }
 
@@ -5343,7 +5424,10 @@ app.post('/miniapi/review/create', miniAuth, async (req, res) => {
 app.get('/miniapi/review/check', miniAuth, async (req, res) => {
   try {
     const { order_id, goods_id } = req.query
-    const r = (await pool.query(`SELECT id FROM mini_reviews WHERE order_id=$1 AND goods_id=$2 LIMIT 1`, [order_id, goods_id])).rows[0]
+    const r = (await pool.query(
+      `SELECT id FROM mini_reviews WHERE order_id=$1 AND goods_id=$2 AND user_id=$3 LIMIT 1`,
+      [order_id, goods_id, req.miniUser.id]
+    )).rows[0]
     return ok(res, { reviewed: !!r })
   } catch(e) { fail(res, e.message) }
 })
@@ -6431,35 +6515,56 @@ app.post('/miniapi/cart/validate', async (req, res) => {
 
 // 申请退款
 app.post('/miniapi/refund/apply', miniAuth, async (req, res) => {
+  const client = await pool.connect()
   try {
     const { order_id, reason, images = '' } = req.body
     if (!order_id || !reason) return fail(res, '请填写退款原因')
-    const order = (await pool.query(
-      `SELECT id, user_id, total_amount, status FROM mini_orders WHERE id=$1 AND deleted_at IS NULL LIMIT 1`,
+    await client.query('BEGIN')
+    // 锁订单防双击
+    const order = (await client.query(
+      `SELECT id, user_id, total_amount, status FROM mini_orders WHERE id=$1 AND deleted_at IS NULL FOR UPDATE`,
       [order_id]
     )).rows[0]
-    if (!order) return fail(res, '订单不存在')
-    if (order.user_id !== req.miniUser.id) return fail(res, '无权操作')
-    if (order.status === 0) return fail(res, '订单未付款，可直接取消')
-    if (order.status === 4) return fail(res, '订单已取消')
-    if (order.status === 5) return fail(res, '退款申请处理中')
-    const existing = (await pool.query(
+    if (!order) { await client.query('ROLLBACK'); return fail(res, '订单不存在') }
+    if (order.user_id !== req.miniUser.id) { await client.query('ROLLBACK'); return fail(res, '无权操作') }
+    if (order.status === 0) { await client.query('ROLLBACK'); return fail(res, '订单未付款，可直接取消') }
+    if (order.status === 4) { await client.query('ROLLBACK'); return fail(res, '订单已取消') }
+    if (order.status === 5) { await client.query('ROLLBACK'); return fail(res, '退款申请处理中') }
+    const existing = (await client.query(
       `SELECT id, status FROM mini_refunds WHERE order_id=$1 AND status != 2 LIMIT 1`, [order_id]
     )).rows[0]
-    if (existing) return fail(res, existing.status === 0 ? '退款申请处理中' : '退款已完成')
-    await pool.query(
+    if (existing) {
+      await client.query('ROLLBACK')
+      return fail(res, existing.status === 0 ? '退款申请处理中' : '退款已完成')
+    }
+    // 校验：已退累计 + 本次 ≤ 订单总额
+    const refundedSum = parseFloat((await client.query(
+      `SELECT COALESCE(SUM(amount),0) as s FROM mini_refunds WHERE order_id=$1 AND status=1`, [order_id]
+    )).rows[0].s)
+    const remaining = parseFloat(order.total_amount) - refundedSum
+    if (remaining <= 0) {
+      await client.query('ROLLBACK')
+      return fail(res, '该订单已全额退款')
+    }
+    await client.query(
       `INSERT INTO mini_refunds (order_id, user_id, reason, images, amount, status, original_order_status) VALUES ($1,$2,$3,$4,$5,0,$6)`,
-      [order_id, req.miniUser.id, reason, images, order.total_amount, order.status]
+      [order_id, req.miniUser.id, reason, images, remaining, order.status]
     )
-    await pool.query(`UPDATE mini_orders SET status=5 WHERE id=$1`, [order_id])
+    await client.query(`UPDATE mini_orders SET status=5 WHERE id=$1`, [order_id])
+    await client.query('COMMIT')
     const key = process.env.SERVER_JIANG_KEY
     if (key) {
       const title = encodeURIComponent('🔄 新退款申请')
-      const desp = encodeURIComponent(`订单：#${order_id}\n原因：${reason}\n金额：¥${order.total_amount}`)
+      const desp = encodeURIComponent(`订单：#${order_id}\n原因：${reason}\n金额：¥${remaining}`)
       fetch(`https://sctapi.ftqq.com/${key}.send?title=${title}&desp=${desp}`).catch(() => {})
     }
     ok(res, { message: '退款申请已提交' })
-  } catch(e) { fail(res, e.message) }
+  } catch(e) {
+    await client.query('ROLLBACK').catch(() => {})
+    fail(res, e.message)
+  } finally {
+    client.release()
+  }
 })
 
 // 我的退款列表
@@ -6491,18 +6596,20 @@ app.get('/miniapi/refund/order/:order_id', miniAuth, async (req, res) => {
 app.get('/adminapi/refund/list', auth, async (req, res) => {
   try {
     const { status, page = 1 } = req.query
-    const offset = (page - 1) * 20
+    const pageNum = Math.max(1, parseInt(page) || 1)
+    const offset = (pageNum - 1) * 20
     let where = ''
     const params = []
-    if (status !== undefined && status !== '') { where = 'WHERE r.status=$1'; params.push(status) }
+    if (status !== undefined && status !== '') { where = 'WHERE r.status=$1'; params.push(parseInt(status)) }
+    const listParams = [...params, 20, offset]
     const rows = (await pool.query(
       `SELECT r.*, o.order_no, u.name as user_name, u.phone as user_phone
        FROM mini_refunds r
        JOIN mini_orders o ON o.id=r.order_id
        LEFT JOIN mini_users u ON u.id=r.user_id
        ${where}
-       ORDER BY r.created_at DESC LIMIT 20 OFFSET ${offset}`,
-      params
+       ORDER BY r.created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+      listParams
     )).rows
     const total = (await pool.query(
       `SELECT COUNT(*) FROM mini_refunds r ${where}`, params
@@ -6525,7 +6632,6 @@ app.post('/adminapi/refund/handle', auth, async (req, res) => {
     )).rows[0]
     if (!refund) return fail(res, '退款记录不存在')
     if (refund.status !== 0) return fail(res, '该申请已处理')
-    const newStatus = action === 'approve' ? 1 : 2
 
     if (action === 'approve') {
       // 调用微信退款接口
@@ -6540,11 +6646,30 @@ app.post('/adminapi/refund/handle', auth, async (req, res) => {
       if (wxResult.code && wxResult.code !== 'SUCCESS' && !wxResult.skipped) {
         return fail(res, `微信退款失败：${wxResult.message || wxResult.code}`)
       }
-      await pool.query(
-        `UPDATE mini_refunds SET status=1, note=$1, handled_at=NOW(), wx_refund_no=$2 WHERE id=$3`,
-        [note, wxResult.refund_id || refundNo, id]
-      )
-      await pool.query(`UPDATE mini_orders SET status=4 WHERE id=$1`, [refund.order_id])
+      // 同事务：标退款单、改订单状态、回滚积分/券/库存
+      const client = await pool.connect()
+      try {
+        await client.query('BEGIN')
+        await client.query(
+          `UPDATE mini_refunds SET status=1, note=$1, handled_at=NOW(), wx_refund_no=$2 WHERE id=$3`,
+          [note, wxResult.refund_id || refundNo, id]
+        )
+        const fullOrder = (await client.query(
+          `SELECT * FROM mini_orders WHERE id=$1 FOR UPDATE`, [refund.order_id]
+        )).rows[0]
+        if (fullOrder) {
+          await releaseOrderBenefits(client, fullOrder, '退款回滚')
+        }
+        await client.query(`UPDATE mini_orders SET status=4 WHERE id=$1`, [refund.order_id])
+        await client.query('COMMIT')
+      } catch (e) {
+        await client.query('ROLLBACK')
+        // 微信钱已退但DB回滚失败：记日志后人工处理
+        console.error('[refund/handle] DB rollback after wx refund success', e.message, { refund_id: id })
+        return fail(res, '退款已发起但本地回滚失败，请联系管理员')
+      } finally {
+        client.release()
+      }
     } else {
       // 拒绝：还原订单原始状态
       await pool.query(

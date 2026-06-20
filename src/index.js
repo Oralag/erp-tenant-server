@@ -3667,31 +3667,52 @@ async function autoConfirmOrders() {
          AND o.shipped_at < NOW() - INTERVAL '7 days'`
     )).rows
     for (const order of rows) {
+      // 仅自动确认收货，不结算佣金（佣金由 settleEligibleCommissions 7天冷静期后处理）
       await pool.query(`UPDATE mini_orders SET status=3, confirmed_at=NOW() WHERE id=$1`, [order.id])
-      const commission = parseFloat(order.commission || 0)
-      if (order.distributor_code && commission > 0) {
-        try {
-          const dist = (await pool.query(
-            `SELECT d.*, u.openid as dist_openid FROM distributors d
-             JOIN mini_users u ON u.id=d.user_id
-             WHERE d.code=$1 AND d.status=1 LIMIT 1`,
-            [order.distributor_code]
-          )).rows[0]
-          if (dist?.dist_openid) {
-            const result = await transferCommission(order.id, order.order_no, dist.dist_openid, commission)
-            if (!result.skipped) {
-              await pool.query(`UPDATE mini_orders SET commission_settled=true WHERE id=$1`, [order.id])
-            }
-          }
-        } catch (e) {
-          console.error(`auto-settle commission failed for order ${order.order_no}:`, e.message)
-        }
-      }
       console.log(`auto-confirmed order ${order.order_no}`)
     }
     if (rows.length) console.log(`Auto-confirmed ${rows.length} orders`)
   } catch (e) {
     console.error('autoConfirmOrders error:', e.message)
+  }
+}
+
+// 佣金结算：扫描已确认收货满 7 天且未结算的订单，逐个转账
+const COMMISSION_COOLING_DAYS = 7
+async function settleEligibleCommissions() {
+  try {
+    const rows = (await pool.query(
+      `SELECT o.id, o.order_no, o.commission, o.distributor_code
+       FROM mini_orders o
+       WHERE o.status=3
+         AND o.commission_settled=false
+         AND o.commission > 0
+         AND o.distributor_code != ''
+         AND o.confirmed_at IS NOT NULL
+         AND o.confirmed_at < NOW() - INTERVAL '${COMMISSION_COOLING_DAYS} days'
+         AND NOT EXISTS (SELECT 1 FROM mini_refunds WHERE order_id=o.id AND status IN (0,1))`
+    )).rows
+    for (const order of rows) {
+      try {
+        const dist = (await pool.query(
+          `SELECT d.*, u.openid as dist_openid FROM distributors d
+           JOIN mini_users u ON u.id=d.user_id
+           WHERE d.code=$1 AND d.status=1 LIMIT 1`,
+          [order.distributor_code]
+        )).rows[0]
+        if (!dist?.dist_openid) continue
+        const result = await transferCommission(order.id, order.order_no, dist.dist_openid, parseFloat(order.commission))
+        if (!result.skipped) {
+          await pool.query(`UPDATE mini_orders SET commission_settled=true WHERE id=$1`, [order.id])
+          console.log(`commission settled for order ${order.order_no}: ¥${order.commission}`)
+        }
+      } catch (e) {
+        console.error(`settle commission failed for order ${order.order_no}:`, e.message)
+      }
+    }
+    if (rows.length) console.log(`Settled ${rows.length} commissions`)
+  } catch (e) {
+    console.error('settleEligibleCommissions error:', e.message)
   }
 }
 
@@ -3709,9 +3730,10 @@ async function start() {
     // 补填历史退货单 fund 信息（一次性，幂等）
     await pool.query(`UPDATE sale_return_order SET fund_id=58, fund_name='公司收入账号' WHERE id=51 AND fund_id=0`).catch(() => {})
     console.log('Database ready')
-    // 每天凌晨2点跑一次自动收货
+    // 每天凌晨2点自动收货；3点结算冷静期满7天的佣金
     const cron = require('node-cron')
     cron.schedule('0 2 * * *', autoConfirmOrders, { timezone: 'Asia/Shanghai' })
+    cron.schedule('0 3 * * *', settleEligibleCommissions, { timezone: 'Asia/Shanghai' })
   } catch (e) {
     console.error('DB init failed (server still running):', e)
   }
@@ -4436,27 +4458,7 @@ app.post('/miniapi/order/confirm', miniAuth, async (req, res) => {
     if (!order) return fail(res, '订单不存在')
     if (order.status !== 2) return fail(res, '订单未发货，无法确认')
     await pool.query(`UPDATE mini_orders SET status=3, confirmed_at=NOW() WHERE id=$1`, [id])
-    // 自动结算分销佣金
-    const commission = parseFloat(order.commission || 0)
-    if (order.distributor_code && commission > 0) {
-      try {
-        const dist = (await pool.query(
-          `SELECT d.*, u.openid as dist_openid FROM distributors d
-           JOIN mini_users u ON u.id=d.user_id
-           WHERE d.code=$1 AND d.status=1 LIMIT 1`,
-          [order.distributor_code]
-        )).rows[0]
-        if (dist?.dist_openid) {
-          const result = await transferCommission(id, order.order_no, dist.dist_openid, commission)
-          console.log('commission transfer result:', JSON.stringify(result))
-          if (!result.skipped) {
-            await pool.query(`UPDATE mini_orders SET commission_settled=true WHERE id=$1`, [id])
-          }
-        }
-      } catch (e) {
-        console.error('commission transfer error:', e.message)
-      }
-    }
+    // 分销佣金结算延后到冷静期满 7 天，由 settleEligibleCommissions cron 处理
     return ok(res, { id, status: 3 })
   } catch (e) {
     return fail(res, e.message)
@@ -4544,14 +4546,18 @@ app.get('/miniapi/distributor/me', miniAuth, async (req, res) => {
     const dist = (await pool.query(`SELECT * FROM distributors WHERE user_id=$1 LIMIT 1`, [req.miniUser.id])).rows[0]
     if (!dist) return ok(res, null)
     if (dist.status !== 1) return ok(res, { status: dist.status, id: dist.id })
-    // 统计佣金
+    // 统计佣金（排除已取消/退款）
     const stats = (await pool.query(
       `SELECT COUNT(*) as order_count,
               COALESCE(SUM(commission),0) as total_commission,
-              COALESCE(SUM(CASE WHEN status>=3 THEN commission ELSE 0 END),0) as settled_commission
-       FROM mini_orders WHERE distributor_code=$1 AND status!=4 AND deleted_at IS NULL`,
+              COALESCE(SUM(CASE WHEN commission_settled=true THEN commission ELSE 0 END),0) as settled_commission,
+              COALESCE(SUM(CASE WHEN status=3 AND commission_settled=false AND confirmed_at IS NOT NULL THEN commission ELSE 0 END),0) as cooling_commission
+       FROM mini_orders
+       WHERE distributor_code=$1 AND status NOT IN (4,5) AND deleted_at IS NULL`,
       [dist.code]
     )).rows[0]
+    const totalCommission = parseFloat(stats.total_commission)
+    const settledCommission = parseFloat(stats.settled_commission)
     return ok(res, {
       status: dist.status,
       id: dist.id,
@@ -4559,9 +4565,11 @@ app.get('/miniapi/distributor/me', miniAuth, async (req, res) => {
       code: dist.code,
       commission_rate: dist.commission_rate,
       order_count: parseInt(stats.order_count),
-      total_commission: parseFloat(stats.total_commission),
-      settled_commission: parseFloat(stats.settled_commission),
-      pending_commission: parseFloat(stats.total_commission) - parseFloat(stats.settled_commission),
+      total_commission: totalCommission,
+      settled_commission: settledCommission,
+      pending_commission: totalCommission - settledCommission,
+      cooling_commission: parseFloat(stats.cooling_commission), // 冷静期内待结算
+      cooling_days: COMMISSION_COOLING_DAYS,
     })
   } catch(e) { fail(res, e.message) }
 })
@@ -5048,6 +5056,8 @@ async function releaseOrderBenefits(client, order, remark = '订单取消退回'
       [couponId, order.user_id, order.id]
     )
   }
+  // 阻止后续佣金结算（即使冷静期已过，cron 不应再发放）
+  await client.query(`UPDATE mini_orders SET commission_settled=true WHERE id=$1 AND commission_settled=false`, [order.id])
   // 回滚库存（防重：检查 stock_flow 是否已存在该订单的回滚记录）
   const orderNo = order.order_no || ''
   if (orderNo) {

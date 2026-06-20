@@ -3878,6 +3878,8 @@ async function wxV3Get(urlPath) {
     method: 'GET',
     headers: {
       'Accept': 'application/json',
+      'Accept-Language': 'zh-CN',
+      'User-Agent': 'NomadERP/1.0',
       'Authorization': auth,
       'Wechatpay-Serial': WX_MCH_PUBLIC_KEY_ID,
     },

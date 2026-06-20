@@ -3872,6 +3872,20 @@ async function wxV3Post(urlPath, payload) {
   try { return JSON.parse(text) } catch { return { raw: text } }
 }
 
+async function wxV3Get(urlPath) {
+  const auth = wxV3Auth('GET', urlPath, '')
+  const resp = await fetch(`https://api.mch.weixin.qq.com${urlPath}`, {
+    method: 'GET',
+    headers: {
+      'Accept': 'application/json',
+      'Authorization': auth,
+      'Wechatpay-Serial': WX_MCH_PUBLIC_KEY_ID,
+    },
+  })
+  const text = await resp.text()
+  return { status: resp.status, body: (() => { try { return JSON.parse(text) } catch { return text } })() }
+}
+
 async function transferCommission(orderId, orderNo, openid, amountYuan) {
   if (!WX_MCH_PRIVATE_KEY || !WX_MCH_CERT_SERIAL) return { skipped: true, reason: 'not configured' }
   const amountFen = Math.round(amountYuan * 100)
@@ -4902,6 +4916,33 @@ app.post('/adminapi/mini/order/pickup-confirm', auth, async (req, res) => {
     )
     if (!r.rows[0]) return fail(res, '操作失败（可能已被核销）')
     return ok(res, r.rows[0])
+  } catch (e) { fail(res, e.message) }
+})
+
+// V3 支付配置健康检查（管理员用）
+app.get('/adminapi/wxpay/v3-health', auth, async (req, res) => {
+  try {
+    const config = {
+      WX_APPID: !!WX_APPID,
+      WX_MCH_ID: !!WX_MCH_ID,
+      WX_MCH_PRIVATE_KEY: WX_MCH_PRIVATE_KEY ? `配置（${WX_MCH_PRIVATE_KEY.length} chars）` : '未配置',
+      WX_MCH_CERT_SERIAL: WX_MCH_CERT_SERIAL || '未配置',
+      WX_API_V3_KEY: WX_API_V3_KEY ? `配置（${WX_API_V3_KEY.length} chars）` : '未配置',
+      WX_PLATFORM_PUBLIC_KEY: WX_PLATFORM_PUBLIC_KEY ? `配置（${WX_PLATFORM_PUBLIC_KEY.length} chars）` : '未配置',
+      WX_MCH_PUBLIC_KEY_ID: WX_MCH_PUBLIC_KEY_ID || '未配置',
+    }
+    // 调微信 /v3/certificates 测签名是否被接受
+    let signTest = { ok: false }
+    try {
+      const result = await wxV3Get('/v3/certificates')
+      signTest.ok = result.status === 200
+      signTest.status = result.status
+      if (result.status !== 200) signTest.error = result.body
+      else signTest.note = '签名被微信接受，V3 凭证有效'
+    } catch (e) {
+      signTest.error = e.message
+    }
+    return ok(res, { config, signTest })
   } catch (e) { fail(res, e.message) }
 })
 

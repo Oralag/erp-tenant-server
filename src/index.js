@@ -5555,8 +5555,9 @@ app.get('/miniapi/review/list', async (req, res) => {
   } catch(e) { fail(res, e.message) }
 })
 
-// 七牛云上传 token（小程序端）—— 七牛已弃用，接口下线
-app.get('/miniapi/upload/review-token', miniAuth, (_req, res) => fail(res, '七牛云已弃用，请使用 Cloudflare R2 等替代方案'))
+// 七牛云上传 token（小程序端）—— 已迁移到 Cloudflare KV 存储
+// 新方式：小程序直接 POST 到 https://nomaderp.pages.dev/miniapi/upload/review-img
+app.get('/miniapi/upload/review-token', miniAuth, (_req, res) => fail(res, '请升级小程序：评价图片上传已迁移到 /miniapi/upload/review-img'))
 
 // 提交评价（需登录，且该订单包含该商品）
 app.post('/miniapi/review/create', miniAuth, async (req, res) => {
@@ -6163,8 +6164,8 @@ app.post('/adminapi/mini/videos/del', auth, async (req, res) => {
   } catch(e) { fail(res, e.message) }
 })
 
-// 七牛云上传 token（管理端）—— 七牛已弃用，接口下线
-app.get('/adminapi/mini/video-token', auth, (_req, res) => fail(res, '七牛云已弃用，请使用 Cloudflare R2 等替代方案'))
+// 视频上传 token（管理端）—— 七牛已弃用，当前直接把视频文件放进 public/videos/ 随前端 build 部署
+app.get('/adminapi/mini/video-token', auth, (_req, res) => fail(res, '视频请直接放在 public/videos/ 目录随前端部署，或上传到 Cloudflare KV 后引用 /media/<key>'))
 
 // 管理端：发货并推送订阅消息
 app.post('/adminapi/mini/ship', auth, async (req, res) => {

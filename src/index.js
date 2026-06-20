@@ -76,7 +76,10 @@ async function sendSubscribeMsg(openid, tmplId, page, data) {
 const JWT_SECRET = process.env.JWT_SECRET || 'erp_secret_2024'
 
 app.use(cors())
-app.use(express.json())
+// verify 钩子把 raw body 保存到 req.rawBody，供 V3 微信回调验签使用
+app.use(express.json({
+  verify: (req, _res, buf) => { req.rawBody = buf.toString('utf8') }
+}))
 app.use(express.urlencoded({ extended: true }))
 
 // ─── 表列名缓存（启动后加载，写入时自动过滤非法字段）─────────────────────────
@@ -3908,12 +3911,45 @@ async function wxV3Refund(orderNo, transactionId, refundNo, amountYuan, reason) 
   return result
 }
 
-// 微信支付V2签名
+// 微信支付V2签名（保留用于历史兼容；新流程走 V3）
 function wxPaySign(params) {
   const crypto = require('crypto')
   const str = Object.keys(params).filter(k => params[k] !== '' && params[k] !== undefined).sort()
     .map(k => `${k}=${params[k]}`).join('&') + `&key=${WX_MCH_KEY}`
   return crypto.createHash('md5').update(str).digest('hex').toUpperCase()
+}
+
+// V3 平台公钥（用 PEM 格式），用于验回调签名。需在 env 配置 WX_PLATFORM_PUBLIC_KEY
+const WX_PLATFORM_PUBLIC_KEY = (process.env.WX_PLATFORM_PUBLIC_KEY || '').replace(/\\n/g, '\n')
+
+// V3 回调验签：根据微信请求头 + body 校验
+function wxV3VerifyCallback(headers, body) {
+  if (!WX_PLATFORM_PUBLIC_KEY) return { ok: false, reason: 'platform public key not configured' }
+  const crypto = require('crypto')
+  const timestamp = headers['wechatpay-timestamp']
+  const nonce = headers['wechatpay-nonce']
+  const signature = headers['wechatpay-signature']
+  if (!timestamp || !nonce || !signature) return { ok: false, reason: 'missing wechatpay headers' }
+  const message = `${timestamp}\n${nonce}\n${body}\n`
+  const verify = crypto.createVerify('RSA-SHA256')
+  verify.update(message)
+  const ok = verify.verify(WX_PLATFORM_PUBLIC_KEY, signature, 'base64')
+  return { ok, reason: ok ? '' : 'signature mismatch' }
+}
+
+// V3 回调解密 resource（AES-256-GCM）
+function wxV3DecryptResource(resource) {
+  if (!WX_API_V3_KEY) throw new Error('WX_API_V3_KEY not configured')
+  const crypto = require('crypto')
+  const { ciphertext, nonce, associated_data } = resource
+  const buf = Buffer.from(ciphertext, 'base64')
+  const tag = buf.subarray(buf.length - 16)
+  const data = buf.subarray(0, buf.length - 16)
+  const decipher = crypto.createDecipheriv('aes-256-gcm', WX_API_V3_KEY, nonce)
+  decipher.setAuthTag(tag)
+  if (associated_data) decipher.setAAD(Buffer.from(associated_data))
+  const plain = Buffer.concat([decipher.update(data), decipher.final()])
+  return JSON.parse(plain.toString('utf8'))
 }
 
 // 对象转XML
@@ -4893,8 +4929,6 @@ app.post('/miniapi/pay/unified', miniAuth, async (req, res) => {
     const order = r.rows[0]
     if (order.status !== 0) return fail(res, '订单已支付')
 
-    const https = require('https')
-    const nonceStr = Math.random().toString(36).slice(2, 18) + Math.random().toString(36).slice(2, 18)
     const totalFee = Math.round(parseFloat(order.total_amount || order.total || 0) * 100) // 转分
     const notifyUrl = 'https://erp-server-xsji.onrender.com/miniapi/pay/notify'
 
@@ -4910,109 +4944,118 @@ app.post('/miniapi/pay/unified', miniAuth, async (req, res) => {
       return ok(res, { paid: true, orderId: order.id })
     }
 
-    const params = {
+    // V3 JSAPI 下单
+    const wxRes = await wxV3Post('/v3/pay/transactions/jsapi', {
       appid: WX_APPID,
-      mch_id: WX_MCH_ID,
-      nonce_str: nonceStr,
-      body: '数字游牧ERP-商品购买',
+      mchid: WX_MCH_ID,
+      description: '数字游牧ERP-商品购买',
       out_trade_no: order.order_no,
-      total_fee: String(totalFee),
-      spbill_create_ip: req.ip || '127.0.0.1',
       notify_url: notifyUrl,
-      trade_type: 'JSAPI',
-      openid: req.miniUser.openid,
-    }
-    params.sign = wxPaySign(params)
-
-    const xmlBody = toXml(params)
-    const wxRes = await new Promise((resolve, reject) => {
-      const req2 = https.request({ hostname: 'api.mch.weixin.qq.com', path: '/pay/unifiedorder', method: 'POST', headers: { 'Content-Type': 'text/xml', 'Content-Length': Buffer.byteLength(xmlBody) } }, r2 => {
-        let d = ''
-        r2.on('data', c => d += c)
-        r2.on('end', () => resolve(fromXml(d)))
-      })
-      req2.on('error', reject)
-      req2.write(xmlBody)
-      req2.end()
+      amount: { total: totalFee, currency: 'CNY' },
+      payer: { openid: req.miniUser.openid },
     })
 
-    if (wxRes.return_code !== 'SUCCESS' || wxRes.result_code !== 'SUCCESS') {
-      return fail(res, wxRes.err_code_des || wxRes.return_msg || '微信支付下单失败')
+    if (!wxRes.prepay_id) {
+      console.error('[V3 unifiedorder]', JSON.stringify(wxRes))
+      return fail(res, wxRes.message || wxRes.detail?.message || '微信支付下单失败')
     }
 
-    const prepayId = wxRes.prepay_id
+    // 调起支付参数（V3 用 RSA 签名）
+    const crypto = require('crypto')
     const timeStamp = String(Math.floor(Date.now() / 1000))
-    const nonceStr2 = Math.random().toString(36).slice(2, 18)
-    const packageStr = `prepay_id=${prepayId}`
-    const paySign = wxPaySign({ appId: WX_APPID, timeStamp, nonceStr: nonceStr2, package: packageStr, signType: 'MD5' })
+    const nonceStr = crypto.randomBytes(16).toString('hex')
+    const packageStr = `prepay_id=${wxRes.prepay_id}`
+    const signMsg = `${WX_APPID}\n${timeStamp}\n${nonceStr}\n${packageStr}\n`
+    const sign = crypto.createSign('RSA-SHA256')
+    sign.update(signMsg)
+    const paySign = sign.sign(WX_MCH_PRIVATE_KEY, 'base64')
 
-    return ok(res, { timeStamp, nonceStr: nonceStr2, package: packageStr, signType: 'MD5', paySign })
+    return ok(res, { timeStamp, nonceStr, package: packageStr, signType: 'RSA', paySign })
   } catch (e) { fail(res, e.message) }
 })
 
-// 支付回调
+// 支付回调（V3 JSON 格式）
 app.post('/miniapi/pay/notify', async (req, res) => {
   try {
-    let body = ''
-    req.on('data', d => body += d)
-    req.on('end', async () => {
-      try {
-        const data = fromXml(body)
-        if (data.return_code === 'SUCCESS' && data.result_code === 'SUCCESS') {
-          // 验签
-          const sign = data.sign
-          const { sign: _, ...rest } = data
-          if (wxPaySign(rest) === sign) {
-            // 校验金额：防止伪造低额回调
-            const expectedOrder = (await pool.query(`SELECT total_amount FROM mini_orders WHERE order_no=$1 LIMIT 1`, [data.out_trade_no])).rows[0]
-            if (!expectedOrder) {
-              return res.send('<xml><return_code><![CDATA[FAIL]]></return_code><return_msg><![CDATA[ORDER_NOT_FOUND]]></return_msg></xml>')
-            }
-            const expectedFen = Math.round(parseFloat(expectedOrder.total_amount) * 100)
-            if (parseInt(data.total_fee) !== expectedFen) {
-              console.error('[pay/notify] amount mismatch', { order_no: data.out_trade_no, expected: expectedFen, got: data.total_fee })
-              return res.send('<xml><return_code><![CDATA[FAIL]]></return_code><return_msg><![CDATA[AMOUNT_MISMATCH]]></return_msg></xml>')
-            }
-            const updOrder = (await pool.query(`UPDATE mini_orders SET status=1, paid_at=NOW(), wx_transaction_id=$2 WHERE order_no=$1 AND status=0 RETURNING *`, [data.out_trade_no, data.transaction_id || ''])).rows[0]
-            if (updOrder) {
-              if (parseInt(updOrder.coupon_id || 0) > 0) {
-                await pool.query(
-                  `UPDATE mini_user_coupons SET status=1, used_at=NOW()
-                   WHERE id=$1 AND user_id=$2 AND order_id=$3 AND status=3`,
-                  [updOrder.coupon_id, updOrder.user_id, updOrder.id]
-                )
-              }
-              const paidUser = (await pool.query(`SELECT * FROM mini_users WHERE id=$1`, [updOrder.user_id])).rows[0]
-              if (paidUser) {
-                if (paidUser.openid && TMPL_ORDER_SUCCESS) {
-                  const paidItems = (await pool.query(`SELECT goods_name FROM mini_order_items WHERE order_id=$1`, [updOrder.id])).rows
-                  const goodsName = paidItems.map(i => i.goods_name).join('、').slice(0, 20)
-                  const now = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })
-                  sendSubscribeMsg(paidUser.openid, TMPL_ORDER_SUCCESS, `pages/order/detail?id=${updOrder.id}`, {
-                    thing1: { value: goodsName || '商品' },
-                    amount1: { value: `¥${parseFloat(updOrder.total_amount || updOrder.total || 0).toFixed(2)}` },
-                    character_string1: { value: updOrder.order_no },
-                    time1: { value: now.slice(0, 16) },
-                  }).catch(() => {})
-                }
-                const lvl = calcLevel(paidUser)
-                const mult = MEMBER_LEVELS[lvl].multiplier
-                const earnPoints = Math.floor(parseFloat(updOrder.total_amount || updOrder.total || 0) * POINTS_PER_YUAN * mult)
-                const newSpent = parseFloat(paidUser.total_spent || 0) + parseFloat(updOrder.total_amount || updOrder.total || 0)
-                const newLevel = newSpent >= 2000 ? 2 : newSpent >= 500 ? 1 : 0
-                await pool.query(`UPDATE mini_users SET points=COALESCE(points,0)+$1, total_spent=COALESCE(total_spent,0)+$2, level=GREATEST(level,$3) WHERE id=$4`,
-                  [earnPoints, parseFloat(updOrder.total_amount || updOrder.total || 0), newLevel, updOrder.user_id])
-                await pool.query(`INSERT INTO mini_points_log (user_id,points,type,remark,order_id,created_at) VALUES ($1,$2,'earn','消费送积分',$3,NOW())`,
-                  [updOrder.user_id, earnPoints, updOrder.id])
-              }
-            }
-          }
+    const rawBody = req.rawBody || JSON.stringify(req.body || {})
+    // 1. 验签
+    const verify = wxV3VerifyCallback(req.headers, rawBody)
+    if (!verify.ok) {
+      console.error('[pay/notify V3] verify failed:', verify.reason)
+      return res.status(401).json({ code: 'FAIL', message: verify.reason })
+    }
+    // 2. 解密 resource
+    const notification = req.body || {}
+    if (notification.event_type !== 'TRANSACTION.SUCCESS') {
+      return res.json({ code: 'SUCCESS', message: '已忽略非成功事件' })
+    }
+    let payload
+    try {
+      payload = wxV3DecryptResource(notification.resource)
+    } catch (e) {
+      console.error('[pay/notify V3] decrypt failed:', e.message)
+      return res.status(500).json({ code: 'FAIL', message: 'decrypt failed' })
+    }
+    // payload 字段：out_trade_no, transaction_id, trade_state, amount{total}, payer{openid}
+    if (payload.trade_state !== 'SUCCESS') {
+      return res.json({ code: 'SUCCESS', message: '已忽略非成功状态' })
+    }
+    const outTradeNo = payload.out_trade_no
+    const transactionId = payload.transaction_id || ''
+    const paidFen = parseInt(payload.amount?.total ?? 0)
+
+    // 3. 校验金额（防伪造）
+    const expectedOrder = (await pool.query(`SELECT total_amount FROM mini_orders WHERE order_no=$1 LIMIT 1`, [outTradeNo])).rows[0]
+    if (!expectedOrder) {
+      return res.status(404).json({ code: 'FAIL', message: 'ORDER_NOT_FOUND' })
+    }
+    const expectedFen = Math.round(parseFloat(expectedOrder.total_amount) * 100)
+    if (paidFen !== expectedFen) {
+      console.error('[pay/notify V3] amount mismatch', { order_no: outTradeNo, expected: expectedFen, got: paidFen })
+      return res.status(400).json({ code: 'FAIL', message: 'AMOUNT_MISMATCH' })
+    }
+
+    // 4. 更新订单 + 锁定优惠券 + 发积分 + 推送
+    const updOrder = (await pool.query(
+      `UPDATE mini_orders SET status=1, paid_at=NOW(), wx_transaction_id=$2 WHERE order_no=$1 AND status=0 RETURNING *`,
+      [outTradeNo, transactionId]
+    )).rows[0]
+    if (updOrder) {
+      if (parseInt(updOrder.coupon_id || 0) > 0) {
+        await pool.query(
+          `UPDATE mini_user_coupons SET status=1, used_at=NOW()
+           WHERE id=$1 AND user_id=$2 AND order_id=$3 AND status=3`,
+          [updOrder.coupon_id, updOrder.user_id, updOrder.id]
+        )
+      }
+      const paidUser = (await pool.query(`SELECT * FROM mini_users WHERE id=$1`, [updOrder.user_id])).rows[0]
+      if (paidUser) {
+        if (paidUser.openid && TMPL_ORDER_SUCCESS) {
+          const paidItems = (await pool.query(`SELECT goods_name FROM mini_order_items WHERE order_id=$1`, [updOrder.id])).rows
+          const goodsName = paidItems.map(i => i.goods_name).join('、').slice(0, 20)
+          const now = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })
+          sendSubscribeMsg(paidUser.openid, TMPL_ORDER_SUCCESS, `pages/order/detail?id=${updOrder.id}`, {
+            thing1: { value: goodsName || '商品' },
+            amount1: { value: `¥${parseFloat(updOrder.total_amount || updOrder.total || 0).toFixed(2)}` },
+            character_string1: { value: updOrder.order_no },
+            time1: { value: now.slice(0, 16) },
+          }).catch(() => {})
         }
-        res.send('<xml><return_code><![CDATA[SUCCESS]]></return_code><return_msg><![CDATA[OK]]></return_msg></xml>')
-      } catch { res.send('<xml><return_code><![CDATA[FAIL]]></return_code></xml>') }
-    })
-  } catch {
-    res.send('<xml><return_code><![CDATA[FAIL]]></return_code></xml>')
+        const lvl = calcLevel(paidUser)
+        const mult = MEMBER_LEVELS[lvl].multiplier
+        const earnPoints = Math.floor(parseFloat(updOrder.total_amount || updOrder.total || 0) * POINTS_PER_YUAN * mult)
+        const newSpent = parseFloat(paidUser.total_spent || 0) + parseFloat(updOrder.total_amount || updOrder.total || 0)
+        const newLevel = newSpent >= 2000 ? 2 : newSpent >= 500 ? 1 : 0
+        await pool.query(`UPDATE mini_users SET points=COALESCE(points,0)+$1, total_spent=COALESCE(total_spent,0)+$2, level=GREATEST(level,$3) WHERE id=$4`,
+          [earnPoints, parseFloat(updOrder.total_amount || updOrder.total || 0), newLevel, updOrder.user_id])
+        await pool.query(`INSERT INTO mini_points_log (user_id,points,type,remark,order_id,created_at) VALUES ($1,$2,'earn','消费送积分',$3,NOW())`,
+          [updOrder.user_id, earnPoints, updOrder.id])
+      }
+    }
+    return res.json({ code: 'SUCCESS', message: 'OK' })
+  } catch (e) {
+    console.error('[pay/notify V3] error:', e.message)
+    return res.status(500).json({ code: 'FAIL', message: e.message })
   }
 })
 
@@ -5146,75 +5189,82 @@ app.get('/miniapi/member/points/log', miniAuth, async (req, res) => {
 // 购买VIP会员（发起支付）
 app.post('/miniapi/member/buy-vip', miniAuth, async (req, res) => {
   try {
-    const https = require('https')
     const orderNo = genOrderNo('VIP')
-    const nonceStr = Math.random().toString(36).slice(2, 18) + Math.random().toString(36).slice(2, 18)
     const totalFee = VIP_PRICE * 100
-    const params = {
+    // V3 JSAPI 下单
+    const wxRes = await wxV3Post('/v3/pay/transactions/jsapi', {
       appid: WX_APPID,
-      mch_id: WX_MCH_ID,
-      nonce_str: nonceStr,
-      body: '数字游牧-VIP年度会员',
+      mchid: WX_MCH_ID,
+      description: '数字游牧-VIP年度会员',
       out_trade_no: orderNo,
-      total_fee: String(totalFee),
-      spbill_create_ip: req.ip || '127.0.0.1',
       notify_url: 'https://erp-server-xsji.onrender.com/miniapi/pay/vip-notify',
-      trade_type: 'JSAPI',
-      openid: req.miniUser.openid,
+      amount: { total: totalFee, currency: 'CNY' },
+      payer: { openid: req.miniUser.openid },
       attach: String(req.miniUser.id),
-    }
-    params.sign = wxPaySign(params)
-    const xmlBody = toXml(params)
-    const wxRes = await new Promise((resolve, reject) => {
-      const req2 = https.request({ hostname: 'api.mch.weixin.qq.com', path: '/pay/unifiedorder', method: 'POST', headers: { 'Content-Type': 'text/xml', 'Content-Length': Buffer.byteLength(xmlBody) } }, r2 => {
-        let d = ''; r2.on('data', c => d += c); r2.on('end', () => resolve(fromXml(d)))
-      })
-      req2.on('error', reject); req2.write(xmlBody); req2.end()
     })
-    if (wxRes.return_code !== 'SUCCESS' || wxRes.result_code !== 'SUCCESS')
-      return fail(res, wxRes.err_code_des || wxRes.return_msg || 'VIP支付下单失败')
-    const prepayId = wxRes.prepay_id
+    if (!wxRes.prepay_id) {
+      console.error('[V3 vip-unifiedorder]', JSON.stringify(wxRes))
+      return fail(res, wxRes.message || wxRes.detail?.message || 'VIP支付下单失败')
+    }
+    const crypto = require('crypto')
     const timeStamp = String(Math.floor(Date.now() / 1000))
-    const nonceStr2 = Math.random().toString(36).slice(2, 18)
-    const packageStr = `prepay_id=${prepayId}`
-    const paySign = wxPaySign({ appId: WX_APPID, timeStamp, nonceStr: nonceStr2, package: packageStr, signType: 'MD5' })
-    return ok(res, { timeStamp, nonceStr: nonceStr2, package: packageStr, signType: 'MD5', paySign, orderNo })
+    const nonceStr = crypto.randomBytes(16).toString('hex')
+    const packageStr = `prepay_id=${wxRes.prepay_id}`
+    const signMsg = `${WX_APPID}\n${timeStamp}\n${nonceStr}\n${packageStr}\n`
+    const sign = crypto.createSign('RSA-SHA256')
+    sign.update(signMsg)
+    const paySign = sign.sign(WX_MCH_PRIVATE_KEY, 'base64')
+    return ok(res, { timeStamp, nonceStr, package: packageStr, signType: 'RSA', paySign, orderNo })
   } catch (e) { fail(res, e.message) }
 })
 
-// VIP支付回调
+// VIP支付回调（V3 JSON 格式）
 app.post('/miniapi/pay/vip-notify', async (req, res) => {
   try {
-    let body = ''
-    req.on('data', d => body += d)
-    req.on('end', async () => {
-      try {
-        const data = fromXml(body)
-        if (data.return_code === 'SUCCESS' && data.result_code === 'SUCCESS') {
-          const { sign: _, ...rest } = data
-          if (wxPaySign(rest) === data.sign) {
-            const userId = parseInt(data.attach)
-            const inserted = (await pool.query(
-              `INSERT INTO mini_vip_payments (order_no, user_id, amount)
-               VALUES ($1,$2,$3)
-               ON CONFLICT (order_no) DO NOTHING
-               RETURNING id`,
-              [data.out_trade_no, userId, VIP_PRICE]
-            )).rows[0]
-            if (!inserted) {
-              res.send('<xml><return_code><![CDATA[SUCCESS]]></return_code><return_msg><![CDATA[OK]]></return_msg></xml>')
-              return
-            }
-            const expireAt = new Date(Date.now() + 365 * 24 * 3600 * 1000)
-            await pool.query(`UPDATE mini_users SET vip_expire_at=$1, level=3 WHERE id=$2`, [expireAt, userId])
-            await pool.query(`INSERT INTO mini_points_log (user_id, points, type, remark, created_at) VALUES ($1,990,'earn','购买VIP会员赠送积分',NOW())`, [userId])
-            await pool.query(`UPDATE mini_users SET points=COALESCE(points,0)+990 WHERE id=$1`, [userId])
-          }
-        }
-        res.send('<xml><return_code><![CDATA[SUCCESS]]></return_code><return_msg><![CDATA[OK]]></return_msg></xml>')
-      } catch { res.send('<xml><return_code><![CDATA[FAIL]]></return_code></xml>') }
-    })
-  } catch { res.send('<xml><return_code><![CDATA[FAIL]]></return_code></xml>') }
+    const rawBody = req.rawBody || JSON.stringify(req.body || {})
+    const verify = wxV3VerifyCallback(req.headers, rawBody)
+    if (!verify.ok) {
+      console.error('[vip-notify V3] verify failed:', verify.reason)
+      return res.status(401).json({ code: 'FAIL', message: verify.reason })
+    }
+    const notification = req.body || {}
+    if (notification.event_type !== 'TRANSACTION.SUCCESS') {
+      return res.json({ code: 'SUCCESS', message: '已忽略非成功事件' })
+    }
+    let payload
+    try {
+      payload = wxV3DecryptResource(notification.resource)
+    } catch (e) {
+      console.error('[vip-notify V3] decrypt failed:', e.message)
+      return res.status(500).json({ code: 'FAIL', message: 'decrypt failed' })
+    }
+    if (payload.trade_state !== 'SUCCESS') {
+      return res.json({ code: 'SUCCESS', message: '已忽略非成功状态' })
+    }
+    // 校验金额（防伪造低额回调）
+    const paidFen = parseInt(payload.amount?.total ?? 0)
+    if (paidFen !== VIP_PRICE * 100) {
+      console.error('[vip-notify V3] amount mismatch', { expected: VIP_PRICE * 100, got: paidFen })
+      return res.status(400).json({ code: 'FAIL', message: 'AMOUNT_MISMATCH' })
+    }
+    const userId = parseInt(payload.attach)
+    const inserted = (await pool.query(
+      `INSERT INTO mini_vip_payments (order_no, user_id, amount)
+       VALUES ($1,$2,$3)
+       ON CONFLICT (order_no) DO NOTHING
+       RETURNING id`,
+      [payload.out_trade_no, userId, VIP_PRICE]
+    )).rows[0]
+    if (!inserted) return res.json({ code: 'SUCCESS', message: '已处理' })
+    const expireAt = new Date(Date.now() + 365 * 24 * 3600 * 1000)
+    await pool.query(`UPDATE mini_users SET vip_expire_at=$1, level=3 WHERE id=$2`, [expireAt, userId])
+    await pool.query(`INSERT INTO mini_points_log (user_id, points, type, remark, created_at) VALUES ($1,990,'earn','购买VIP会员赠送积分',NOW())`, [userId])
+    await pool.query(`UPDATE mini_users SET points=COALESCE(points,0)+990 WHERE id=$1`, [userId])
+    return res.json({ code: 'SUCCESS', message: 'OK' })
+  } catch (e) {
+    console.error('[vip-notify V3] error:', e.message)
+    return res.status(500).json({ code: 'FAIL', message: e.message })
+  }
 })
 
 // Nova 客服聊天（收集 Cloudflare SSE → 返回完整 JSON）

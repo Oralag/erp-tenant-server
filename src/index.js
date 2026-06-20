@@ -148,8 +148,8 @@ function fail(res, message = '操作失败', status = 200) {
   return res.status(status).json({ code: 0, message })
 }
 
-function todayCN() {
-  return new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString().slice(0, 10)
+function todayCN(offsetDays = 0) {
+  return new Date(Date.now() + 8 * 60 * 60 * 1000 + offsetDays * 86400000).toISOString().slice(0, 10)
 }
 
 function genOrderNo(prefix = 'ORD') {
@@ -3681,11 +3681,17 @@ async function autoConfirmOrders() {
 }
 
 // 佣金结算：扫描已确认收货满 7 天且未结算的订单，逐个转账
+// 失败自动累计 commission_retry_count，超过上限不再重试（需人工处理）
 const COMMISSION_COOLING_DAYS = 7
+const COMMISSION_MAX_RETRY = 10
 async function settleEligibleCommissions() {
   try {
+    // 一次性补字段（幂等）
+    await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS commission_retry_count INT DEFAULT 0`).catch(() => {})
+    await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS commission_last_error TEXT DEFAULT ''`).catch(() => {})
+
     const rows = (await pool.query(
-      `SELECT o.id, o.order_no, o.commission, o.distributor_code
+      `SELECT o.id, o.order_no, o.commission, o.distributor_code, COALESCE(o.commission_retry_count, 0) AS retry
        FROM mini_orders o
        WHERE o.status=3
          AND o.commission_settled=false
@@ -3693,6 +3699,7 @@ async function settleEligibleCommissions() {
          AND o.distributor_code != ''
          AND o.confirmed_at IS NOT NULL
          AND o.confirmed_at < NOW() - INTERVAL '${COMMISSION_COOLING_DAYS} days'
+         AND COALESCE(o.commission_retry_count, 0) < ${COMMISSION_MAX_RETRY}
          AND NOT EXISTS (SELECT 1 FROM mini_refunds WHERE order_id=o.id AND status IN (0,1))`
     )).rows
     for (const order of rows) {
@@ -3703,13 +3710,20 @@ async function settleEligibleCommissions() {
            WHERE d.code=$1 AND d.status=1 LIMIT 1`,
           [order.distributor_code]
         )).rows[0]
-        if (!dist?.dist_openid) continue
+        if (!dist?.dist_openid) {
+          await pool.query(`UPDATE mini_orders SET commission_retry_count=commission_retry_count+1, commission_last_error=$1 WHERE id=$2`, ['distributor not active or missing openid', order.id])
+          continue
+        }
         const result = await transferCommission(order.id, order.order_no, dist.dist_openid, parseFloat(order.commission))
-        if (!result.skipped) {
-          await pool.query(`UPDATE mini_orders SET commission_settled=true WHERE id=$1`, [order.id])
+        if (!result.skipped && !result.code) {
+          await pool.query(`UPDATE mini_orders SET commission_settled=true, commission_last_error='' WHERE id=$1`, [order.id])
           console.log(`commission settled for order ${order.order_no}: ¥${order.commission}`)
+        } else if (result.code && result.code !== 'SUCCESS') {
+          await pool.query(`UPDATE mini_orders SET commission_retry_count=commission_retry_count+1, commission_last_error=$1 WHERE id=$2`, [result.message || result.code, order.id])
+          console.error(`commission transfer rejected for order ${order.order_no}:`, result.message || result.code)
         }
       } catch (e) {
+        await pool.query(`UPDATE mini_orders SET commission_retry_count=commission_retry_count+1, commission_last_error=$1 WHERE id=$2`, [e.message, order.id]).catch(() => {})
         console.error(`settle commission failed for order ${order.order_no}:`, e.message)
       }
     }
@@ -3910,6 +3924,14 @@ async function transferCommission(orderId, orderNo, openid, amountYuan) {
   })
 }
 
+// V3 订单查询：查微信实际支付状态（用于取消订单前的安全校验）
+async function wxV3QueryOrder(outTradeNo) {
+  if (!WX_MCH_PRIVATE_KEY || !WX_MCH_CERT_SERIAL) return { skipped: true }
+  const urlPath = `/v3/pay/transactions/out-trade-no/${outTradeNo}?mchid=${WX_MCH_ID}`
+  const result = await wxV3Get(urlPath)
+  return result
+}
+
 // 微信退款（V3）
 async function wxV3Refund(orderNo, transactionId, refundNo, amountYuan, reason) {
   if (!WX_MCH_PRIVATE_KEY || !WX_MCH_CERT_SERIAL) return { skipped: true, reason: 'not configured' }
@@ -4051,13 +4073,21 @@ app.post('/miniapi/auth/phoneLogin', async (req, res) => {
         `INSERT INTO shop_customer (name, mobile, source, created_at) VALUES ($1,$2,'小程序',NOW()) ON CONFLICT DO NOTHING`,
         [phone, phone]
       ).catch(() => {})
-      // 新客自动发两张满减券
+      // 新客自动发两张满减券（按手机号防重，避免换 openid 重复领）
       try {
-        const newUserCoupons = (await pool.query(`SELECT id, validity_days FROM mini_coupons WHERE type='new_user' AND status=1`)).rows
-        for (const c of newUserCoupons) {
-          const expireAt = new Date(Date.now() + c.validity_days * 86400000)
-          await pool.query(`INSERT INTO mini_user_coupons (user_id, coupon_id, status, expire_at) VALUES ($1,$2,0,$3)`, [user.id, c.id, expireAt])
-          await pool.query(`UPDATE mini_coupons SET claimed_count=claimed_count+1 WHERE id=$1`, [c.id])
+        const phoneAlreadyHasNewCoupon = parseInt((await pool.query(
+          `SELECT COUNT(*) FROM mini_user_coupons uc
+           JOIN mini_users u ON u.id=uc.user_id
+           JOIN mini_coupons c ON c.id=uc.coupon_id
+           WHERE u.phone=$1 AND c.type='new_user'`, [phone]
+        )).rows[0].count)
+        if (phoneAlreadyHasNewCoupon === 0) {
+          const newUserCoupons = (await pool.query(`SELECT id, validity_days FROM mini_coupons WHERE type='new_user' AND status=1`)).rows
+          for (const c of newUserCoupons) {
+            const expireAt = new Date(Date.now() + c.validity_days * 86400000)
+            await pool.query(`INSERT INTO mini_user_coupons (user_id, coupon_id, status, expire_at) VALUES ($1,$2,0,$3)`, [user.id, c.id, expireAt])
+            await pool.query(`UPDATE mini_coupons SET claimed_count=claimed_count+1 WHERE id=$1`, [c.id])
+          }
         }
       } catch {}
     } else if (!user.phone) {
@@ -4475,6 +4505,23 @@ app.post('/miniapi/order/cancel', miniAuth, async (req, res) => {
   try {
     const { order_id } = req.body
     if (!order_id) return fail(res, '缺少订单ID')
+    // 取消前先查微信实际支付状态，避免"用户已付款但回调延迟到达"卡死
+    const orderPre = (await pool.query(`SELECT order_no FROM mini_orders WHERE id=$1 AND user_id=$2 AND status=0 LIMIT 1`, [order_id, req.miniUser.id])).rows[0]
+    if (orderPre?.order_no) {
+      try {
+        const wxQuery = await wxV3QueryOrder(orderPre.order_no)
+        if (wxQuery?.status === 200 && wxQuery.body?.trade_state === 'SUCCESS') {
+          // 微信确认已支付：把订单更新为已支付，回调进来后变 noop
+          await pool.query(
+            `UPDATE mini_orders SET status=1, paid_at=NOW(), wx_transaction_id=$2 WHERE id=$1 AND status=0`,
+            [order_id, wxQuery.body.transaction_id || '']
+          )
+          return fail(res, '订单已支付成功，不可取消，请刷新查看')
+        }
+      } catch (e) {
+        console.warn('[order/cancel] wx query failed (continuing to cancel):', e.message)
+      }
+    }
     await client.query('BEGIN')
     const order = (await client.query(
       `SELECT * FROM mini_orders WHERE id=$1 AND user_id=$2 AND status=0 FOR UPDATE`,
@@ -5508,24 +5555,8 @@ app.get('/miniapi/review/list', async (req, res) => {
   } catch(e) { fail(res, e.message) }
 })
 
-// 评价图片上传 token（需登录）
-app.get('/miniapi/upload/review-token', miniAuth, (req, res) => {
-  try {
-    const crypto = require('crypto')
-    const AK = process.env.QINIU_AK || '5Y3KQi2xwmjZG339-mPFwsrSHm1e5e9nZkoW46Gl'
-    const SK = process.env.QINIU_SK || 'y8BmL62oTxlZSl38IC3pJFyiBO_5g6l6gU7vroYk'
-    const BUCKET = process.env.QINIU_BUCKET || 'nomad-videos'
-    const DOMAIN = process.env.QINIU_DOMAIN || 'https://nomaderp.pages.dev/media'
-    const UPLOAD_URL = process.env.QINIU_UPLOAD_URL || 'https://up-z2.qiniup.com/'
-    const deadline = Math.floor(Date.now() / 1000) + 3600
-    const policy = { scope: BUCKET, deadline, returnBody: '{"key":"$(key)","hash":"$(etag)"}' }
-    const encodedPolicy = Buffer.from(JSON.stringify(policy)).toString('base64').replace(/\+/g,'-').replace(/\//g,'_')
-    const sign = crypto.createHmac('sha1', SK).update(encodedPolicy).digest()
-    const encodedSign = sign.toString('base64').replace(/\+/g,'-').replace(/\//g,'_')
-    const token = `${AK}:${encodedSign}:${encodedPolicy}`
-    ok(res, { token, domain: DOMAIN, uploadUrl: UPLOAD_URL })
-  } catch(e) { fail(res, e.message) }
-})
+// 七牛云上传 token（小程序端）—— 七牛已弃用，接口下线
+app.get('/miniapi/upload/review-token', miniAuth, (_req, res) => fail(res, '七牛云已弃用，请使用 Cloudflare R2 等替代方案'))
 
 // 提交评价（需登录，且该订单包含该商品）
 app.post('/miniapi/review/create', miniAuth, async (req, res) => {
@@ -5573,10 +5604,27 @@ app.get('/miniapi/review/check', miniAuth, async (req, res) => {
   } catch(e) { fail(res, e.message) }
 })
 
+// 内存级频控（够用，重启清空）
+const wholesaleInquiryRateLimit = new Map()
 app.post('/miniapi/wholesale/inquiry', async (req, res) => {
   try {
     const { name, wechat, mobile } = req.body
     if (!name || (!wechat && !mobile)) return fail(res, '请填写姓名及微信号或手机号')
+
+    // 频控：同 mobile/wechat/IP 任一维度 5 分钟内只能 1 次
+    const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || ''
+    const keys = [`m:${mobile || ''}`, `w:${wechat || ''}`, `ip:${ip}`].filter(k => k.length > 3)
+    const nowMs = Date.now()
+    for (const [k, ts] of wholesaleInquiryRateLimit) {
+      if (nowMs - ts > 600000) wholesaleInquiryRateLimit.delete(k) // 清理 10 分钟前的
+    }
+    for (const k of keys) {
+      const last = wholesaleInquiryRateLimit.get(k)
+      if (last && nowMs - last < 300000) {
+        return fail(res, '提交过于频繁，请 5 分钟后再试')
+      }
+    }
+    keys.forEach(k => wholesaleInquiryRateLimit.set(k, nowMs))
 
     // 保存到 ERP 客户表
     const now = Math.floor(Date.now() / 1000)
@@ -5676,11 +5724,24 @@ app.get('/miniapi/coupon/list', miniAuth, async (req, res) => {
       let reason = ''
 
       if (c.type === 'new_user') {
-        const orderCount = parseInt((await pool.query(
-          `SELECT COUNT(*) FROM mini_orders WHERE user_id=$1 AND status>=1`, [uid]
-        )).rows[0].count)
-        if (orderCount > 0) { canClaim = false; reason = '仅限新客' }
-        if (claimedByUser > 0) { canClaim = false; reason = '已领取' }
+        // 按手机号判断（防止换 openid 重新注册重领）
+        const userPhone = user?.phone || ''
+        if (userPhone) {
+          const phoneOrderCount = parseInt((await pool.query(
+            `SELECT COUNT(*) FROM mini_orders o
+             JOIN mini_users u ON u.id=o.user_id
+             WHERE u.phone=$1 AND o.status>=1`, [userPhone]
+          )).rows[0].count)
+          if (phoneOrderCount > 0) { canClaim = false; reason = '仅限新客' }
+          const phoneClaimed = parseInt((await pool.query(
+            `SELECT COUNT(*) FROM mini_user_coupons uc
+             JOIN mini_users u ON u.id=uc.user_id
+             WHERE u.phone=$1 AND uc.coupon_id=$2`, [userPhone, c.id]
+          )).rows[0].count)
+          if (phoneClaimed > 0) { canClaim = false; reason = '已领取' }
+        } else {
+          if (claimedByUser > 0) { canClaim = false; reason = '已领取' }
+        }
       } else if (c.type === 'birthday') {
         const bm = user?.birth_month, bd = user?.birth_day
         if (!bm) { canClaim = false; reason = '请先设置生日' }
@@ -5720,12 +5781,24 @@ app.post('/miniapi/coupon/claim', miniAuth, async (req, res) => {
     const now = new Date()
 
     if (c.type === 'new_user') {
-      const orderCount = parseInt((await pool.query(
-        `SELECT COUNT(*) FROM mini_orders WHERE user_id=$1 AND status>=1`, [uid]
-      )).rows[0].count)
-      if (orderCount > 0) return fail(res, '仅限新用户领取')
-      const already = (await pool.query(`SELECT id FROM mini_user_coupons WHERE user_id=$1 AND coupon_id=$2 LIMIT 1`, [uid, coupon_id])).rows[0]
-      if (already) return fail(res, '您已领取过该券')
+      const userPhone = user?.phone || ''
+      if (userPhone) {
+        const phoneOrderCount = parseInt((await pool.query(
+          `SELECT COUNT(*) FROM mini_orders o
+           JOIN mini_users u ON u.id=o.user_id
+           WHERE u.phone=$1 AND o.status>=1`, [userPhone]
+        )).rows[0].count)
+        if (phoneOrderCount > 0) return fail(res, '仅限新用户领取')
+        const phoneAlready = (await pool.query(
+          `SELECT uc.id FROM mini_user_coupons uc
+           JOIN mini_users u ON u.id=uc.user_id
+           WHERE u.phone=$1 AND uc.coupon_id=$2 LIMIT 1`, [userPhone, coupon_id]
+        )).rows[0]
+        if (phoneAlready) return fail(res, '您已领取过该券')
+      } else {
+        const already = (await pool.query(`SELECT id FROM mini_user_coupons WHERE user_id=$1 AND coupon_id=$2 LIMIT 1`, [uid, coupon_id])).rows[0]
+        if (already) return fail(res, '您已领取过该券')
+      }
     } else if (c.type === 'birthday') {
       if (!user?.birth_month) return fail(res, '请先在个人中心设置生日')
       if (user.birth_month !== now.getMonth() + 1) return fail(res, `生日月（${user.birth_month}月）才能领取`)
@@ -6090,24 +6163,8 @@ app.post('/adminapi/mini/videos/del', auth, async (req, res) => {
   } catch(e) { fail(res, e.message) }
 })
 
-// 管理端：获取七牛云上传token（纯内置crypto，无需qiniu包）
-app.get('/adminapi/mini/video-token', auth, (req, res) => {
-  try {
-    const crypto = require('crypto')
-    const AK = process.env.QINIU_AK || '5Y3KQi2xwmjZG339-mPFwsrSHm1e5e9nZkoW46Gl'
-    const SK = process.env.QINIU_SK || 'y8BmL62oTxlZSl38IC3pJFyiBO_5g6l6gU7vroYk'
-    const BUCKET = process.env.QINIU_BUCKET || 'nomad-videos'
-    const DOMAIN = process.env.QINIU_DOMAIN || 'https://nomaderp.pages.dev/media'
-    const UPLOAD_URL = process.env.QINIU_UPLOAD_URL || 'https://up-z2.qiniup.com/'
-    const deadline = Math.floor(Date.now() / 1000) + 3600
-    const policy = { scope: BUCKET, deadline, returnBody: '{"key":"$(key)","hash":"$(etag)"}' }
-    const encodedPolicy = Buffer.from(JSON.stringify(policy)).toString('base64').replace(/\+/g,'-').replace(/\//g,'_')
-    const sign = crypto.createHmac('sha1', SK).update(encodedPolicy).digest()
-    const encodedSign = sign.toString('base64').replace(/\+/g,'-').replace(/\//g,'_')
-    const token = `${AK}:${encodedSign}:${encodedPolicy}`
-    ok(res, { token, domain: DOMAIN, bucket: BUCKET, uploadUrl: UPLOAD_URL })
-  } catch(e) { fail(res, e.message) }
-})
+// 七牛云上传 token（管理端）—— 七牛已弃用，接口下线
+app.get('/adminapi/mini/video-token', auth, (_req, res) => fail(res, '七牛云已弃用，请使用 Cloudflare R2 等替代方案'))
 
 // 管理端：发货并推送订阅消息
 app.post('/adminapi/mini/ship', auth, async (req, res) => {
@@ -6387,7 +6444,7 @@ app.get('/miniapi/signin/status', miniAuth, async (req, res) => {
     )).rows[0]
     let streak = todayRow ? todayRow.streak : 0
     if (!todayRow) {
-      const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10)
+      const yesterday = todayCN(-1)
       const y = (await pool.query(`SELECT streak FROM user_signin WHERE user_id=$1 AND signin_date=$2`, [uid, yesterday])).rows[0]
       streak = y ? y.streak : 0
     }
@@ -6401,7 +6458,7 @@ app.post('/miniapi/signin', miniAuth, async (req, res) => {
     const today = todayCN()
     const existing = (await pool.query(`SELECT id FROM user_signin WHERE user_id=$1 AND signin_date=$2`, [uid, today])).rows[0]
     if (existing) return fail(res, '今天已签到')
-    const yesterday = new Date(Date.now() + 8 * 60 * 60 * 1000 - 86400000).toISOString().slice(0, 10)
+    const yesterday = todayCN(-1)
     const y = (await pool.query(`SELECT streak FROM user_signin WHERE user_id=$1 AND signin_date=$2`, [uid, yesterday])).rows[0]
     const streak = y ? y.streak + 1 : 1
     const points = streak >= 7 ? 10 : streak >= 4 ? 8 : 5
@@ -6485,6 +6542,17 @@ app.post('/miniapi/lottery/spin', miniAuth, async (req, res) => {
       await client.query('BEGIN')
 
       if (usePoints) {
+        // 每日积分加抽上限 5 次
+        const todayUsePointsCount = parseInt((await client.query(
+          `SELECT COUNT(*) FROM user_lottery WHERE user_id=$1 AND spin_date=$2 AND COALESCE(use_points,FALSE)=TRUE`,
+          [uid, today]
+        )).rows[0].count)
+        const DAILY_USE_POINTS_LIMIT = 5
+        if (todayUsePointsCount >= DAILY_USE_POINTS_LIMIT) {
+          const err = new Error(`今日积分加抽已达上限（${DAILY_USE_POINTS_LIMIT}次），明天再来`)
+          err.userMessage = err.message
+          throw err
+        }
         const user = (await client.query(`SELECT points FROM mini_users WHERE id=$1 FOR UPDATE`, [uid])).rows[0]
         const currentPoints = user?.points || 0
         if (currentPoints < extraSpinCost) {

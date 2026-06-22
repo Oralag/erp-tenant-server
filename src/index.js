@@ -4302,6 +4302,8 @@ app.post('/miniapi/order/create', miniAuth, async (req, res) => {
     }
     originalTotal = Math.round(originalTotal * 100) / 100
 
+    await pool.query(`ALTER TABLE mini_users ADD COLUMN IF NOT EXISTS distributor_code VARCHAR(20) DEFAULT ''`)
+
     // 会员折扣
     const userRow = (await pool.query(`SELECT * FROM mini_users WHERE id=$1`, [req.miniUser.id])).rows[0]
     const userLevel = calcLevel(userRow || {})
@@ -4338,9 +4340,18 @@ app.post('/miniapi/order/create', miniAuth, async (req, res) => {
     try {
       await client.query('BEGIN')
 
+      const lockedMiniUser = (await client.query(
+        `SELECT points, distributor_code FROM mini_users WHERE id=$1 FOR UPDATE`,
+        [req.miniUser.id]
+      )).rows[0]
+      if (!lockedMiniUser) {
+        const err = new Error('用户不存在')
+        err.userMessage = err.message
+        throw err
+      }
+
       if (usePoints > 0) {
-        const lockedUser = (await client.query(`SELECT points FROM mini_users WHERE id=$1 FOR UPDATE`, [req.miniUser.id])).rows[0]
-        if ((lockedUser?.points || 0) < usePoints) {
+        if ((lockedMiniUser.points || 0) < usePoints) {
           const err = new Error('积分余额不足')
           err.userMessage = err.message
           throw err
@@ -4363,16 +4374,22 @@ app.post('/miniapi/order/create', miniAuth, async (req, res) => {
 
       // 分销商佣金
       let distCode = '', distCommission = 0
-      if (distributor_code) {
+      const requestedDistCode = String(distributor_code || '').trim()
+      const boundDistCode = String(lockedMiniUser.distributor_code || '').trim()
+      const effectiveDistCode = boundDistCode || requestedDistCode
+      if (effectiveDistCode) {
         const distRow = (await client.query(
           `SELECT d.code, d.commission_rate as own_rate, cl.commission_rate as level_rate
            FROM distributors d
            LEFT JOIN sale_customers c ON c.mobile=d.phone AND c.deleted_at IS NULL
            LEFT JOIN customer_levels cl ON cl.name=c.level_name
-           WHERE d.code=$1 AND d.status=1 LIMIT 1`, [distributor_code]
+           WHERE d.code=$1 AND d.status=1 LIMIT 1`, [effectiveDistCode]
         )).rows[0]
         if (distRow) {
           distCode = distRow.code
+          if (!boundDistCode && requestedDistCode) {
+            await client.query(`UPDATE mini_users SET distributor_code=$1 WHERE id=$2`, [distCode, req.miniUser.id])
+          }
           // 分销商自己设了佣金率就用自己的，否则用等级统一设置
           const rate = parseFloat(distRow.own_rate ?? distRow.level_rate ?? 0)
           distCommission = Math.round(serverTotal * rate / 100 * 100) / 100
@@ -4587,6 +4604,21 @@ app.post('/miniapi/order/confirm', miniAuth, async (req, res) => {
     await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS commission NUMERIC(8,2) DEFAULT 0`)
     await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS commission_settled BOOLEAN DEFAULT FALSE`)
     await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS confirmed_at TIMESTAMPTZ`)
+    await pool.query(`ALTER TABLE mini_users ADD COLUMN IF NOT EXISTS distributor_code VARCHAR(20) DEFAULT ''`)
+    await pool.query(`
+      UPDATE mini_users u
+      SET distributor_code = first_orders.distributor_code
+      FROM (
+        SELECT DISTINCT ON (user_id) user_id, distributor_code
+        FROM mini_orders
+        WHERE COALESCE(distributor_code, '') != ''
+          AND status NOT IN (4, 5)
+          AND deleted_at IS NULL
+        ORDER BY user_id, id ASC
+      ) first_orders
+      WHERE u.id = first_orders.user_id
+        AND COALESCE(u.distributor_code, '') = ''
+    `)
     // 客户等级价格表
     await pool.query(`CREATE TABLE IF NOT EXISTS customer_levels (
       id SERIAL PRIMARY KEY,

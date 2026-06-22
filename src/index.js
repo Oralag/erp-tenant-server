@@ -5638,6 +5638,9 @@ app.get('/miniapi/brand/config', async (req, res) => {
       return 'https://nomaderp.pages.dev' + (url.startsWith('/') ? '' : '/') + url
     }
     cfg.heroImage = abs(cfg.heroImage)
+    if (Array.isArray(cfg.heroImages)) {
+      cfg.heroImages = cfg.heroImages.filter(Boolean).map(abs)
+    }
     if (Array.isArray(cfg.categories)) {
       cfg.categories = cfg.categories.map(c => ({ ...c, img: abs(c.img) }))
     }

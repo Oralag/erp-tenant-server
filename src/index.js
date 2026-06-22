@@ -4179,6 +4179,45 @@ function parseBrandGoods(row) {
   }
 }
 
+async function getOptionalMiniUser(req) {
+  const token = req.headers['mini-token']
+  if (!token) return null
+  try {
+    const decoded = jwt.verify(token, MINI_JWT_SECRET)
+    const user = (await pool.query(
+      `SELECT id, distributor_code FROM mini_users WHERE id=$1 AND deleted_at IS NULL LIMIT 1`,
+      [decoded.id]
+    )).rows[0]
+    return user || null
+  } catch {
+    return null
+  }
+}
+
+async function getDistributorScope(req) {
+  await pool.query(`ALTER TABLE mini_users ADD COLUMN IF NOT EXISTS distributor_code VARCHAR(20) DEFAULT ''`).catch(() => {})
+  const user = await getOptionalMiniUser(req)
+  const boundCode = String(user?.distributor_code || '').trim()
+  const requestCode = String(req.query.distributor_code || req.body?.distributor_code || '').trim()
+  const code = boundCode || requestCode
+  if (!code) return { code: '', distributor: null, restricted: false, allowedIds: [] }
+  const distributor = (await pool.query(
+    `SELECT id, code FROM distributors WHERE code=$1 AND status=1 LIMIT 1`,
+    [code]
+  )).rows[0]
+  if (!distributor) return { code: '', distributor: null, restricted: false, allowedIds: [] }
+  const goodsRows = (await pool.query(
+    `SELECT goods_id FROM distributor_goods WHERE distributor_id=$1 AND status=1`,
+    [distributor.id]
+  )).rows
+  return {
+    code: distributor.code,
+    distributor,
+    restricted: goodsRows.length > 0,
+    allowedIds: goodsRows.map(r => parseInt(r.goods_id)).filter(Boolean),
+  }
+}
+
 // 商品列表 — 只返回品牌主页标记 show:true 的商品（与 shopStore.ts 逻辑一致）
 app.get('/miniapi/goods/list', async (req, res) => {
   try {
@@ -4186,6 +4225,11 @@ app.get('/miniapi/goods/list', async (req, res) => {
     const pageNum = parseInt(page), pageSize = parseInt(list_rows)
     const params = []
     let where = `WHERE deleted_at IS NULL AND status=1 AND can_sale=1`
+    const distScope = await getDistributorScope(req)
+    if (distScope.restricted) {
+      params.push(distScope.allowedIds)
+      where += ` AND id=ANY($${params.length})`
+    }
     if (category_id) { params.push(category_id); where += ` AND cate_id=$${params.length}` }
     if (keyword) { params.push(`%${keyword}%`); where += ` AND goods_name ILIKE $${params.length}` }
     // 拉全量（≤500），在 Node 里过滤 show:true，与品牌主页 .filter(p=>p.show===true) 一致
@@ -4240,6 +4284,10 @@ app.get('/miniapi/goods/list', async (req, res) => {
 // 商品详情
 app.get('/miniapi/goods/detail/:id', async (req, res) => {
   try {
+    const distScope = await getDistributorScope(req)
+    if (distScope.restricted && !distScope.allowedIds.includes(parseInt(req.params.id))) {
+      return fail(res, '该商品不在当前分销商可售范围')
+    }
     const r = await pool.query(`SELECT * FROM goods WHERE id=$1 AND deleted_at IS NULL LIMIT 1`, [req.params.id])
     if (!r.rows[0]) return fail(res, '商品不存在')
     const goods = parseBrandGoods(r.rows[0])
@@ -4379,7 +4427,7 @@ app.post('/miniapi/order/create', miniAuth, async (req, res) => {
       const effectiveDistCode = boundDistCode || requestedDistCode
       if (effectiveDistCode) {
         const distRow = (await client.query(
-          `SELECT d.code, d.commission_rate as own_rate, cl.commission_rate as level_rate
+          `SELECT d.id, d.code, d.commission_rate as own_rate, cl.commission_rate as level_rate
            FROM distributors d
            LEFT JOIN sale_customers c ON c.mobile=d.phone AND c.deleted_at IS NULL
            LEFT JOIN customer_levels cl ON cl.name=c.level_name
@@ -4393,6 +4441,19 @@ app.post('/miniapi/order/create', miniAuth, async (req, res) => {
           // 分销商自己设了佣金率就用自己的，否则用等级统一设置
           const rate = parseFloat(distRow.own_rate ?? distRow.level_rate ?? 0)
           distCommission = Math.round(serverTotal * rate / 100 * 100) / 100
+          const configuredGoods = (await client.query(
+            `SELECT goods_id FROM distributor_goods WHERE distributor_id=$1 AND status=1`,
+            [distRow.id]
+          )).rows.map(r => parseInt(r.goods_id))
+          if (configuredGoods.length) {
+            const allowed = new Set(configuredGoods)
+            const blocked = validItems.filter(i => !allowed.has(parseInt(i.goods_id))).map(i => i.goods_name)
+            if (blocked.length) {
+              const err = new Error(`商品「${blocked[0]}」不在该分销商可售范围`)
+              err.userMessage = err.message
+              throw err
+            }
+          }
         }
       }
 
@@ -4606,6 +4667,35 @@ app.post('/miniapi/order/confirm', miniAuth, async (req, res) => {
     await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS confirmed_at TIMESTAMPTZ`)
     await pool.query(`ALTER TABLE mini_users ADD COLUMN IF NOT EXISTS distributor_code VARCHAR(20) DEFAULT ''`)
     await pool.query(`
+      CREATE TABLE IF NOT EXISTS distributor_goods (
+        id SERIAL PRIMARY KEY,
+        distributor_id INT NOT NULL,
+        goods_id INT NOT NULL,
+        status INT DEFAULT 1,
+        sort INT DEFAULT 0,
+        custom_price NUMERIC(10,2) DEFAULT 0,
+        commission_rate NUMERIC(5,2),
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(distributor_id, goods_id)
+      )
+    `)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS distributor_materials (
+        id SERIAL PRIMARY KEY,
+        title VARCHAR(120) NOT NULL DEFAULT '',
+        type VARCHAR(20) NOT NULL DEFAULT 'text',
+        content TEXT DEFAULT '',
+        file_url TEXT DEFAULT '',
+        goods_id INT DEFAULT 0,
+        scope VARCHAR(20) DEFAULT 'public',
+        distributor_id INT DEFAULT 0,
+        status INT DEFAULT 1,
+        sort INT DEFAULT 0,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `)
+    await pool.query(`
       UPDATE mini_users u
       SET distributor_code = first_orders.distributor_code
       FROM (
@@ -4725,6 +4815,42 @@ app.get('/miniapi/distributor/orders', miniAuth, async (req, res) => {
   } catch(e) { fail(res, e.message) }
 })
 
+// 分销商自己的可售商品
+app.get('/miniapi/distributor/goods', miniAuth, async (req, res) => {
+  try {
+    const dist = (await pool.query(`SELECT id FROM distributors WHERE user_id=$1 AND status=1 LIMIT 1`, [req.miniUser.id])).rows[0]
+    if (!dist) return fail(res, '非分销商')
+    const assigned = (await pool.query(
+      `SELECT g.id, g.goods_name, g.images, g.remark, g.sell_price, g.unit_name, g.spec, g.barcode, g.goods_memo, g.sort
+       FROM distributor_goods dg
+       JOIN goods g ON g.id=dg.goods_id AND g.deleted_at IS NULL AND g.status=1 AND g.can_sale=1
+       WHERE dg.distributor_id=$1 AND dg.status=1
+       ORDER BY dg.sort ASC, dg.id DESC`,
+      [dist.id]
+    )).rows
+    const rows = assigned.map(parseBrandGoods)
+    return ok(res, rows)
+  } catch(e) { fail(res, e.message) }
+})
+
+// 分销商自己的素材库
+app.get('/miniapi/distributor/materials', miniAuth, async (req, res) => {
+  try {
+    const dist = (await pool.query(`SELECT id FROM distributors WHERE user_id=$1 AND status=1 LIMIT 1`, [req.miniUser.id])).rows[0]
+    if (!dist) return fail(res, '非分销商')
+    const rows = (await pool.query(
+      `SELECT m.*, g.goods_name
+       FROM distributor_materials m
+       LEFT JOIN goods g ON g.id=m.goods_id
+       WHERE m.status=1
+         AND (m.scope='public' OR (m.scope='distributor' AND m.distributor_id=$1))
+       ORDER BY m.sort ASC, m.id DESC`,
+      [dist.id]
+    )).rows
+    return ok(res, rows)
+  } catch(e) { fail(res, e.message) }
+})
+
 // ERP后台 — 分销商列表
 app.get('/adminapi/distributor/list', auth, async (req, res) => {
   try {
@@ -4740,6 +4866,103 @@ app.get('/adminapi/distributor/list', auth, async (req, res) => {
       [parseInt(list_rows), offset]
     )).rows
     return ok(res, { total, rows })
+  } catch(e) { fail(res, e.message) }
+})
+
+// ERP后台 — 分销商商品池
+app.get('/adminapi/distributor/goods', auth, async (req, res) => {
+  try {
+    const distributorId = parseInt(req.query.distributor_id)
+    if (!distributorId) return fail(res, 'distributor_id必填')
+    const rows = (await pool.query(
+      `SELECT dg.*, g.goods_name, g.goods_sn, g.sell_price, g.unit_name
+       FROM distributor_goods dg
+       LEFT JOIN goods g ON g.id=dg.goods_id
+       WHERE dg.distributor_id=$1 AND dg.status=1
+       ORDER BY dg.sort ASC, dg.id DESC`,
+      [distributorId]
+    )).rows
+    return ok(res, rows)
+  } catch(e) { fail(res, e.message) }
+})
+
+app.post('/adminapi/distributor/goods/save', auth, async (req, res) => {
+  const client = await pool.connect()
+  try {
+    const distributorId = parseInt(req.body.distributor_id)
+    const goodsIds = Array.isArray(req.body.goods_ids) ? req.body.goods_ids.map(Number).filter(Boolean) : []
+    if (!distributorId) return fail(res, 'distributor_id必填')
+    await client.query('BEGIN')
+    await client.query(`DELETE FROM distributor_goods WHERE distributor_id=$1`, [distributorId])
+    for (let i = 0; i < goodsIds.length; i++) {
+      await client.query(
+        `INSERT INTO distributor_goods (distributor_id, goods_id, status, sort)
+         VALUES ($1,$2,1,$3)
+         ON CONFLICT (distributor_id, goods_id) DO UPDATE SET status=1, sort=$3`,
+        [distributorId, goodsIds[i], i]
+      )
+    }
+    await client.query('COMMIT')
+    return ok(res)
+  } catch(e) {
+    await client.query('ROLLBACK').catch(() => {})
+    fail(res, e.message)
+  } finally {
+    client.release()
+  }
+})
+
+// ERP后台 — 分销素材库
+app.get('/adminapi/distributor/materials', auth, async (req, res) => {
+  try {
+    const distributorId = parseInt(req.query.distributor_id || 0)
+    const params = []
+    let where = `WHERE m.status=1`
+    if (distributorId) {
+      params.push(distributorId)
+      where += ` AND (m.scope='public' OR m.distributor_id=$${params.length})`
+    }
+    const rows = (await pool.query(
+      `SELECT m.*, d.name as distributor_name, g.goods_name
+       FROM distributor_materials m
+       LEFT JOIN distributors d ON d.id=m.distributor_id
+       LEFT JOIN goods g ON g.id=m.goods_id
+       ${where}
+       ORDER BY m.sort ASC, m.id DESC`,
+      params
+    )).rows
+    return ok(res, rows)
+  } catch(e) { fail(res, e.message) }
+})
+
+app.post('/adminapi/distributor/materials/save', auth, async (req, res) => {
+  try {
+    const { id, title, type = 'text', content = '', file_url = '', goods_id = 0, scope = 'public', distributor_id = 0, sort = 0 } = req.body
+    if (!title) return fail(res, '标题必填')
+    if (id) {
+      const row = (await pool.query(
+        `UPDATE distributor_materials
+         SET title=$1,type=$2,content=$3,file_url=$4,goods_id=$5,scope=$6,distributor_id=$7,sort=$8,updated_at=NOW()
+         WHERE id=$9 RETURNING *`,
+        [title, type, content, file_url, parseInt(goods_id) || 0, scope, parseInt(distributor_id) || 0, parseInt(sort) || 0, id]
+      )).rows[0]
+      return ok(res, row)
+    }
+    const row = (await pool.query(
+      `INSERT INTO distributor_materials (title,type,content,file_url,goods_id,scope,distributor_id,sort)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+      [title, type, content, file_url, parseInt(goods_id) || 0, scope, parseInt(distributor_id) || 0, parseInt(sort) || 0]
+    )).rows[0]
+    return ok(res, row)
+  } catch(e) { fail(res, e.message) }
+})
+
+app.post('/adminapi/distributor/materials/del', auth, async (req, res) => {
+  try {
+    const { id } = req.body
+    if (!id) return fail(res, 'id必填')
+    await pool.query(`UPDATE distributor_materials SET status=0, updated_at=NOW() WHERE id=$1`, [id])
+    return ok(res)
   } catch(e) { fail(res, e.message) }
 })
 

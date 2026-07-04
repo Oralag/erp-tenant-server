@@ -5641,6 +5641,9 @@ app.get('/miniapi/brand/config', async (req, res) => {
     if (Array.isArray(cfg.heroImages)) {
       cfg.heroImages = cfg.heroImages.filter(Boolean).map(abs)
     }
+    if (Array.isArray(cfg.homeStoryImages)) {
+      cfg.homeStoryImages = cfg.homeStoryImages.filter(Boolean).map(abs)
+    }
     if (Array.isArray(cfg.categories)) {
       cfg.categories = cfg.categories.map(c => ({ ...c, img: abs(c.img) }))
     }

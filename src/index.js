@@ -4170,7 +4170,9 @@ function parseBrandGoods(row) {
     description: brand.description || row.goods_memo || '',
     tags: brand.tags || [],
     category: brand.category || '',
-    skuVariants: brand.skuVariants || null,
+    skuVariants: brand.skuVariants
+      ? brand.skuVariants.map(v => ({ ...v, image: v.image ? toAbsUrl(v.image) : '' }))
+      : null,
     rating: brand.rating || 5.0,
     wholesalePrice: brand.wholesalePrice || 0,
     minOrderQuantity: brand.minOrderQuantity || 1,

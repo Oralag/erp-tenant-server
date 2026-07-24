@@ -4308,14 +4308,15 @@ async function getDistributorScope(req) {
   )).rows[0]
   if (!distributor) return { code: '', distributor: null, restricted: false, allowedIds: [] }
   const goodsRows = (await pool.query(
-    `SELECT goods_id FROM distributor_goods WHERE distributor_id=$1 AND status=1`,
+    `SELECT goods_id, visible FROM distributor_goods
+     WHERE distributor_id=$1 AND status=1`,
     [distributor.id]
   )).rows
   return {
     code: distributor.code,
     distributor,
     restricted: goodsRows.length > 0,
-    allowedIds: goodsRows.map(r => parseInt(r.goods_id)).filter(Boolean),
+    allowedIds: goodsRows.filter(r => r.visible !== false).map(r => parseInt(r.goods_id)).filter(Boolean),
   }
 }
 
@@ -4774,6 +4775,7 @@ app.post('/miniapi/order/confirm', miniAuth, async (req, res) => {
         distributor_id INT NOT NULL,
         goods_id INT NOT NULL,
         status INT DEFAULT 1,
+        visible BOOLEAN DEFAULT TRUE,
         sort INT DEFAULT 0,
         custom_price NUMERIC(10,2) DEFAULT 0,
         commission_rate NUMERIC(5,2),
@@ -4781,6 +4783,7 @@ app.post('/miniapi/order/confirm', miniAuth, async (req, res) => {
         UNIQUE(distributor_id, goods_id)
       )
     `)
+    await pool.query(`ALTER TABLE distributor_goods ADD COLUMN IF NOT EXISTS visible BOOLEAN DEFAULT TRUE`)
     await pool.query(`
       CREATE TABLE IF NOT EXISTS distributor_materials (
         id SERIAL PRIMARY KEY,
@@ -4935,15 +4938,39 @@ app.get('/miniapi/distributor/goods', miniAuth, async (req, res) => {
     const dist = (await pool.query(`SELECT id FROM distributors WHERE user_id=$1 AND status=1 LIMIT 1`, [req.miniUser.id])).rows[0]
     if (!dist) return fail(res, '非分销商')
     const assigned = (await pool.query(
-      `SELECT g.id, g.goods_name, g.images, g.remark, g.sell_price, g.unit_name, g.spec, g.barcode, g.goods_memo, g.sort
+      `SELECT g.id, g.goods_name, g.images, g.remark, g.sell_price, g.unit_name, g.spec, g.barcode, g.goods_memo, g.sort,
+              dg.visible
        FROM distributor_goods dg
        JOIN goods g ON g.id=dg.goods_id AND g.deleted_at IS NULL AND g.status=1 AND g.can_sale=1
        WHERE dg.distributor_id=$1 AND dg.status=1
        ORDER BY dg.sort ASC, dg.id DESC`,
       [dist.id]
     )).rows
-    const rows = assigned.map(parseBrandGoods)
+    const rows = assigned.map(g => ({ ...parseBrandGoods(g), visible: g.visible !== false }))
     return ok(res, rows)
+  } catch(e) { fail(res, e.message) }
+})
+
+// 分销商自主设置已授权商品是否向客户展示
+app.post('/miniapi/distributor/goods/visibility', miniAuth, async (req, res) => {
+  try {
+    const goodsId = parseInt(req.body.goods_id)
+    const visible = req.body.visible !== false
+    if (!goodsId) return fail(res, 'goods_id必填')
+    const dist = (await pool.query(
+      `SELECT id FROM distributors WHERE user_id=$1 AND status=1 LIMIT 1`,
+      [req.miniUser.id]
+    )).rows[0]
+    if (!dist) return fail(res, '非分销商')
+    const row = (await pool.query(
+      `UPDATE distributor_goods
+       SET visible=$1
+       WHERE distributor_id=$2 AND goods_id=$3 AND status=1
+       RETURNING goods_id, visible`,
+      [visible, dist.id, goodsId]
+    )).rows[0]
+    if (!row) return fail(res, '该商品未授权给当前分销商')
+    return ok(res, row)
   } catch(e) { fail(res, e.message) }
 })
 
@@ -5007,13 +5034,18 @@ app.post('/adminapi/distributor/goods/save', auth, async (req, res) => {
     const goodsIds = Array.isArray(req.body.goods_ids) ? req.body.goods_ids.map(Number).filter(Boolean) : []
     if (!distributorId) return fail(res, 'distributor_id必填')
     await client.query('BEGIN')
+    const visibilityRows = (await client.query(
+      `SELECT goods_id, visible FROM distributor_goods WHERE distributor_id=$1`,
+      [distributorId]
+    )).rows
+    const visibilityMap = new Map(visibilityRows.map(row => [Number(row.goods_id), row.visible !== false]))
     await client.query(`DELETE FROM distributor_goods WHERE distributor_id=$1`, [distributorId])
     for (let i = 0; i < goodsIds.length; i++) {
       await client.query(
-        `INSERT INTO distributor_goods (distributor_id, goods_id, status, sort)
-         VALUES ($1,$2,1,$3)
-         ON CONFLICT (distributor_id, goods_id) DO UPDATE SET status=1, sort=$3`,
-        [distributorId, goodsIds[i], i]
+        `INSERT INTO distributor_goods (distributor_id, goods_id, status, sort, visible)
+         VALUES ($1,$2,1,$3,$4)
+         ON CONFLICT (distributor_id, goods_id) DO UPDATE SET status=1, sort=$3, visible=$4`,
+        [distributorId, goodsIds[i], i, visibilityMap.get(goodsIds[i]) !== false]
       )
     }
     await client.query('COMMIT')

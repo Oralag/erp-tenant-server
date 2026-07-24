@@ -2769,8 +2769,29 @@ router.post('/finance/Prepay/del', async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════════════
 
 // retail/order
+// 一次性迁移：加 admin_id/admin_name 列 + 回填历史零售单归属该店超级管理员
+let retailAdminMigrated = false
+async function ensureRetailAdminCols() {
+  if (retailAdminMigrated) return
+  try {
+    await pool.query(`ALTER TABLE retail_orders ADD COLUMN IF NOT EXISTS admin_id INT DEFAULT 0`)
+    await pool.query(`ALTER TABLE retail_orders ADD COLUMN IF NOT EXISTS admin_name VARCHAR(100) DEFAULT ''`)
+    await pool.query(`
+      UPDATE retail_orders ro
+      SET admin_id = a.id, admin_name = a.name
+      FROM admins a
+      WHERE ro.shop_id = a.shop_id
+        AND a.role_id = 0
+        AND a.deleted_at IS NULL
+        AND (ro.admin_id IS NULL OR ro.admin_id = 0)
+    `)
+    retailAdminMigrated = true
+  } catch (e) { console.error('[retail admin migrate]', e.message) }
+}
+
 router.get('/retail/order/index', async (req, res) => {
   try { await pool.query(`ALTER TABLE retail_orders ADD COLUMN IF NOT EXISTS fee_items JSONB DEFAULT '[]'`) } catch {}
+  await ensureRetailAdminCols()
   try {
     const { page, list_rows, offset } = pageParams(req.query)
     await listQuery(res, 'retail_orders', { keyword: req.query.keyword, keywordCols: ['order_sn','member_name'], baseWhere: shopBase(req, '1=1'), orderBy: 'id DESC', page, list_rows, offset })
@@ -2782,8 +2803,21 @@ router.post('/retail/order/add', async (req, res) => {
     await pool.query(`ALTER TABLE retail_orders ADD COLUMN IF NOT EXISTS store_id INT DEFAULT 0`)
     await pool.query(`ALTER TABLE retail_orders ADD COLUMN IF NOT EXISTS store_name VARCHAR(100) DEFAULT ''`)
     await pool.query(`ALTER TABLE retail_orders ADD COLUMN IF NOT EXISTS fee_items JSONB DEFAULT '[]'`)
+    await ensureRetailAdminCols()
     await loadTableCols()
-    const b = filterBodyCols('retail_orders', { order_sn: genOrderNo('LS'), ...req.body, shop_id: parseInt(req.admin?.shop_id) || 1 })
+    // 服务端强制注入创建人（不信客户端传的 admin_id/admin_name）
+    let adminName = ''
+    try {
+      const a = await pool.query('SELECT name FROM admins WHERE id=$1', [req.admin?.id])
+      adminName = a.rows[0]?.name || ''
+    } catch {}
+    const b = filterBodyCols('retail_orders', {
+      order_sn: genOrderNo('LS'),
+      ...req.body,
+      admin_id: parseInt(req.admin?.id) || 0,
+      admin_name: adminName,
+      shop_id: parseInt(req.admin?.shop_id) || 1,
+    })
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
     const vals = cols.map(k => typeof b[k] === 'object' ? JSON.stringify(b[k]) : b[k])
     const r = await pool.query(`INSERT INTO retail_orders (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)

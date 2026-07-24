@@ -4338,7 +4338,8 @@ app.get('/miniapi/goods/list', async (req, res) => {
       `SELECT id, goods_name, images, remark, sell_price, unit_name, spec, barcode, goods_memo, sort FROM goods ${where} ORDER BY sort ASC, id DESC LIMIT 500`,
       params
     )).rows
-    const brandRows = rows.filter(g => {
+    // 配置了分销商品池时，以商品池为准；未配置时仍只展示品牌主页已上架商品。
+    const brandRows = distScope.restricted ? rows : rows.filter(g => {
       try { return JSON.parse(g.remark || '{}')['__brand__']?.show === true } catch { return false }
     })
     // 按基础销量降序排列
@@ -4787,6 +4788,12 @@ app.post('/miniapi/order/confirm', miniAuth, async (req, res) => {
         type VARCHAR(20) NOT NULL DEFAULT 'text',
         content TEXT DEFAULT '',
         file_url TEXT DEFAULT '',
+        file_urls TEXT DEFAULT '[]',
+        cover_url TEXT DEFAULT '',
+        source VARCHAR(20) DEFAULT 'upload',
+        sync_url TEXT DEFAULT '',
+        synced_at TIMESTAMPTZ,
+        category VARCHAR(30) DEFAULT 'product',
         goods_id INT DEFAULT 0,
         scope VARCHAR(20) DEFAULT 'public',
         distributor_id INT DEFAULT 0,
@@ -4796,6 +4803,12 @@ app.post('/miniapi/order/confirm', miniAuth, async (req, res) => {
         updated_at TIMESTAMPTZ DEFAULT NOW()
       )
     `)
+    await pool.query(`ALTER TABLE distributor_materials ADD COLUMN IF NOT EXISTS file_urls TEXT DEFAULT '[]'`)
+    await pool.query(`ALTER TABLE distributor_materials ADD COLUMN IF NOT EXISTS cover_url TEXT DEFAULT ''`)
+    await pool.query(`ALTER TABLE distributor_materials ADD COLUMN IF NOT EXISTS source VARCHAR(20) DEFAULT 'upload'`)
+    await pool.query(`ALTER TABLE distributor_materials ADD COLUMN IF NOT EXISTS sync_url TEXT DEFAULT ''`)
+    await pool.query(`ALTER TABLE distributor_materials ADD COLUMN IF NOT EXISTS synced_at TIMESTAMPTZ`)
+    await pool.query(`ALTER TABLE distributor_materials ADD COLUMN IF NOT EXISTS category VARCHAR(30) DEFAULT 'product'`)
     await pool.query(`
       UPDATE mini_users u
       SET distributor_code = first_orders.distributor_code
@@ -5038,21 +5051,41 @@ app.get('/adminapi/distributor/materials', auth, async (req, res) => {
 
 app.post('/adminapi/distributor/materials/save', auth, async (req, res) => {
   try {
-    const { id, title, type = 'text', content = '', file_url = '', goods_id = 0, scope = 'public', distributor_id = 0, sort = 0 } = req.body
+    const {
+      id, title, type = 'article', content = '', file_url = '', file_urls = [],
+      cover_url = '', source = 'upload', sync_url = '', goods_id = 0,
+      category = 'product', scope = 'public', distributor_id = 0, sort = 0,
+    } = req.body
     if (!title) return fail(res, '标题必填')
+    const normalizedFiles = Array.isArray(file_urls)
+      ? file_urls.filter(Boolean).slice(0, 9)
+      : (() => { try { return JSON.parse(file_urls || '[]').filter(Boolean).slice(0, 9) } catch { return [] } })()
+    const filesJson = JSON.stringify(normalizedFiles)
+    const syncedAt = source === 'sync' ? new Date() : null
     if (id) {
       const row = (await pool.query(
         `UPDATE distributor_materials
-         SET title=$1,type=$2,content=$3,file_url=$4,goods_id=$5,scope=$6,distributor_id=$7,sort=$8,updated_at=NOW()
-         WHERE id=$9 RETURNING *`,
-        [title, type, content, file_url, parseInt(goods_id) || 0, scope, parseInt(distributor_id) || 0, parseInt(sort) || 0, id]
+         SET title=$1,type=$2,content=$3,file_url=$4,file_urls=$5,cover_url=$6,
+             source=$7,sync_url=$8,synced_at=$9,goods_id=$10,scope=$11,
+             distributor_id=$12,sort=$13,category=$14,updated_at=NOW()
+         WHERE id=$15 RETURNING *`,
+        [
+          title, type, content, file_url, filesJson, cover_url, source,
+          sync_url, syncedAt, parseInt(goods_id) || 0, scope,
+          parseInt(distributor_id) || 0, parseInt(sort) || 0, category, id,
+        ]
       )).rows[0]
       return ok(res, row)
     }
     const row = (await pool.query(
-      `INSERT INTO distributor_materials (title,type,content,file_url,goods_id,scope,distributor_id,sort)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
-      [title, type, content, file_url, parseInt(goods_id) || 0, scope, parseInt(distributor_id) || 0, parseInt(sort) || 0]
+      `INSERT INTO distributor_materials
+       (title,type,content,file_url,file_urls,cover_url,source,sync_url,synced_at,goods_id,scope,distributor_id,sort,category)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *`,
+      [
+        title, type, content, file_url, filesJson, cover_url, source,
+        sync_url, syncedAt, parseInt(goods_id) || 0, scope,
+        parseInt(distributor_id) || 0, parseInt(sort) || 0, category,
+      ]
     )).rows[0]
     return ok(res, row)
   } catch(e) { fail(res, e.message) }

@@ -73,6 +73,40 @@ async function sendSubscribeMsg(openid, tmplId, page, data) {
     req.end()
   })
 }
+
+async function notifyAdminNewOrder(order, items = []) {
+  const key = process.env.SERVER_JIANG_KEY
+  if (!key || !order) return
+  const address = typeof order.address === 'string'
+    ? (() => { try { return JSON.parse(order.address || '{}') } catch { return {} } })()
+    : (order.address || {})
+  const deliveryLabels = ['物流发货', '跑腿送货', '到店自提']
+  const delivery = deliveryLabels[parseInt(order.delivery_type || 0)] || '物流发货'
+  const goods = items.map(i => `${i.goods_name}×${i.qty || 1}`).join('、') || '商品'
+  const receiver = parseInt(order.delivery_type || 0) === 2
+    ? (order.store_name || '到店自提')
+    : `${address.name || ''} ${address.phone || ''}`.trim()
+  const title = '🔔 小程序新订单'
+  const desp = [
+    `订单号：${order.order_no}`,
+    `实付金额：¥${parseFloat(order.total_amount || order.total || 0).toFixed(2)}`,
+    `配送方式：${delivery}`,
+    `商品：${goods}`,
+    `收货人：${receiver || '未填写'}`,
+    '',
+    '请登录 ERP → 小程序 → 小程序订单及时处理。',
+  ].join('\n')
+  try {
+    const response = await fetch(`https://sctapi.ftqq.com/${key}.send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title, desp }),
+    })
+    if (!response.ok) console.log('admin order notify failed:', response.status)
+  } catch (e) {
+    console.log('admin order notify error:', e.message)
+  }
+}
 const JWT_SECRET = process.env.JWT_SECRET || 'erp_secret_2024'
 
 app.use(cors())
@@ -5454,8 +5488,8 @@ app.post('/miniapi/pay/notify', async (req, res) => {
       }
       const paidUser = (await pool.query(`SELECT * FROM mini_users WHERE id=$1`, [updOrder.user_id])).rows[0]
       if (paidUser) {
+        const paidItems = (await pool.query(`SELECT goods_name, qty FROM mini_order_items WHERE order_id=$1`, [updOrder.id])).rows
         if (paidUser.openid && TMPL_ORDER_SUCCESS) {
-          const paidItems = (await pool.query(`SELECT goods_name FROM mini_order_items WHERE order_id=$1`, [updOrder.id])).rows
           const goodsName = paidItems.map(i => i.goods_name).join('、').slice(0, 20)
           const now = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })
           sendSubscribeMsg(paidUser.openid, TMPL_ORDER_SUCCESS, `pages/order/detail?id=${updOrder.id}`, {
@@ -5465,6 +5499,7 @@ app.post('/miniapi/pay/notify', async (req, res) => {
             time1: { value: now.slice(0, 16) },
           }).catch(() => {})
         }
+        notifyAdminNewOrder(updOrder, paidItems).catch(() => {})
         const lvl = calcLevel(paidUser)
         const mult = MEMBER_LEVELS[lvl].multiplier
         const earnPoints = Math.floor(parseFloat(updOrder.total_amount || updOrder.total || 0) * POINTS_PER_YUAN * mult)

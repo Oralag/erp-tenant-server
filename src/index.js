@@ -5406,7 +5406,7 @@ app.post('/miniapi/pay/unified', miniAuth, async (req, res) => {
     const wxRes = await wxV3Post('/v3/pay/transactions/jsapi', {
       appid: WX_APPID,
       mchid: WX_MCH_ID,
-      description: '数字游牧ERP-商品购买',
+      description: '牧区纯坊',
       out_trade_no: order.order_no,
       notify_url: notifyUrl,
       amount: { total: totalFee, currency: 'CNY' },
@@ -5654,7 +5654,7 @@ app.post('/miniapi/member/buy-vip', miniAuth, async (req, res) => {
     const wxRes = await wxV3Post('/v3/pay/transactions/jsapi', {
       appid: WX_APPID,
       mchid: WX_MCH_ID,
-      description: '数字游牧-VIP年度会员',
+      description: '牧区纯坊',
       out_trade_no: orderNo,
       notify_url: 'https://erp-server-xsji.onrender.com/miniapi/pay/vip-notify',
       amount: { total: totalFee, currency: 'CNY' },

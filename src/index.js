@@ -755,6 +755,7 @@ router.post('/shop/ShopCustomer/batchDel', async (req, res) => {
 
 // ContractOrder (销售合同)
 router.get('/shop/ContractOrder/index', async (req, res) => {
+  await ensureAdminCols('sale_contracts')
   try {
     const { page, list_rows, offset } = pageParams(req.query)
     const conditions = ['deleted_at IS NULL']
@@ -774,7 +775,21 @@ router.get('/shop/ContractOrder/detail', async (req, res) => {
 })
 router.post('/shop/ContractOrder/add', async (req, res) => {
   try {
-    const b = filterBodyCols('sale_contracts', { order_no: genOrderNo('XS'), order_sn: genOrderNo('XS'), ...req.body, shop_id: parseInt(req.admin?.shop_id) || 1 })
+    await ensureAdminCols('sale_contracts')
+    await loadTableCols()
+    let adminName = ''
+    try {
+      const a = await pool.query('SELECT name FROM admins WHERE id=$1', [req.admin?.id])
+      adminName = a.rows[0]?.name || ''
+    } catch {}
+    const b = filterBodyCols('sale_contracts', {
+      order_no: genOrderNo('XS'),
+      order_sn: genOrderNo('XS'),
+      ...req.body,
+      admin_id: parseInt(req.admin?.id) || 0,
+      admin_name: adminName,
+      shop_id: parseInt(req.admin?.shop_id) || 1,
+    })
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
     const vals = cols.map(k => typeof b[k] === 'object' ? JSON.stringify(b[k]) : b[k])
     const r = await pool.query(`INSERT INTO sale_contracts (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
@@ -958,6 +973,7 @@ router.post('/shop/offerOrder/audit', async (req, res) => {
 
 // PurchaseOrder
 router.get('/stock/PurchaseOrder/index', async (req, res) => {
+  await ensureAdminCols('purchase_order')
   try {
     const { page, list_rows, offset } = pageParams(req.query)
     const conditions = ['deleted_at IS NULL']
@@ -968,7 +984,21 @@ router.get('/stock/PurchaseOrder/index', async (req, res) => {
 })
 router.post('/stock/PurchaseOrder/add', async (req, res) => {
   try {
-    const b = filterBodyCols('purchase_order', { order_no: genOrderNo('CG'), order_sn: genOrderNo('CG'), ...req.body, shop_id: parseInt(req.admin?.shop_id) || 1 })
+    await ensureAdminCols('purchase_order')
+    await loadTableCols()
+    let adminName = ''
+    try {
+      const a = await pool.query('SELECT name FROM admins WHERE id=$1', [req.admin?.id])
+      adminName = a.rows[0]?.name || ''
+    } catch {}
+    const b = filterBodyCols('purchase_order', {
+      order_no: genOrderNo('CG'),
+      order_sn: genOrderNo('CG'),
+      ...req.body,
+      admin_id: parseInt(req.admin?.id) || 0,
+      admin_name: adminName,
+      shop_id: parseInt(req.admin?.shop_id) || 1,
+    })
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
     const vals = cols.map(k => typeof b[k] === 'object' ? JSON.stringify(b[k]) : b[k])
     const r = await pool.query(`INSERT INTO purchase_order (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
@@ -2769,25 +2799,26 @@ router.post('/finance/Prepay/del', async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════════════
 
 // retail/order
-// 一次性迁移：加 admin_id/admin_name 列 + 回填历史零售单归属该店超级管理员
-let retailAdminMigrated = false
-async function ensureRetailAdminCols() {
-  if (retailAdminMigrated) return
+// 一次性迁移：加 admin_id/admin_name 列 + 回填历史单归属该店超级管理员
+const adminColsMigrated = new Set()
+async function ensureAdminCols(table) {
+  if (adminColsMigrated.has(table)) return
   try {
-    await pool.query(`ALTER TABLE retail_orders ADD COLUMN IF NOT EXISTS admin_id INT DEFAULT 0`)
-    await pool.query(`ALTER TABLE retail_orders ADD COLUMN IF NOT EXISTS admin_name VARCHAR(100) DEFAULT ''`)
+    await pool.query(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS admin_id INT DEFAULT 0`)
+    await pool.query(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS admin_name VARCHAR(100) DEFAULT ''`)
     await pool.query(`
-      UPDATE retail_orders ro
+      UPDATE ${table} t
       SET admin_id = a.id, admin_name = a.name
       FROM admins a
-      WHERE ro.shop_id = a.shop_id
+      WHERE t.shop_id = a.shop_id
         AND a.role_id = 0
         AND a.deleted_at IS NULL
-        AND (ro.admin_id IS NULL OR ro.admin_id = 0)
+        AND (t.admin_id IS NULL OR t.admin_id = 0)
     `)
-    retailAdminMigrated = true
-  } catch (e) { console.error('[retail admin migrate]', e.message) }
+    adminColsMigrated.add(table)
+  } catch (e) { console.error(`[${table} admin migrate]`, e.message) }
 }
+const ensureRetailAdminCols = () => ensureAdminCols('retail_orders')
 
 router.get('/retail/order/index', async (req, res) => {
   try { await pool.query(`ALTER TABLE retail_orders ADD COLUMN IF NOT EXISTS fee_items JSONB DEFAULT '[]'`) } catch {}
@@ -5710,19 +5741,14 @@ app.post('/miniapi/nova/chat', async (req, res) => {
       }).join('\n')
     } catch {}
 
-    const brandContext = `你是 NOMADIC DAIRY 的专属客服 Nova，熟悉所有产品详情，语气亲切自然。
+    const brandContext = `【在售商品】
+${productLines || '（暂无实时商品数据，遇到具体价格/规格问题请引导用户去商店页面查看）'}
 
-【品牌】NOMADIC DAIRY — 内蒙古草原奶食品牌。纯天然无添加，传统蒙古族工艺，鲜奶直供，可溯源到牧场。
+【物流】顺丰冷链 1-3 日、京东次日达，满 199 包邮
+【售后】7 天无忧退换，破损必赔
+【批发】起订量各品类不同，请引导用户填写采购商申请表或联系客服报价
 
-【在售商品】
-${productLines || '奶皮、奶豆腐、青砖奶茶、冻炒米、奶果子、蒙古黄油'}
-
-【物流】顺丰冷链1-3日、京东次日达，满199包邮。
-【售后】7天无忧退换，破损必赔。
-【批发】起订量各品类不同，请联系客服报价。
-【注意】不要主动提及具体地名（如锡林郭勒等），除非用户先问到产地。
-
-回答时如果用户问具体产品的价格或规格，从上方商品列表里准确引用，不要编造数字。`
+回答时如果用户问具体产品的价格或规格，只能从上方【在售商品】里准确引用，不要编造数字；商品列表里没有的品类，如实说"这个目前没上架"。`
 
     const cfRes = await fetch('https://nomaderp.pages.dev/api/brand-chat', {
       method: 'POST',
@@ -5989,13 +6015,30 @@ app.post('/miniapi/wholesale/inquiry', async (req, res) => {
     // 预置默认券
     await pool.query(`
       INSERT INTO mini_coupons (name, type, discount_value, min_order, validity_days, total_count, points_cost)
-      VALUES ('新客满减券·满100减10', 'new_user', 10, 100, 30, -1, 0),
-             ('新客满减券·满300减20', 'new_user', 20, 300, 30, -1, 0),
-             ('生日特权券', 'birthday', 15, 50, 7, -1, 0),
-             ('签到7天专享券', 'signin7', 8, 30, 14, -1, 0),
-             ('抽奖券·满50减5', 'lottery', 5, 50, 7, -1, 0),
-             ('抽奖券·满100减10', 'lottery', 10, 100, 7, -1, 0)
-      ON CONFLICT DO NOTHING
+      SELECT v.* FROM (VALUES
+        ('新客满减券·满100减10', 'new_user', 10::numeric, 100::numeric, 30, -1, 0),
+        ('新客满减券·满300减20', 'new_user', 20::numeric, 300::numeric, 30, -1, 0),
+        ('生日特权券', 'birthday', 15::numeric, 50::numeric, 7, -1, 0),
+        ('签到7天专享券', 'signin7', 8::numeric, 30::numeric, 14, -1, 0),
+        ('抽奖券·满50减5', 'lottery', 5::numeric, 50::numeric, 7, -1, 0),
+        ('抽奖券·满100减10', 'lottery', 10::numeric, 100::numeric, 7, -1, 0)
+      ) AS v(name, type, discount_value, min_order, validity_days, total_count, points_cost)
+      WHERE NOT EXISTS (
+        SELECT 1 FROM mini_coupons c
+        WHERE c.type=v.type AND c.discount_value=v.discount_value AND c.min_order=v.min_order
+      )
+    `)
+    // 历史版本曾在每次服务启动时重复插入默认券；只保留每组最早的一张有效券。
+    await pool.query(`
+      WITH duplicates AS (
+        SELECT id, ROW_NUMBER() OVER (
+          PARTITION BY type, name, discount_value, min_order, validity_days, points_cost
+          ORDER BY id
+        ) AS rn
+        FROM mini_coupons
+      )
+      UPDATE mini_coupons SET status=0
+      WHERE id IN (SELECT id FROM duplicates WHERE rn > 1)
     `)
     console.log('mini_coupons tables ready')
   } catch(e) { console.log('mini_coupons init:', e.message) }

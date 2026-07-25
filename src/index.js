@@ -6967,6 +6967,11 @@ app.post('/adminapi/mini/coupons/del', auth, async (req, res) => {
     `)
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_mvc_video ON mini_video_comments(video_id)`)
     await pool.query(`ALTER TABLE mini_video_comments ADD COLUMN IF NOT EXISTS display_name VARCHAR(40)`)
+    // 内容频道兼容升级：保留原表及互动外键，增加图文所需字段。
+    await pool.query(`ALTER TABLE mini_videos ADD COLUMN IF NOT EXISTS content_type VARCHAR(20) NOT NULL DEFAULT 'video'`)
+    await pool.query(`ALTER TABLE mini_videos ADD COLUMN IF NOT EXISTS content TEXT DEFAULT ''`)
+    await pool.query(`ALTER TABLE mini_videos ADD COLUMN IF NOT EXISTS images JSONB NOT NULL DEFAULT '[]'::jsonb`)
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_mini_content_type ON mini_videos(content_type, status, sort DESC, id DESC)`)
 
     // 为没有评论的视频插入预设评论
     const SEED_COMMENTS = [
@@ -7039,6 +7044,7 @@ app.post('/adminapi/mini/coupons/del', auth, async (req, res) => {
 app.get('/miniapi/video/list', async (req, res) => {
   try {
     const page = Math.max(1, parseInt(req.query.page) || 1)
+    const contentType = req.query.type === 'article' ? 'article' : 'video'
     const limit = 5
     const offset = (page - 1) * limit
     const uid = req.miniUser?.id || 0
@@ -7047,10 +7053,10 @@ app.get('/miniapi/video/list', async (req, res) => {
       `SELECT v.*, g.goods_name, g.sell_price AS sale_price, g.images AS header_images
        FROM mini_videos v
        LEFT JOIN goods g ON g.id=v.goods_id
-       WHERE v.status=1
+       WHERE v.status=1 AND v.content_type=$3
        ORDER BY v.sort DESC, v.id DESC
        LIMIT $1 OFFSET $2`,
-      [limit, offset]
+      [limit, offset, contentType]
     )).rows
 
     // 当前用户点赞状态
@@ -7067,9 +7073,39 @@ app.get('/miniapi/video/list', async (req, res) => {
     const list = rows.map(r => ({
       ...r,
       liked: likedIds.has(r.id),
+      images: Array.isArray(r.images) ? r.images : [],
       header_images: r.header_images ? (typeof r.header_images === 'string' ? JSON.parse(r.header_images) : r.header_images) : [],
     }))
     return ok(res, { list, has_more: rows.length === limit })
+  } catch(e) { fail(res, e.message) }
+})
+
+// 图文详情
+app.get('/miniapi/content/detail/:id', async (req, res) => {
+  try {
+    const uid = req.miniUser?.id || 0
+    const row = (await pool.query(
+      `SELECT v.*, g.goods_name, g.sell_price AS sale_price, g.images AS header_images
+       FROM mini_videos v
+       LEFT JOIN goods g ON g.id=v.goods_id
+       WHERE v.id=$1 AND v.status=1 LIMIT 1`,
+      [req.params.id]
+    )).rows[0]
+    if (!row) return fail(res, '内容不存在')
+    let liked = false
+    if (uid) {
+      liked = !!(await pool.query(
+        `SELECT id FROM mini_video_likes WHERE video_id=$1 AND user_id=$2 LIMIT 1`,
+        [row.id, uid]
+      )).rows[0]
+    }
+    await pool.query(`UPDATE mini_videos SET view_count=view_count+1 WHERE id=$1`, [row.id])
+    return ok(res, {
+      ...row,
+      liked,
+      images: Array.isArray(row.images) ? row.images : [],
+      header_images: row.header_images ? (typeof row.header_images === 'string' ? JSON.parse(row.header_images) : row.header_images) : [],
+    })
   } catch(e) { fail(res, e.message) }
 })
 
@@ -7156,18 +7192,32 @@ app.get('/adminapi/mini/videos', auth, async (req, res) => {
 // 管理端：新增/编辑视频
 app.post('/adminapi/mini/videos/save', auth, async (req, res) => {
   try {
-    const { id, title, description, video_url, cover_url, goods_id, sort = 0, status = 1 } = req.body
-    if (!title || !video_url) return fail(res, '标题和视频URL必填')
+    const {
+      id, title, description, video_url = '', cover_url = '', goods_id,
+      sort = 0, status = 1, content_type = 'video', content = '', images = []
+    } = req.body
+    if (!title) return fail(res, '标题必填')
+    if (content_type === 'video' && !video_url) return fail(res, '请上传视频')
+    if (content_type === 'article' && !cover_url && !images.length) return fail(res, '请至少上传一张图片')
+    const safeType = content_type === 'article' ? 'article' : 'video'
+    const safeImages = Array.isArray(images) ? images.filter(Boolean).slice(0, 9) : []
     if (id) {
       const r = await pool.query(
-        `UPDATE mini_videos SET title=$1,description=$2,video_url=$3,cover_url=$4,goods_id=$5,sort=$6,status=$7 WHERE id=$8 RETURNING *`,
-        [title, description, video_url, cover_url, goods_id || 0, sort, status, id]
+        `UPDATE mini_videos
+         SET title=$1,description=$2,video_url=$3,cover_url=$4,goods_id=$5,sort=$6,status=$7,
+             content_type=$8,content=$9,images=$10::jsonb
+         WHERE id=$11 RETURNING *`,
+        [title, description, video_url, cover_url, goods_id || 0, sort, status,
+          safeType, content, JSON.stringify(safeImages), id]
       )
       return ok(res, r.rows[0])
     } else {
       const r = await pool.query(
-        `INSERT INTO mini_videos (title,description,video_url,cover_url,goods_id,sort,status) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
-        [title, description, video_url, cover_url, goods_id || 0, sort, status]
+        `INSERT INTO mini_videos
+         (title,description,video_url,cover_url,goods_id,sort,status,content_type,content,images)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb) RETURNING *`,
+        [title, description, video_url, cover_url, goods_id || 0, sort, status,
+          safeType, content, JSON.stringify(safeImages)]
       )
       return ok(res, r.rows[0])
     }

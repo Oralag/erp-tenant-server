@@ -6610,30 +6610,40 @@ app.post('/miniapi/wholesale/inquiry', async (req, res) => {
       )
     `)
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_muc_user ON mini_user_coupons(user_id)`)
-    // 优惠券去重迁移：coupon_type冗余列 + 按类型的偏索引 + 清理历史脏数据
+    // 优惠券去重迁移：coupon_type冗余列 + 按签名的偏索引 + 清理历史脏数据
     await pool.query(`ALTER TABLE mini_user_coupons ADD COLUMN IF NOT EXISTS coupon_type VARCHAR(20)`)
     await pool.query(`UPDATE mini_user_coupons uc SET coupon_type = c.type FROM mini_coupons c WHERE uc.coupon_id = c.id AND uc.coupon_type IS NULL`)
-    // 清理新客券重复（保留 status=1 已用 > status=3 锁定 > 有 order_id > 最早领取）
+    // 清理新客券：按"券签名"(name+discount_value+min_order)去重，每档只保留1张
+    // 保留优先级：已用 > 锁定 > 有order_id > 券本身active > 最早领取
+    // 允许一人多张不同档位（如满100减10 + 满300减20）
     await pool.query(`DELETE FROM mini_user_coupons WHERE id IN (
-      SELECT id FROM (
-        SELECT id, ROW_NUMBER() OVER (
-          PARTITION BY user_id, coupon_id
-          ORDER BY (status=1)::int DESC, (status=3)::int DESC,
-                   (order_id IS NOT NULL)::int DESC, claimed_at ASC, id ASC
-        ) rn FROM mini_user_coupons WHERE coupon_type='new_user'
+      SELECT uc_id FROM (
+        SELECT uc.id AS uc_id, ROW_NUMBER() OVER (
+          PARTITION BY uc.user_id, c.name, c.discount_value, c.min_order
+          ORDER BY (uc.status=1)::int DESC, (uc.status=3)::int DESC,
+                   (uc.order_id IS NOT NULL)::int DESC,
+                   (c.status=1)::int DESC, uc.claimed_at ASC, uc.id ASC
+        ) rn
+        FROM mini_user_coupons uc
+        JOIN mini_coupons c ON c.id=uc.coupon_id
+        WHERE uc.coupon_type='new_user'
       ) x WHERE x.rn > 1
     )`)
-    // 清理生日券重复（按年分区，同上保留规则）
+    // 清理生日券：一人每年每档只保留一张
     await pool.query(`DELETE FROM mini_user_coupons WHERE id IN (
-      SELECT id FROM (
-        SELECT id, ROW_NUMBER() OVER (
-          PARTITION BY user_id, coupon_id, EXTRACT(YEAR FROM claimed_at)
-          ORDER BY (status=1)::int DESC, (status=3)::int DESC,
-                   (order_id IS NOT NULL)::int DESC, claimed_at ASC, id ASC
-        ) rn FROM mini_user_coupons WHERE coupon_type='birthday'
+      SELECT uc_id FROM (
+        SELECT uc.id AS uc_id, ROW_NUMBER() OVER (
+          PARTITION BY uc.user_id, c.name, c.discount_value, c.min_order, EXTRACT(YEAR FROM uc.claimed_at)
+          ORDER BY (uc.status=1)::int DESC, (uc.status=3)::int DESC,
+                   (uc.order_id IS NOT NULL)::int DESC,
+                   (c.status=1)::int DESC, uc.claimed_at ASC, uc.id ASC
+        ) rn
+        FROM mini_user_coupons uc
+        JOIN mini_coupons c ON c.id=uc.coupon_id
+        WHERE uc.coupon_type='birthday'
       ) x WHERE x.rn > 1
     )`)
-    // 按类型的偏唯一索引：一次性券（new_user/birthday）应用层已防重，DB兜底
+    // 按类型的偏唯一索引：DB兜底，(user_id, coupon_id) 内一人一张
     await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS uniq_muc_new_user ON mini_user_coupons(user_id, coupon_id) WHERE coupon_type='new_user'`)
     await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS uniq_muc_birthday_year ON mini_user_coupons(user_id, coupon_id, (EXTRACT(YEAR FROM claimed_at))) WHERE coupon_type='birthday'`)
     // 同步 claimed_count 到真实数量
@@ -6760,22 +6770,34 @@ app.post('/miniapi/coupon/claim', miniAuth, async (req, res) => {
            WHERE u.phone=$1 AND o.status>=1`, [userPhone]
         )).rows[0].count)
         if (phoneOrderCount > 0) return fail(res, '仅限新用户领取')
+        // 按券签名判断，防止历史重复券定义（不同 coupon_id）被重复领取；
+        // 不同满减档位仍可各领一张。
         const phoneAlready = (await pool.query(
           `SELECT uc.id FROM mini_user_coupons uc
            JOIN mini_users u ON u.id=uc.user_id
-           WHERE u.phone=$1 AND uc.coupon_id=$2 LIMIT 1`, [userPhone, coupon_id]
+           JOIN mini_coupons owned ON owned.id=uc.coupon_id
+           WHERE u.phone=$1 AND uc.coupon_type='new_user'
+             AND owned.name=$2 AND owned.discount_value=$3 AND owned.min_order=$4
+           LIMIT 1`, [userPhone, c.name, c.discount_value, c.min_order]
         )).rows[0]
-        if (phoneAlready) return fail(res, '您已领取过该券')
+        if (phoneAlready) return fail(res, '您已领取过该档新客券')
       } else {
-        const already = (await pool.query(`SELECT id FROM mini_user_coupons WHERE user_id=$1 AND coupon_id=$2 LIMIT 1`, [uid, coupon_id])).rows[0]
-        if (already) return fail(res, '您已领取过该券')
+        const already = (await pool.query(
+          `SELECT uc.id FROM mini_user_coupons uc
+           JOIN mini_coupons owned ON owned.id=uc.coupon_id
+           WHERE uc.user_id=$1 AND uc.coupon_type='new_user'
+             AND owned.name=$2 AND owned.discount_value=$3 AND owned.min_order=$4
+           LIMIT 1`, [uid, c.name, c.discount_value, c.min_order]
+        )).rows[0]
+        if (already) return fail(res, '您已领取过该档新客券')
       }
     } else if (c.type === 'birthday') {
       if (!user?.birth_month) return fail(res, '请先在个人中心设置生日')
       if (user.birth_month !== now.getMonth() + 1) return fail(res, `生日月（${user.birth_month}月）才能领取`)
+      // 按类型判断：一年只能领一张 birthday 类型券
       const thisYear = parseInt((await pool.query(
-        `SELECT COUNT(*) FROM mini_user_coupons WHERE user_id=$1 AND coupon_id=$2 AND EXTRACT(YEAR FROM claimed_at)=$3`,
-        [uid, coupon_id, now.getFullYear()]
+        `SELECT COUNT(*) FROM mini_user_coupons WHERE user_id=$1 AND coupon_type='birthday' AND EXTRACT(YEAR FROM claimed_at)=$2`,
+        [uid, now.getFullYear()]
       )).rows[0].count)
       if (thisYear > 0) return fail(res, '今年已领取过生日券')
     } else {

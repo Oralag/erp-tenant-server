@@ -7033,6 +7033,19 @@ app.post('/adminapi/mini/coupons/del', auth, async (req, res) => {
       WHERE content_type='article'
         AND title IN ('一口来自草原的鲜香，藏着怎样的好味道', '发现｜了不起的家乡特产')
     `)
+    // 第二张首屏卡片使用统一的品牌产品视觉，替换早期界面截图示例。
+    await pool.query(`
+      UPDATE mini_videos
+      SET title='黄金纬度，藏在风里的草原滋味',
+          description='经典风干牛肉，从黄金纬度出发，留下肉香与嚼劲。',
+          content='在北纬 45° 左右的草原，充足日照、清爽空气与传统风干方式，共同塑造了牛肉干紧实而有层次的口感。\\n\\n慢慢嚼，能尝到肉香，也能尝到来自草原的风。',
+          cover_url='https://nomaderp.pages.dev/media/covers/1784978599407_zurfpr.jpg',
+          images='["https://nomaderp.pages.dev/media/covers/1784978599407_zurfpr.jpg"]'::jsonb,
+          goods_id=0,
+          sort=110
+      WHERE content_type='article'
+        AND title IN ('从产地到餐桌，我们认真守住每一份新鲜', '黄金纬度，藏在风里的草原滋味')
+    `)
 
     // 为没有评论的视频插入预设评论
     const SEED_COMMENTS = [

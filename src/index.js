@@ -6596,6 +6596,34 @@ app.post('/miniapi/wholesale/inquiry', async (req, res) => {
       )
     `)
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_muc_user ON mini_user_coupons(user_id)`)
+    // 优惠券去重迁移：coupon_type冗余列 + 按类型的偏索引 + 清理历史脏数据
+    await pool.query(`ALTER TABLE mini_user_coupons ADD COLUMN IF NOT EXISTS coupon_type VARCHAR(20)`)
+    await pool.query(`UPDATE mini_user_coupons uc SET coupon_type = c.type FROM mini_coupons c WHERE uc.coupon_id = c.id AND uc.coupon_type IS NULL`)
+    // 清理新客券重复（保留 status=1 已用 > status=3 锁定 > 有 order_id > 最早领取）
+    await pool.query(`DELETE FROM mini_user_coupons WHERE id IN (
+      SELECT id FROM (
+        SELECT id, ROW_NUMBER() OVER (
+          PARTITION BY user_id, coupon_id
+          ORDER BY (status=1)::int DESC, (status=3)::int DESC,
+                   (order_id IS NOT NULL)::int DESC, claimed_at ASC, id ASC
+        ) rn FROM mini_user_coupons WHERE coupon_type='new_user'
+      ) x WHERE x.rn > 1
+    )`)
+    // 清理生日券重复（按年分区，同上保留规则）
+    await pool.query(`DELETE FROM mini_user_coupons WHERE id IN (
+      SELECT id FROM (
+        SELECT id, ROW_NUMBER() OVER (
+          PARTITION BY user_id, coupon_id, EXTRACT(YEAR FROM claimed_at)
+          ORDER BY (status=1)::int DESC, (status=3)::int DESC,
+                   (order_id IS NOT NULL)::int DESC, claimed_at ASC, id ASC
+        ) rn FROM mini_user_coupons WHERE coupon_type='birthday'
+      ) x WHERE x.rn > 1
+    )`)
+    // 按类型的偏唯一索引：一次性券（new_user/birthday）应用层已防重，DB兜底
+    await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS uniq_muc_new_user ON mini_user_coupons(user_id, coupon_id) WHERE coupon_type='new_user'`)
+    await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS uniq_muc_birthday_year ON mini_user_coupons(user_id, coupon_id, (EXTRACT(YEAR FROM claimed_at))) WHERE coupon_type='birthday'`)
+    // 同步 claimed_count 到真实数量
+    await pool.query(`UPDATE mini_coupons c SET claimed_count = sub.cnt FROM (SELECT coupon_id, COUNT(*)::int AS cnt FROM mini_user_coupons GROUP BY coupon_id) sub WHERE c.id = sub.coupon_id AND c.claimed_count <> sub.cnt`)
     // 补生日字段
     await pool.query(`ALTER TABLE mini_users ADD COLUMN IF NOT EXISTS birth_month SMALLINT`)
     await pool.query(`ALTER TABLE mini_users ADD COLUMN IF NOT EXISTS birth_day SMALLINT`)
@@ -7217,7 +7245,7 @@ app.post('/miniapi/points/redeem', miniAuth, async (req, res) => {
       return fail(res, `积分不足，需要${c.points_cost}分`)
     }
     const expireAt = new Date(Date.now() + c.validity_days * 86400000)
-    await client.query(`INSERT INTO mini_user_coupons (user_id, coupon_id, status, expire_at) VALUES ($1,$2,0,$3)`, [uid, c.id, expireAt])
+    await client.query(`INSERT INTO mini_user_coupons (user_id, coupon_id, coupon_type, status, expire_at) VALUES ($1,$2,$3,0,$4)`, [uid, c.id, c.type, expireAt])
     await client.query(`UPDATE mini_users SET points=points-$1 WHERE id=$2`, [c.points_cost, uid])
     await client.query(
       `INSERT INTO mini_points_log (user_id,points,type,remark,created_at)
@@ -7401,7 +7429,7 @@ app.post('/miniapi/signin', miniAuth, async (req, res) => {
         const expireAt = new Date(Date.now() + 14 * 86400000)
         try {
           await pool.query(
-            `INSERT INTO mini_user_coupons (user_id, coupon_id, status, expire_at) VALUES ($1,$2,0,$3)`,
+            `INSERT INTO mini_user_coupons (user_id, coupon_id, coupon_type, status, expire_at) VALUES ($1,$2,'signin7',0,$3)`,
             [uid, c.id, expireAt]
           )
           await pool.query(`UPDATE mini_coupons SET claimed_count=claimed_count+1 WHERE id=$1`, [c.id])
@@ -7540,7 +7568,7 @@ app.post('/miniapi/lottery/spin', miniAuth, async (req, res) => {
         )).rows[0]
         if (lc) {
           const expireAt = new Date(Date.now() + 7 * 86400000)
-          await client.query(`INSERT INTO mini_user_coupons (user_id, coupon_id, status, expire_at) VALUES ($1,$2,0,$3)`, [uid, lc.id, expireAt])
+          await client.query(`INSERT INTO mini_user_coupons (user_id, coupon_id, coupon_type, status, expire_at) VALUES ($1,$2,'lottery',0,$3)`, [uid, lc.id, expireAt])
           await client.query(`UPDATE mini_coupons SET claimed_count=claimed_count+1 WHERE id=$1`, [lc.id])
         }
       }

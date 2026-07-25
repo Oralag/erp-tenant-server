@@ -6980,6 +6980,7 @@ app.post('/adminapi/mini/coupons/del', auth, async (req, res) => {
     await pool.query(`ALTER TABLE mini_videos ADD COLUMN IF NOT EXISTS content_type VARCHAR(20) NOT NULL DEFAULT 'video'`)
     await pool.query(`ALTER TABLE mini_videos ADD COLUMN IF NOT EXISTS content TEXT DEFAULT ''`)
     await pool.query(`ALTER TABLE mini_videos ADD COLUMN IF NOT EXISTS images JSONB NOT NULL DEFAULT '[]'::jsonb`)
+    await pool.query(`ALTER TABLE mini_videos ADD COLUMN IF NOT EXISTS source_url TEXT DEFAULT ''`)
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_mini_content_type ON mini_videos(content_type, status, sort DESC, id DESC)`)
     // 首次启用图文频道时，用现有在售商品生成两篇可直接预览的示例内容。
     await pool.query(`
@@ -7029,6 +7030,7 @@ app.post('/adminapi/mini/coupons/del', auth, async (req, res) => {
             "https://nomaderp.pages.dev/media/covers/1784978599250_0mn7cc.jpg",
             "https://nomaderp.pages.dev/media/covers/1784978600234_5holkb.jpg"
           ]'::jsonb,
+          source_url='',
           sort=120
       WHERE content_type='article'
         AND title IN ('一口来自草原的鲜香，藏着怎样的好味道', '发现｜了不起的家乡特产')
@@ -7041,6 +7043,7 @@ app.post('/adminapi/mini/coupons/del', auth, async (req, res) => {
           content='在北纬 45° 左右的草原，充足日照、清爽空气与传统风干方式，共同塑造了牛肉干紧实而有层次的口感。\\n\\n慢慢嚼，能尝到肉香，也能尝到来自草原的风。',
           cover_url='https://nomaderp.pages.dev/media/covers/1784978599407_zurfpr.jpg',
           images='["https://nomaderp.pages.dev/media/covers/1784978599407_zurfpr.jpg"]'::jsonb,
+          source_url='',
           goods_id=0,
           sort=110
       WHERE content_type='article'
@@ -7062,6 +7065,7 @@ app.post('/adminapi/mini/coupons/del', auth, async (req, res) => {
             "https://nomaderp.pages.dev/media/covers/1784979366190_wde1bf.jpg",
             "https://nomaderp.pages.dev/media/covers/1784979366188_5osf1v.jpg"
           ]'::jsonb,
+          source_url='https://mp.weixin.qq.com/s/JeyRlj9GhCuMkui_XCJg4g',
           goods_id=0,
           sort=110
       WHERE content_type='article'
@@ -7302,7 +7306,7 @@ app.post('/adminapi/mini/videos/save', auth, async (req, res) => {
   try {
     const {
       id, title, description, video_url = '', cover_url = '', goods_id,
-      sort = 0, status = 1, content_type = 'video', content = '', images = []
+      sort = 0, status = 1, content_type = 'video', content = '', images = [], source_url = ''
     } = req.body
     if (!title) return fail(res, '标题必填')
     if (content_type === 'video' && !video_url) return fail(res, '请上传视频')
@@ -7313,19 +7317,19 @@ app.post('/adminapi/mini/videos/save', auth, async (req, res) => {
       const r = await pool.query(
         `UPDATE mini_videos
          SET title=$1,description=$2,video_url=$3,cover_url=$4,goods_id=$5,sort=$6,status=$7,
-             content_type=$8,content=$9,images=$10::jsonb
-         WHERE id=$11 RETURNING *`,
+             content_type=$8,content=$9,images=$10::jsonb,source_url=$11
+         WHERE id=$12 RETURNING *`,
         [title, description, video_url, cover_url, goods_id || 0, sort, status,
-          safeType, content, JSON.stringify(safeImages), id]
+          safeType, content, JSON.stringify(safeImages), source_url, id]
       )
       return ok(res, r.rows[0])
     } else {
       const r = await pool.query(
         `INSERT INTO mini_videos
-         (title,description,video_url,cover_url,goods_id,sort,status,content_type,content,images)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb) RETURNING *`,
+         (title,description,video_url,cover_url,goods_id,sort,status,content_type,content,images,source_url)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11) RETURNING *`,
         [title, description, video_url, cover_url, goods_id || 0, sort, status,
-          safeType, content, JSON.stringify(safeImages)]
+          safeType, content, JSON.stringify(safeImages), source_url]
       )
       return ok(res, r.rows[0])
     }

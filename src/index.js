@@ -2531,6 +2531,7 @@ router.post('/finance/CollectReceipt/del', async (req, res) => {
 
 // PayReceipt (付款单)
 router.get('/finance/PayReceipt/index', async (req, res) => {
+  await ensureAdminCols('pay_receipt')
   try {
     const { page, list_rows, offset } = pageParams(req.query)
     await listQuery(res, 'pay_receipt', { keyword: req.query.keyword, keywordCols: ['receipt_no','contact_name'], baseWhere: shopBase(req, 'deleted_at IS NULL'), orderBy: 'id DESC', page, list_rows, offset })
@@ -2538,8 +2539,21 @@ router.get('/finance/PayReceipt/index', async (req, res) => {
 })
 router.post('/finance/PayReceipt/add', async (req, res) => {
   try {
+    await ensureAdminCols('pay_receipt')
+    await loadTableCols()
     const shopId = parseInt(req.admin?.shop_id) || 1
-    const b = filterBodyCols('pay_receipt', { receipt_no: genOrderNo('FK'), ...req.body, shop_id: shopId })
+    let adminName = ''
+    try {
+      const a = await pool.query('SELECT name FROM admins WHERE id=$1', [req.admin?.id])
+      adminName = a.rows[0]?.name || ''
+    } catch {}
+    const b = filterBodyCols('pay_receipt', {
+      receipt_no: genOrderNo('FK'),
+      ...req.body,
+      admin_id: parseInt(req.admin?.id) || 0,
+      admin_name: adminName,
+      shop_id: shopId,
+    })
     // 防重复：同一供应商+同一金额+同一天+同一采购单已存在则拒绝
     const supName = b.supplier_name || b.contact_name || ''
     const payDate = b.pay_date ? String(b.pay_date).slice(0, 10) : new Date().toISOString().slice(0, 10)

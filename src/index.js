@@ -7067,7 +7067,7 @@ app.post('/adminapi/mini/coupons/del', auth, async (req, res) => {
       UPDATE mini_videos
       SET title='草原儿女从小吃到大的营养奶食品',
           description='奶品营养家 · 牧区纯坊',
-          content='草原儿女从小吃到大的营养奶食品。\\n\\n奶豆腐、奶皮子、奶酪等草原奶食，是味道，也是代代相传的生活记忆。鲜奶经过熬煮、发酵、晾晒与凝结，变成各具风味的传统食品；它们既浓缩了牛奶的营养，也保存着牧区日常生活的温度。\\n\\n原文内容来自公众号文章，下面保留原文章配图。',
+          content='',
           cover_url='https://nomaderp.pages.dev/media/covers/1784979365056_p5sgw6.jpg',
           images='[
   "https://erp-server-xsji.onrender.com/miniapi/article-image?url=https%3A%2F%2Fmmbiz.qpic.cn%2Fmmbiz_jpg%2FeOl7PcZd7S37zYy14RhdE2T13hvMypcW22X66gUWfY778KGnZypzeUpSxEwGL1f6OFLkCXiagvoP9PoOibu2uhJg%2F0%3Fwx_fmt%3Djpeg",

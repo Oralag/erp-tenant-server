@@ -6981,6 +6981,39 @@ app.post('/adminapi/mini/coupons/del', auth, async (req, res) => {
     await pool.query(`ALTER TABLE mini_videos ADD COLUMN IF NOT EXISTS content TEXT DEFAULT ''`)
     await pool.query(`ALTER TABLE mini_videos ADD COLUMN IF NOT EXISTS images JSONB NOT NULL DEFAULT '[]'::jsonb`)
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_mini_content_type ON mini_videos(content_type, status, sort DESC, id DESC)`)
+    // 首次启用图文频道时，用现有在售商品生成两篇可直接预览的示例内容。
+    await pool.query(`
+      WITH products AS (
+        SELECT id, goods_name, COALESCE(images::jsonb, '[]'::jsonb) AS pics,
+               ROW_NUMBER() OVER (ORDER BY sort ASC, id DESC) AS rn
+        FROM goods
+        WHERE deleted_at IS NULL AND status=1 AND can_sale=1
+          AND images IS NOT NULL AND images::text NOT IN ('', '[]', 'null')
+        LIMIT 2
+      ), samples AS (
+        SELECT id AS goods_id, goods_name, pics, rn,
+          CASE rn
+            WHEN 1 THEN '一口来自草原的鲜香，藏着怎样的好味道'
+            ELSE '从产地到餐桌，我们认真守住每一份新鲜'
+          END AS sample_title,
+          CASE rn
+            WHEN 1 THEN '顺着食材的来路，认识草原馈赠的自然风味。'
+            ELSE '好食材不需要复杂修饰，安心、新鲜和本真的味道就是答案。'
+          END AS sample_desc,
+          CASE rn
+            WHEN 1 THEN '风吹过牧场，草木的清香也被收藏进食材里。我们沿着产地寻找真实的味道，把适合一家人分享的草原好物认真送到餐桌。\\n\\n打开图片，看看这份鲜香从哪里来；也可以点击文末商品，了解更多食用与搭配方式。'
+            ELSE '从挑选原料、整理包装到送达，每一步都值得认真。我们希望大家收到的不只是一件商品，也是一份看得见来路、吃得出新鲜的安心。\\n\\n简单烹饪，保留食材本身的香气，就是草原餐桌最舒服的打开方式。'
+          END AS sample_content
+        FROM products
+      )
+      INSERT INTO mini_videos
+        (title, description, video_url, cover_url, goods_id, sort, status, content_type, content, images)
+      SELECT sample_title, sample_desc, '', pics->>0, goods_id, 100-rn, 1, 'article', sample_content, pics
+      FROM samples s
+      WHERE NOT EXISTS (
+        SELECT 1 FROM mini_videos v WHERE v.content_type='article' AND v.title=s.sample_title
+      )
+    `)
 
     // 为没有评论的视频插入预设评论
     const SEED_COMMENTS = [

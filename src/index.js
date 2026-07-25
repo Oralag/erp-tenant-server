@@ -4127,6 +4127,15 @@ function miniAuth(req, res, next) {
   }
 }
 
+// 公开内容接口可匿名访问；携带有效 token 时补充点赞状态。
+function optionalMiniAuth(req, _res, next) {
+  const token = req.headers['mini-token']
+  if (token) {
+    try { req.miniUser = jwt.verify(token, MINI_JWT_SECRET) } catch {}
+  }
+  next()
+}
+
 // 微信code换openid
 app.post('/miniapi/auth/wxLogin', async (req, res) => {
   try {
@@ -7041,7 +7050,7 @@ app.post('/adminapi/mini/coupons/del', auth, async (req, res) => {
 })()
 
 // 视频列表（分页，支持滑动加载）
-app.get('/miniapi/video/list', async (req, res) => {
+app.get('/miniapi/video/list', optionalMiniAuth, async (req, res) => {
   try {
     const page = Math.max(1, parseInt(req.query.page) || 1)
     const contentType = req.query.type === 'article' ? 'article' : 'video'
@@ -7081,7 +7090,7 @@ app.get('/miniapi/video/list', async (req, res) => {
 })
 
 // 图文详情
-app.get('/miniapi/content/detail/:id', async (req, res) => {
+app.get('/miniapi/content/detail/:id', optionalMiniAuth, async (req, res) => {
   try {
     const uid = req.miniUser?.id || 0
     const row = (await pool.query(

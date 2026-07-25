@@ -7014,6 +7014,25 @@ app.post('/adminapi/mini/coupons/del', auth, async (req, res) => {
         SELECT 1 FROM mini_videos v WHERE v.content_type='article' AND v.title=s.sample_title
       )
     `)
+    // 品牌发现示例：6 张为同一篇内容，列表展示首图，详情页左右滑动查看。
+    await pool.query(`
+      UPDATE mini_videos
+      SET title='发现｜了不起的家乡特产',
+          description='奶豆腐、奶条、青砖茶与风干牛肉，一次认识来自草原的家乡味道。',
+          content='有些味道来自时间，有些味道来自土地。奶豆腐慢慢蒸制，奶条保留鲜奶本味，青砖茶用热水一泡就香，风干牛肉则收藏着黄金纬度的风与阳光。\\n\\n左右滑动图片，一起发现这些值得被看见的家乡特产。',
+          cover_url='https://nomaderp.pages.dev/media/covers/1784978586592_b8jhkm.jpg',
+          images='[
+            "https://nomaderp.pages.dev/media/covers/1784978586592_b8jhkm.jpg",
+            "https://nomaderp.pages.dev/media/covers/1784978596721_k7fug2.jpg",
+            "https://nomaderp.pages.dev/media/covers/1784978599407_zurfpr.jpg",
+            "https://nomaderp.pages.dev/media/covers/1784978600545_276qyb.jpg",
+            "https://nomaderp.pages.dev/media/covers/1784978599250_0mn7cc.jpg",
+            "https://nomaderp.pages.dev/media/covers/1784978600234_5holkb.jpg"
+          ]'::jsonb,
+          sort=120
+      WHERE content_type='article'
+        AND title IN ('一口来自草原的鲜香，藏着怎样的好味道', '发现｜了不起的家乡特产')
+    `)
 
     // 为没有评论的视频插入预设评论
     const SEED_COMMENTS = [

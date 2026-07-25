@@ -7053,10 +7053,11 @@ app.post('/adminapi/mini/coupons/del', auth, async (req, res) => {
     await pool.query(`
       UPDATE mini_videos
       SET title='草原儿女从小吃到大的营养奶食品',
-          description='奶豆腐、奶皮子、奶酪等草原奶食，是味道，也是代代相传的生活记忆。',
-          content='草原奶食陪伴着一代代草原儿女长大。鲜奶经过熬煮、发酵、晾晒与凝结，变成奶豆腐、奶皮子、奶酪等各具风味的传统食品。\\n\\n它们既浓缩了牛奶的营养，也保存着牧区日常生活的温度。左右滑动图片，一起认识这些熟悉又珍贵的草原味道。',
-          cover_url='https://nomaderp.pages.dev/media/covers/1784979366054_rl69wl.jpg',
+          description='奶品营养家 · 牧区纯坊',
+          content='草原儿女从小吃到大的营养奶食品。\\n\\n奶豆腐、奶皮子、奶酪等草原奶食，是味道，也是代代相传的生活记忆。鲜奶经过熬煮、发酵、晾晒与凝结，变成各具风味的传统食品；它们既浓缩了牛奶的营养，也保存着牧区日常生活的温度。\\n\\n原文内容来自公众号文章，下面保留原文章配图。',
+          cover_url='https://nomaderp.pages.dev/media/covers/1784979365056_p5sgw6.jpg',
           images='[
+            "https://nomaderp.pages.dev/media/covers/1784979365056_p5sgw6.jpg",
             "https://nomaderp.pages.dev/media/covers/1784979366054_rl69wl.jpg",
             "https://nomaderp.pages.dev/media/covers/1784979365965_qd38k6.jpg",
             "https://nomaderp.pages.dev/media/covers/1784979365903_8osg7d.jpg",

@@ -4301,22 +4301,29 @@ async function getDistributorScope(req) {
   const boundCode = String(user?.distributor_code || '').trim()
   const requestCode = String(req.query.distributor_code || req.body?.distributor_code || '').trim()
   const code = boundCode || requestCode
-  if (!code) return { code: '', distributor: null, restricted: false, allowedIds: [] }
+  if (!code) return { code: '', distributor: null, restricted: false, allowedIds: [], hiddenIds: [] }
   const distributor = (await pool.query(
     `SELECT id, code FROM distributors WHERE code=$1 AND status=1 LIMIT 1`,
     [code]
   )).rows[0]
-  if (!distributor) return { code: '', distributor: null, restricted: false, allowedIds: [] }
+  if (!distributor) return { code: '', distributor: null, restricted: false, allowedIds: [], hiddenIds: [] }
   const goodsRows = (await pool.query(
-    `SELECT goods_id, visible FROM distributor_goods
+    `SELECT goods_id FROM distributor_goods
      WHERE distributor_id=$1 AND status=1`,
     [distributor.id]
   )).rows
+  const hiddenRows = (await pool.query(
+    `SELECT goods_id FROM distributor_hidden_goods WHERE distributor_id=$1`,
+    [distributor.id]
+  )).rows
+  const hiddenIds = hiddenRows.map(r => parseInt(r.goods_id)).filter(Boolean)
+  const hiddenSet = new Set(hiddenIds)
   return {
     code: distributor.code,
     distributor,
     restricted: goodsRows.length > 0,
-    allowedIds: goodsRows.filter(r => r.visible !== false).map(r => parseInt(r.goods_id)).filter(Boolean),
+    allowedIds: goodsRows.map(r => parseInt(r.goods_id)).filter(id => id && !hiddenSet.has(id)),
+    hiddenIds,
   }
 }
 
@@ -4340,9 +4347,10 @@ app.get('/miniapi/goods/list', async (req, res) => {
       params
     )).rows
     // 配置了分销商品池时，以商品池为准；未配置时仍只展示品牌主页已上架商品。
-    const brandRows = distScope.restricted ? rows : rows.filter(g => {
+    const hiddenSet = new Set(distScope.hiddenIds || [])
+    const brandRows = (distScope.restricted ? rows : rows.filter(g => {
       try { return JSON.parse(g.remark || '{}')['__brand__']?.show === true } catch { return false }
-    })
+    })).filter(g => !hiddenSet.has(Number(g.id)))
     // 按基础销量降序排列
     brandRows.sort((a, b) => {
       const getBase = g => { try { return JSON.parse(g.remark || '{}')['__brand__']?.baseSales || 0 } catch { return 0 } }
@@ -4785,6 +4793,19 @@ app.post('/miniapi/order/confirm', miniAuth, async (req, res) => {
     `)
     await pool.query(`ALTER TABLE distributor_goods ADD COLUMN IF NOT EXISTS visible BOOLEAN DEFAULT TRUE`)
     await pool.query(`
+      CREATE TABLE IF NOT EXISTS distributor_hidden_goods (
+        distributor_id INT NOT NULL,
+        goods_id INT NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        PRIMARY KEY(distributor_id, goods_id)
+      )
+    `)
+    await pool.query(`
+      INSERT INTO distributor_hidden_goods (distributor_id, goods_id)
+      SELECT distributor_id, goods_id FROM distributor_goods WHERE visible IS FALSE
+      ON CONFLICT (distributor_id, goods_id) DO NOTHING
+    `)
+    await pool.query(`
       CREATE TABLE IF NOT EXISTS distributor_materials (
         id SERIAL PRIMARY KEY,
         title VARCHAR(120) NOT NULL DEFAULT '',
@@ -4937,16 +4958,30 @@ app.get('/miniapi/distributor/goods', miniAuth, async (req, res) => {
   try {
     const dist = (await pool.query(`SELECT id FROM distributors WHERE user_id=$1 AND status=1 LIMIT 1`, [req.miniUser.id])).rows[0]
     if (!dist) return fail(res, '非分销商')
-    const assigned = (await pool.query(
-      `SELECT g.id, g.goods_name, g.images, g.remark, g.sell_price, g.unit_name, g.spec, g.barcode, g.goods_memo, g.sort,
-              dg.visible
+    let assigned = (await pool.query(
+      `SELECT g.id, g.goods_name, g.images, g.remark, g.sell_price, g.unit_name, g.spec, g.barcode, g.goods_memo, g.sort
        FROM distributor_goods dg
        JOIN goods g ON g.id=dg.goods_id AND g.deleted_at IS NULL AND g.status=1 AND g.can_sale=1
        WHERE dg.distributor_id=$1 AND dg.status=1
        ORDER BY dg.sort ASC, dg.id DESC`,
       [dist.id]
     )).rows
-    const rows = assigned.map(g => ({ ...parseBrandGoods(g), visible: g.visible !== false }))
+    if (!assigned.length) {
+      assigned = (await pool.query(
+        `SELECT id, goods_name, images, remark, sell_price, unit_name, spec, barcode, goods_memo, sort
+         FROM goods
+         WHERE deleted_at IS NULL AND status=1 AND can_sale=1
+         ORDER BY sort ASC, id DESC LIMIT 500`
+      )).rows.filter(g => {
+        try { return JSON.parse(g.remark || '{}')['__brand__']?.show === true } catch { return false }
+      })
+    }
+    const hiddenRows = (await pool.query(
+      `SELECT goods_id FROM distributor_hidden_goods WHERE distributor_id=$1`,
+      [dist.id]
+    )).rows
+    const hiddenSet = new Set(hiddenRows.map(row => Number(row.goods_id)))
+    const rows = assigned.map(g => ({ ...parseBrandGoods(g), visible: !hiddenSet.has(Number(g.id)) }))
     return ok(res, rows)
   } catch(e) { fail(res, e.message) }
 })
@@ -4962,15 +4997,38 @@ app.post('/miniapi/distributor/goods/visibility', miniAuth, async (req, res) => 
       [req.miniUser.id]
     )).rows[0]
     if (!dist) return fail(res, '非分销商')
-    const row = (await pool.query(
-      `UPDATE distributor_goods
-       SET visible=$1
-       WHERE distributor_id=$2 AND goods_id=$3 AND status=1
-       RETURNING goods_id, visible`,
-      [visible, dist.id, goodsId]
-    )).rows[0]
-    if (!row) return fail(res, '该商品未授权给当前分销商')
-    return ok(res, row)
+    const assignedCount = parseInt((await pool.query(
+      `SELECT COUNT(*) FROM distributor_goods WHERE distributor_id=$1 AND status=1`,
+      [dist.id]
+    )).rows[0].count)
+    if (assignedCount > 0) {
+      const authorized = (await pool.query(
+        `SELECT 1 FROM distributor_goods WHERE distributor_id=$1 AND goods_id=$2 AND status=1`,
+        [dist.id, goodsId]
+      )).rowCount > 0
+      if (!authorized) return fail(res, '该商品未授权给当前分销商')
+    } else {
+      const goods = (await pool.query(
+        `SELECT remark FROM goods WHERE id=$1 AND deleted_at IS NULL AND status=1 AND can_sale=1`,
+        [goodsId]
+      )).rows[0]
+      let shown = false
+      try { shown = JSON.parse(goods?.remark || '{}')['__brand__']?.show === true } catch {}
+      if (!shown) return fail(res, '该商品当前不可展示')
+    }
+    if (visible) {
+      await pool.query(
+        `DELETE FROM distributor_hidden_goods WHERE distributor_id=$1 AND goods_id=$2`,
+        [dist.id, goodsId]
+      )
+    } else {
+      await pool.query(
+        `INSERT INTO distributor_hidden_goods (distributor_id, goods_id)
+         VALUES ($1,$2) ON CONFLICT (distributor_id, goods_id) DO NOTHING`,
+        [dist.id, goodsId]
+      )
+    }
+    return ok(res, { goods_id: goodsId, visible })
   } catch(e) { fail(res, e.message) }
 })
 

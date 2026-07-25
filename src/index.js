@@ -6519,6 +6519,19 @@ app.get('/miniapi/review/list', async (req, res) => {
 // 新方式：小程序直接 POST 到 https://nomaderp.pages.dev/miniapi/upload/review-img
 app.get('/miniapi/upload/review-token', miniAuth, (_req, res) => fail(res, '请升级小程序：评价图片上传已迁移到 /miniapi/upload/review-img'))
 
+// 公众号原文配图代理：小程序只请求自有业务域名，避免 qpic 图片域名白名单限制。
+app.get('/miniapi/article-image', async (req, res) => {
+  try {
+    const target = String(req.query.url || '')
+    if (!/^https?:\/\/mmbiz\.qpic\.cn\//i.test(target)) return res.status(400).end()
+    const upstream = await fetch(target)
+    if (!upstream.ok) return res.status(upstream.status).end()
+    res.set('Content-Type', upstream.headers.get('content-type') || 'image/jpeg')
+    res.set('Cache-Control', 'public, max-age=86400')
+    res.send(Buffer.from(await upstream.arrayBuffer()))
+  } catch (e) { res.status(502).end() }
+})
+
 // 提交评价（需登录，且该订单包含该商品）
 app.post('/miniapi/review/create', miniAuth, async (req, res) => {
   try {
@@ -7057,15 +7070,33 @@ app.post('/adminapi/mini/coupons/del', auth, async (req, res) => {
           content='草原儿女从小吃到大的营养奶食品。\\n\\n奶豆腐、奶皮子、奶酪等草原奶食，是味道，也是代代相传的生活记忆。鲜奶经过熬煮、发酵、晾晒与凝结，变成各具风味的传统食品；它们既浓缩了牛奶的营养，也保存着牧区日常生活的温度。\\n\\n原文内容来自公众号文章，下面保留原文章配图。',
           cover_url='https://nomaderp.pages.dev/media/covers/1784979365056_p5sgw6.jpg',
           images='[
-            "https://nomaderp.pages.dev/media/covers/1784979365056_p5sgw6.jpg",
-            "https://nomaderp.pages.dev/media/covers/1784979366054_rl69wl.jpg",
-            "https://nomaderp.pages.dev/media/covers/1784979365965_qd38k6.jpg",
-            "https://nomaderp.pages.dev/media/covers/1784979365903_8osg7d.jpg",
-            "https://nomaderp.pages.dev/media/covers/1784979365905_r7hwa6.jpg",
-            "https://nomaderp.pages.dev/media/covers/1784979365512_vaxgvp.jpg",
-            "https://nomaderp.pages.dev/media/covers/1784979366190_wde1bf.jpg",
-            "https://nomaderp.pages.dev/media/covers/1784979366188_5osf1v.jpg"
-          ]'::jsonb,
+  "https://erp-server-xsji.onrender.com/miniapi/article-image?url=https%3A%2F%2Fmmbiz.qpic.cn%2Fmmbiz_jpg%2FeOl7PcZd7S37zYy14RhdE2T13hvMypcW22X66gUWfY778KGnZypzeUpSxEwGL1f6OFLkCXiagvoP9PoOibu2uhJg%2F0%3Fwx_fmt%3Djpeg",
+  "https://erp-server-xsji.onrender.com/miniapi/article-image?url=https%3A%2F%2Fmmbiz.qpic.cn%2Fmmbiz_jpg%2FeOl7PcZd7S37zYy14RhdE2T13hvMypcWbTlA2ic6pG5tjzV0ahkd2tOXOCABrq33OwZAoTvgbQ883hibFHZIjAlg%2F640%3Fwx_fmt%3Djpeg",
+  "https://erp-server-xsji.onrender.com/miniapi/article-image?url=https%3A%2F%2Fmmbiz.qpic.cn%2Fmmbiz_jpg%2FeOl7PcZd7S37zYy14RhdE2T13hvMypcWyY3CAjsLLCiah6rOxsz9anwCoxXK0GRAgLOs5Sg7v2HwdibI7jNNtmibA%2F640%3Fwx_fmt%3Djpeg",
+  "https://erp-server-xsji.onrender.com/miniapi/article-image?url=https%3A%2F%2Fmmbiz.qpic.cn%2Fmmbiz_jpg%2FeOl7PcZd7S37zYy14RhdE2T13hvMypcWynz5u4u2ua0ZU4e6WCqvzuxLySFzWAJSFba0uG04JVDfWwsM8BT4BA%2F640%3Fwx_fmt%3Djpeg",
+  "https://erp-server-xsji.onrender.com/miniapi/article-image?url=https%3A%2F%2Fmmbiz.qpic.cn%2Fmmbiz_jpg%2FeOl7PcZd7S37zYy14RhdE2T13hvMypcWr9e4M6FqKIqRtsvNpK5HicutRux4LGy0tT1zoH8l4uQ8kaJKykIHTPA%2F640%3Fwx_fmt%3Djpeg",
+  "https://erp-server-xsji.onrender.com/miniapi/article-image?url=https%3A%2F%2Fmmbiz.qpic.cn%2Fmmbiz_jpg%2FeOl7PcZd7S37zYy14RhdE2T13hvMypcWWpAibLIjyQpBvxbopR5Y9yQvt94Egiam2njSXNdcJeibBfaGhwmZkwO1w%2F640%3Fwx_fmt%3Djpeg",
+  "https://erp-server-xsji.onrender.com/miniapi/article-image?url=https%3A%2F%2Fmmbiz.qpic.cn%2Fmmbiz_jpg%2FeOl7PcZd7S37zYy14RhdE2T13hvMypcWdGgXOiby1kdCCStajmL49VDmWUOiacibcldf7nn6eZpGJS6kSWHIeadpg%2F640%3Fwx_fmt%3Djpeg",
+  "https://erp-server-xsji.onrender.com/miniapi/article-image?url=https%3A%2F%2Fmmbiz.qpic.cn%2Fmmbiz_jpg%2FeOl7PcZd7S37zYy14RhdE2T13hvMypcWiaTAeGG5BbdZmlL3qh1Ie2EVSLvicMic5XHcBgj59t1sIOPibp1MdN4JJg%2F640%3Fwx_fmt%3Djpeg",
+  "https://erp-server-xsji.onrender.com/miniapi/article-image?url=https%3A%2F%2Fmmbiz.qpic.cn%2Fmmbiz_jpg%2FeOl7PcZd7S37zYy14RhdE2T13hvMypcWom5szcYmn5ic69X5ygPHsPL2YnmYa7M7CWDXHuBToDh97plIU0ClBIQ%2F640%3Fwx_fmt%3Djpeg",
+  "https://erp-server-xsji.onrender.com/miniapi/article-image?url=https%3A%2F%2Fmmbiz.qpic.cn%2Fmmbiz_jpg%2FeOl7PcZd7S37zYy14RhdE2T13hvMypcWbKso7Xs9nNdeFTb91O3ia1lpYkx6giauyyNp4gsUKnrZ5dVzKIU9ZJCQ%2F640%3Fwx_fmt%3Djpeg",
+  "https://erp-server-xsji.onrender.com/miniapi/article-image?url=https%3A%2F%2Fmmbiz.qpic.cn%2Fmmbiz_jpg%2FeOl7PcZd7S37zYy14RhdE2T13hvMypcWxiasUOl0300w0gteRWWLV2hT1pHDLGasVZuz8FQyOfib1IwJfHtKtMHg%2F640%3Fwx_fmt%3Djpeg",
+  "https://erp-server-xsji.onrender.com/miniapi/article-image?url=https%3A%2F%2Fmmbiz.qpic.cn%2Fmmbiz_jpg%2FeOl7PcZd7S37zYy14RhdE2T13hvMypcWHOzWZqSh4ic5qWNAroI4W9ddy44CG5ZGpo7O2icxs34xzy23Cq6WgPcQ%2F640%3Fwx_fmt%3Djpeg",
+  "https://erp-server-xsji.onrender.com/miniapi/article-image?url=https%3A%2F%2Fmmbiz.qpic.cn%2Fmmbiz_jpg%2FeOl7PcZd7S37zYy14RhdE2T13hvMypcWeWPLaa39B3EohBss7icrmplHLnLLvyBmI5LxV9rIXVOUftpNZ09sQIg%2F640%3Fwx_fmt%3Djpeg",
+  "https://erp-server-xsji.onrender.com/miniapi/article-image?url=https%3A%2F%2Fmmbiz.qpic.cn%2Fmmbiz_jpg%2FeOl7PcZd7S37zYy14RhdE2T13hvMypcWNh1iaUAvkzs32eKDomxgkfqFqZA0q4N8iaEEQ3Y4VE5uQ3dbIl8k5Y8g%2F640%3Fwx_fmt%3Djpeg",
+  "https://erp-server-xsji.onrender.com/miniapi/article-image?url=https%3A%2F%2Fmmbiz.qpic.cn%2Fmmbiz_jpg%2FeOl7PcZd7S37zYy14RhdE2T13hvMypcWBNu72qLCxBhy0j2NwvrxTiaJXsgrvmkGkaToibGPdw1IXR0PA8Jq4e5w%2F640%3Fwx_fmt%3Djpeg",
+  "https://erp-server-xsji.onrender.com/miniapi/article-image?url=https%3A%2F%2Fmmbiz.qpic.cn%2Fmmbiz_jpg%2FeOl7PcZd7S37zYy14RhdE2T13hvMypcW4Qh8ib5E1osWaKxSB2QWZzaDSQu6WXnja9HXJ7m1gGangBtE2SjRIPw%2F640%3Fwx_fmt%3Djpeg",
+  "https://erp-server-xsji.onrender.com/miniapi/article-image?url=https%3A%2F%2Fmmbiz.qpic.cn%2Fmmbiz_jpg%2FeOl7PcZd7S37zYy14RhdE2T13hvMypcW6nST85VdCV6uS2ibyfeOmDz63kW593ibibCWyXvmWbzT1MFERFddeovMA%2F640%3Fwx_fmt%3Djpeg",
+  "https://erp-server-xsji.onrender.com/miniapi/article-image?url=https%3A%2F%2Fmmbiz.qpic.cn%2Fmmbiz_jpg%2FeOl7PcZd7S37zYy14RhdE2T13hvMypcWX4wmw79zjjncWdPicMjLvvZl2rwBdiccRXhL0iapQhpOibjdwsSZHW4RdA%2F640%3Fwx_fmt%3Djpeg",
+  "https://erp-server-xsji.onrender.com/miniapi/article-image?url=https%3A%2F%2Fmmbiz.qpic.cn%2Fmmbiz_jpg%2FeOl7PcZd7S37zYy14RhdE2T13hvMypcW2vwOic6T2zeAuMQ1VEHEjMQqAO0VnzeFhQ6w2XWq3qz5H2jq4Sm1BNA%2F640%3Fwx_fmt%3Djpeg",
+  "https://erp-server-xsji.onrender.com/miniapi/article-image?url=https%3A%2F%2Fmmbiz.qpic.cn%2Fmmbiz_jpg%2FeOl7PcZd7S37zYy14RhdE2T13hvMypcWbIiaajGUOwaiac3dndGia8rbALoQdibzW8Mwm8fY5jPmlWQW14HfLiceicFw%2F640%3Fwx_fmt%3Djpeg",
+  "https://erp-server-xsji.onrender.com/miniapi/article-image?url=https%3A%2F%2Fmmbiz.qpic.cn%2Fmmbiz_jpg%2FeOl7PcZd7S37zYy14RhdE2T13hvMypcWzzqib82WeasnynG7VNUebMYXMnwiaUViaF0nEJ8lT5ic68Nu5X2daLBGxw%2F640%3Fwx_fmt%3Djpeg",
+  "https://erp-server-xsji.onrender.com/miniapi/article-image?url=https%3A%2F%2Fmmbiz.qpic.cn%2Fmmbiz_jpg%2FeOl7PcZd7S37zYy14RhdE2T13hvMypcWX9h0K0vJhe1880fCEXrteu3Sv3cLPVLHuyhKj2eW6rgyYC9XxTGOicw%2F640%3Fwx_fmt%3Djpeg",
+  "https://erp-server-xsji.onrender.com/miniapi/article-image?url=https%3A%2F%2Fmmbiz.qpic.cn%2Fmmbiz_jpg%2FeOl7PcZd7S37zYy14RhdE2T13hvMypcWN6qJLVn1fB94iba3HupL9V2dibVkl50kJ0Hic2xZxGWFj1BUE0fttchUQ%2F640%3Fwx_fmt%3Djpeg",
+  "https://erp-server-xsji.onrender.com/miniapi/article-image?url=https%3A%2F%2Fmmbiz.qpic.cn%2Fmmbiz_jpg%2FeOl7PcZd7S37zYy14RhdE2T13hvMypcWBQHZCL6iaGMSNms3VjNYFbM3fcnxRicEtPUF5FibH227QVaX0Zsq7vUYQ%2F640%3Fwx_fmt%3Djpeg",
+  "https://erp-server-xsji.onrender.com/miniapi/article-image?url=https%3A%2F%2Fmmbiz.qpic.cn%2Fmmbiz_jpg%2FeOl7PcZd7S37zYy14RhdE2T13hvMypcWILibyYs7DZY6u6nBqb7Q0kTYtuGHl3ibNCdChnia7j2DUSvcZqaJXNxPg%2F640%3Fwx_fmt%3Djpeg",
+  "https://erp-server-xsji.onrender.com/miniapi/article-image?url=https%3A%2F%2Fmmbiz.qpic.cn%2Fmmbiz_jpg%2FeOl7PcZd7S1dIqDJXky2fDLC3icpyzC9h6KNkM93CaW2hqnIZibukyonJqW9rEdTZo0YgID1qqsHgHXp3embKtBA%2F640%3Fwx_fmt%3Djpeg"
+]'::jsonb,
           source_url='https://mp.weixin.qq.com/s/JeyRlj9GhCuMkui_XCJg4g',
           goods_id=0,
           sort=110

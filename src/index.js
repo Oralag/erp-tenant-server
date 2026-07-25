@@ -7011,7 +7011,7 @@ app.post('/adminapi/mini/coupons/del', auth, async (req, res) => {
       SELECT sample_title, sample_desc, '', pics->>0, goods_id, 100-rn, 1, 'article', sample_content, pics
       FROM samples s
       WHERE NOT EXISTS (
-        SELECT 1 FROM mini_videos v WHERE v.content_type='article' AND v.title=s.sample_title
+        SELECT 1 FROM mini_videos v WHERE v.content_type='article'
       )
     `)
     // 品牌发现示例：6 张为同一篇内容，列表展示首图，详情页左右滑动查看。
@@ -7066,6 +7066,19 @@ app.post('/adminapi/mini/coupons/del', auth, async (req, res) => {
           sort=110
       WHERE content_type='article'
         AND title IN ('黄金纬度，藏在风里的草原滋味', '草原儿女从小吃到大的营养奶食品')
+    `)
+    // 清理由早期示例标题变更导致的重复记录，每篇只保留最早创建的一条。
+    await pool.query(`
+      DELETE FROM mini_videos
+      WHERE id IN (
+        SELECT id FROM (
+          SELECT id, ROW_NUMBER() OVER (PARTITION BY title ORDER BY id ASC) AS rn
+          FROM mini_videos
+          WHERE content_type='article'
+            AND title IN ('发现｜了不起的家乡特产', '草原儿女从小吃到大的营养奶食品')
+        ) duplicates
+        WHERE rn > 1
+      )
     `)
 
     // 为没有评论的视频插入预设评论

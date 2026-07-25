@@ -6984,14 +6984,14 @@ app.post('/adminapi/mini/coupons/del', auth, async (req, res) => {
     // 首次启用图文频道时，用现有在售商品生成两篇可直接预览的示例内容。
     await pool.query(`
       WITH products AS (
-        SELECT id, goods_name, COALESCE(images::jsonb, '[]'::jsonb) AS pics,
-               ROW_NUMBER() OVER (ORDER BY sort ASC, id DESC) AS rn
-        FROM goods
-        WHERE deleted_at IS NULL AND status=1 AND can_sale=1
-          AND images IS NOT NULL AND images::text NOT IN ('', '[]', 'null')
+        SELECT goods_id, jsonb_build_array(cover_url) AS pics,
+               ROW_NUMBER() OVER (ORDER BY sort DESC, id DESC) AS rn
+        FROM mini_videos
+        WHERE content_type='video' AND status=1
+          AND cover_url IS NOT NULL AND cover_url<>''
         LIMIT 2
       ), samples AS (
-        SELECT id AS goods_id, goods_name, pics, rn,
+        SELECT goods_id, pics, rn,
           CASE rn
             WHEN 1 THEN '一口来自草原的鲜香，藏着怎样的好味道'
             ELSE '从产地到餐桌，我们认真守住每一份新鲜'

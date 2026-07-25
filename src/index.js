@@ -4343,14 +4343,19 @@ app.get('/miniapi/goods/list', async (req, res) => {
     if (keyword) { params.push(`%${keyword}%`); where += ` AND goods_name ILIKE $${params.length}` }
     // 拉全量（≤500），在 Node 里过滤 show:true，与品牌主页 .filter(p=>p.show===true) 一致
     const rows = (await pool.query(
-      `SELECT id, goods_name, images, remark, sell_price, unit_name, spec, barcode, goods_memo, sort FROM goods ${where} ORDER BY sort ASC, id DESC LIMIT 500`,
+      `SELECT id, goods_name, images, remark, sell_price, unit_name, spec, barcode, goods_memo, sort,
+              owner_type, owner_distributor_id, platform_fee_rate
+       FROM goods ${where} ORDER BY sort ASC, id DESC LIMIT 500`,
       params
     )).rows
     // 配置了分销商品池时，以商品池为准；未配置时仍只展示品牌主页已上架商品。
     const hiddenSet = new Set(distScope.hiddenIds || [])
     const brandRows = (distScope.restricted ? rows : rows.filter(g => {
       try { return JSON.parse(g.remark || '{}')['__brand__']?.show === true } catch { return false }
-    })).filter(g => !hiddenSet.has(Number(g.id)))
+    })).filter(g => !hiddenSet.has(Number(g.id))).filter(g =>
+      (g.owner_type || 'official') === 'official' ||
+      Number(g.owner_distributor_id || 0) === Number(distScope.distributor?.id || 0)
+    )
     // 按基础销量降序排列
     brandRows.sort((a, b) => {
       const getBase = g => { try { return JSON.parse(g.remark || '{}')['__brand__']?.baseSales || 0 } catch { return 0 } }
@@ -4444,7 +4449,8 @@ app.post('/miniapi/order/create', miniAuth, async (req, res) => {
     const goodsIds = items.map(i => i.goods_id).filter(Boolean)
     if (goodsIds.length === 0) return fail(res, '商品信息有误')
     const goodsRows = (await pool.query(
-      `SELECT id, goods_name as name, sell_price as price FROM goods WHERE id = ANY($1) AND status=1 AND can_sale=1`,
+      `SELECT id, goods_name as name, sell_price as price, owner_type, owner_distributor_id, platform_fee_rate
+       FROM goods WHERE id = ANY($1) AND status=1 AND can_sale=1`,
       [goodsIds]
     )).rows
     const goodsMap = Object.fromEntries(goodsRows.map(g => [g.id, g]))
@@ -4457,11 +4463,23 @@ app.post('/miniapi/order/create', miniAuth, async (req, res) => {
       const qty = Math.max(1, parseInt(item.qty) || 1)
       const price = parseFloat(g.price)
       originalTotal += price * qty
-      validItems.push({ goods_id: g.id, goods_name: g.name, spec: item.spec || '', price, qty })
+      validItems.push({ goods_id: g.id, goods_name: g.name, spec: item.spec || '', price, qty,
+        owner_type: g.owner_type || 'official', owner_distributor_id: Number(g.owner_distributor_id || 0),
+        platform_fee_rate: g.platform_fee_rate })
     }
     originalTotal = Math.round(originalTotal * 100) / 100
 
     await pool.query(`ALTER TABLE mini_users ADD COLUMN IF NOT EXISTS distributor_code VARCHAR(20) DEFAULT ''`)
+    await pool.query(`ALTER TABLE distributors ADD COLUMN IF NOT EXISTS platform_fee_rate NUMERIC(5,2) DEFAULT 10`)
+    await pool.query(`ALTER TABLE distributors ADD COLUMN IF NOT EXISTS settlement_cycle_days INT DEFAULT 7`)
+    await pool.query(`ALTER TABLE distributors ADD COLUMN IF NOT EXISTS agreement_type VARCHAR(20) DEFAULT 'offline'`)
+    await pool.query(`ALTER TABLE distributors ADD COLUMN IF NOT EXISTS agreement_no VARCHAR(80) DEFAULT ''`)
+    await pool.query(`ALTER TABLE distributors ADD COLUMN IF NOT EXISTS agreement_url TEXT DEFAULT ''`)
+    await pool.query(`ALTER TABLE distributors ADD COLUMN IF NOT EXISTS agreement_start DATE`)
+    await pool.query(`ALTER TABLE distributors ADD COLUMN IF NOT EXISTS agreement_end DATE`)
+    await pool.query(`ALTER TABLE distributors ADD COLUMN IF NOT EXISTS sub_mchid VARCHAR(40) DEFAULT ''`)
+    await pool.query(`ALTER TABLE distributors ADD COLUMN IF NOT EXISTS merchant_onboarding_status VARCHAR(30) DEFAULT 'not_started'`)
+    await pool.query(`ALTER TABLE distributors ADD COLUMN IF NOT EXISTS settlement_mode VARCHAR(30) DEFAULT 'manual'`)
 
     // 会员折扣
     const userRow = (await pool.query(`SELECT * FROM mini_users WHERE id=$1`, [req.miniUser.id])).rows[0]
@@ -4532,7 +4550,7 @@ app.post('/miniapi/order/create', miniAuth, async (req, res) => {
       }
 
       // 分销商佣金
-      let distCode = '', distCommission = 0
+      let distCode = '', distCommission = 0, activeDistributorId = 0, activePromotionRate = 0
       const requestedDistCode = String(distributor_code || '').trim()
       const boundDistCode = String(lockedMiniUser.distributor_code || '').trim()
       const effectiveDistCode = boundDistCode || requestedDistCode
@@ -4546,11 +4564,13 @@ app.post('/miniapi/order/create', miniAuth, async (req, res) => {
         )).rows[0]
         if (distRow) {
           distCode = distRow.code
+          activeDistributorId = Number(distRow.id)
           if (!boundDistCode && requestedDistCode) {
             await client.query(`UPDATE mini_users SET distributor_code=$1 WHERE id=$2`, [distCode, req.miniUser.id])
           }
           // 分销商自己设了佣金率就用自己的，否则用等级统一设置
           const rate = parseFloat(distRow.own_rate ?? distRow.level_rate ?? 0)
+          activePromotionRate = rate
           distCommission = Math.round(serverTotal * rate / 100 * 100) / 100
           const configuredGoods = (await client.query(
             `SELECT goods_id FROM distributor_goods WHERE distributor_id=$1 AND status=1`,
@@ -4558,7 +4578,9 @@ app.post('/miniapi/order/create', miniAuth, async (req, res) => {
           )).rows.map(r => parseInt(r.goods_id))
           if (configuredGoods.length) {
             const allowed = new Set(configuredGoods)
-            const blocked = validItems.filter(i => !allowed.has(parseInt(i.goods_id))).map(i => i.goods_name)
+            const blocked = validItems.filter(i =>
+              i.owner_type !== 'distributor' && !allowed.has(parseInt(i.goods_id))
+            ).map(i => i.goods_name)
             if (blocked.length) {
               const err = new Error(`商品「${blocked[0]}」不在该分销商可售范围`)
               err.userMessage = err.message
@@ -4566,6 +4588,12 @@ app.post('/miniapi/order/create', miniAuth, async (req, res) => {
             }
           }
         }
+      }
+      const invalidSelfItem = validItems.find(i => i.owner_type === 'distributor' && i.owner_distributor_id !== activeDistributorId)
+      if (invalidSelfItem) {
+        const err = new Error(`商品「${invalidSelfItem.goods_name}」仅限所属分销商店铺销售`)
+        err.userMessage = err.message
+        throw err
       }
 
       // 自提时查门店信息
@@ -4604,9 +4632,17 @@ app.post('/miniapi/order/create', miniAuth, async (req, res) => {
       order = r.rows[0]
 
       for (const item of validItems) {
+        const lineAmount = Math.round(item.price * item.qty * 100) / 100
+        const platformRate = item.owner_type === 'distributor' ? Number(item.platform_fee_rate || 0) : 0
+        const platformFee = Math.round(lineAmount * platformRate) / 100
         await client.query(
-          `INSERT INTO mini_order_items (order_id, goods_id, goods_name, spec, price, qty) VALUES ($1,$2,$3,$4,$5,$6)`,
-          [order.id, item.goods_id, item.goods_name, item.spec, item.price, item.qty]
+          `INSERT INTO mini_order_items
+           (order_id,goods_id,goods_name,spec,price,qty,seller_type,seller_distributor_id,
+            promotion_rate_snapshot,platform_fee_rate_snapshot,platform_fee_amount,seller_receivable_amount)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+          [order.id,item.goods_id,item.goods_name,item.spec,item.price,item.qty,item.owner_type,
+           item.owner_distributor_id,item.owner_type==='official'?activePromotionRate:0,platformRate,
+           platformFee,item.owner_type==='distributor'?lineAmount-platformFee:0]
         )
       }
 
@@ -4800,6 +4836,42 @@ app.post('/miniapi/order/confirm', miniAuth, async (req, res) => {
         PRIMARY KEY(distributor_id, goods_id)
       )
     `)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS distributor_product_submissions (
+        id SERIAL PRIMARY KEY,
+        distributor_id INT NOT NULL,
+        title VARCHAR(160) NOT NULL DEFAULT '',
+        category VARCHAR(80) DEFAULT '',
+        images JSONB DEFAULT '[]',
+        detail_images JSONB DEFAULT '[]',
+        description TEXT DEFAULT '',
+        spec VARCHAR(160) DEFAULT '',
+        unit_name VARCHAR(40) DEFAULT '件',
+        suggested_price NUMERIC(12,2) DEFAULT 0,
+        stock_qty NUMERIC(12,3) DEFAULT 0,
+        freight_template VARCHAR(120) DEFAULT '',
+        qualification_urls JSONB DEFAULT '[]',
+        platform_fee_rate NUMERIC(5,2),
+        review_status VARCHAR(20) DEFAULT 'pending',
+        review_note TEXT DEFAULT '',
+        reviewed_by INT DEFAULT 0,
+        reviewed_at TIMESTAMPTZ,
+        goods_id INT DEFAULT 0,
+        machine_review_status VARCHAR(20) DEFAULT 'pending',
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        deleted_at TIMESTAMPTZ
+      )
+    `)
+    await pool.query(`ALTER TABLE mini_order_items ADD COLUMN IF NOT EXISTS seller_type VARCHAR(20) DEFAULT 'official'`)
+    await pool.query(`ALTER TABLE mini_order_items ADD COLUMN IF NOT EXISTS seller_distributor_id INT DEFAULT 0`)
+    await pool.query(`ALTER TABLE mini_order_items ADD COLUMN IF NOT EXISTS promotion_rate_snapshot NUMERIC(5,2) DEFAULT 0`)
+    await pool.query(`ALTER TABLE mini_order_items ADD COLUMN IF NOT EXISTS platform_fee_rate_snapshot NUMERIC(5,2) DEFAULT 0`)
+    await pool.query(`ALTER TABLE mini_order_items ADD COLUMN IF NOT EXISTS platform_fee_amount NUMERIC(12,2) DEFAULT 0`)
+    await pool.query(`ALTER TABLE mini_order_items ADD COLUMN IF NOT EXISTS seller_receivable_amount NUMERIC(12,2) DEFAULT 0`)
+    await pool.query(`ALTER TABLE goods ADD COLUMN IF NOT EXISTS owner_type VARCHAR(20) DEFAULT 'official'`)
+    await pool.query(`ALTER TABLE goods ADD COLUMN IF NOT EXISTS owner_distributor_id INT DEFAULT 0`)
+    await pool.query(`ALTER TABLE goods ADD COLUMN IF NOT EXISTS platform_fee_rate NUMERIC(5,2)`)
     await pool.query(`
       INSERT INTO distributor_hidden_goods (distributor_id, goods_id)
       SELECT distributor_id, goods_id FROM distributor_goods WHERE visible IS FALSE
@@ -5030,6 +5102,163 @@ app.post('/miniapi/distributor/goods/visibility', miniAuth, async (req, res) => 
     }
     return ok(res, { goods_id: goodsId, visible })
   } catch(e) { fail(res, e.message) }
+})
+
+// 分销商自营商品投稿
+app.get('/miniapi/distributor/product-submissions', miniAuth, async (req, res) => {
+  try {
+    const dist = (await pool.query(
+      `SELECT id, platform_fee_rate FROM distributors WHERE user_id=$1 AND status=1 LIMIT 1`,
+      [req.miniUser.id]
+    )).rows[0]
+    if (!dist) return fail(res, '非分销商')
+    const rows = (await pool.query(
+      `SELECT * FROM distributor_product_submissions
+       WHERE distributor_id=$1 AND deleted_at IS NULL ORDER BY id DESC`,
+      [dist.id]
+    )).rows
+    return ok(res, { rows, default_platform_fee_rate: parseFloat(dist.platform_fee_rate || 0) })
+  } catch (e) { fail(res, e.message) }
+})
+
+app.post('/miniapi/distributor/product-submissions/save', miniAuth, async (req, res) => {
+  try {
+    const dist = (await pool.query(
+      `SELECT id FROM distributors WHERE user_id=$1 AND status=1 LIMIT 1`,
+      [req.miniUser.id]
+    )).rows[0]
+    if (!dist) return fail(res, '非分销商')
+    const {
+      id, title, category = '', images = [], detail_images = [], description = '',
+      spec = '', unit_name = '件', suggested_price = 0, stock_qty = 0,
+      freight_template = '', qualification_urls = [],
+    } = req.body
+    if (!String(title || '').trim()) return fail(res, '商品名称必填')
+    if (!Array.isArray(images) || !images.length) return fail(res, '至少上传一张商品图片')
+    if (Number(suggested_price) <= 0) return fail(res, '商品价格必须大于0')
+    if (id) {
+      const old = (await pool.query(
+        `SELECT * FROM distributor_product_submissions
+         WHERE id=$1 AND distributor_id=$2 AND deleted_at IS NULL`,
+        [id, dist.id]
+      )).rows[0]
+      if (!old) return fail(res, '商品申请不存在')
+      if (old.review_status === 'approved') return fail(res, '已审核商品请在ERP申请修改')
+      const row = (await pool.query(
+        `UPDATE distributor_product_submissions SET
+          title=$1,category=$2,images=$3,detail_images=$4,description=$5,spec=$6,
+          unit_name=$7,suggested_price=$8,stock_qty=$9,freight_template=$10,
+          qualification_urls=$11,review_status='pending',review_note='',
+          machine_review_status='pending',updated_at=NOW()
+         WHERE id=$12 AND distributor_id=$13 RETURNING *`,
+        [String(title).trim(), category, JSON.stringify(images.slice(0, 9)),
+          JSON.stringify(detail_images.slice(0, 20)), description, spec, unit_name,
+          Number(suggested_price), Number(stock_qty) || 0, freight_template,
+          JSON.stringify(qualification_urls.slice(0, 12)), id, dist.id]
+      )).rows[0]
+      return ok(res, row)
+    }
+    const row = (await pool.query(
+      `INSERT INTO distributor_product_submissions
+       (distributor_id,title,category,images,detail_images,description,spec,unit_name,
+        suggested_price,stock_qty,freight_template,qualification_urls)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
+      [dist.id, String(title).trim(), category, JSON.stringify(images.slice(0, 9)),
+        JSON.stringify(detail_images.slice(0, 20)), description, spec, unit_name,
+        Number(suggested_price), Number(stock_qty) || 0, freight_template,
+        JSON.stringify(qualification_urls.slice(0, 12))]
+    )).rows[0]
+    return ok(res, row)
+  } catch (e) { fail(res, e.message) }
+})
+
+// ERP后台 — 分销商自营商品审核与结算配置
+app.get('/adminapi/distributor/product-submissions', auth, async (req, res) => {
+  try {
+    const params = []
+    let where = `WHERE p.deleted_at IS NULL`
+    if (req.query.status) { params.push(req.query.status); where += ` AND p.review_status=$${params.length}` }
+    if (req.query.distributor_id) { params.push(parseInt(req.query.distributor_id)); where += ` AND p.distributor_id=$${params.length}` }
+    const rows = (await pool.query(
+      `SELECT p.*, d.name AS distributor_name, d.code AS distributor_code,
+              d.platform_fee_rate AS distributor_platform_fee_rate
+       FROM distributor_product_submissions p
+       JOIN distributors d ON d.id=p.distributor_id
+       ${where} ORDER BY p.id DESC`,
+      params
+    )).rows
+    return ok(res, rows)
+  } catch (e) { fail(res, e.message) }
+})
+
+app.post('/adminapi/distributor/product-submissions/review', auth, async (req, res) => {
+  try {
+    const id = parseInt(req.body.id)
+    const reviewStatus = String(req.body.review_status || '')
+    if (!id || !['approved', 'rejected'].includes(reviewStatus)) return fail(res, '审核参数错误')
+    let row = (await pool.query(
+      `UPDATE distributor_product_submissions SET review_status=$1,review_note=$2,
+       platform_fee_rate=COALESCE($3,platform_fee_rate),reviewed_by=$4,reviewed_at=NOW(),updated_at=NOW()
+       WHERE id=$5 AND deleted_at IS NULL RETURNING *`,
+      [reviewStatus, req.body.review_note || '',
+        req.body.platform_fee_rate == null ? null : Number(req.body.platform_fee_rate),
+        parseInt(req.admin?.id) || 0, id]
+    )).rows[0]
+    if (!row) return fail(res, '商品申请不存在')
+    if (reviewStatus === 'approved' && !row.goods_id) {
+      const brandRemark = JSON.stringify({ __brand__: {
+        show: true, image: (row.images || [])[0] || '', headerImages: row.images || [],
+        detailImages: row.detail_images || [], description: row.description || '',
+        category: row.category || '', baseSales: 0,
+      }})
+      const goods = (await pool.query(
+        `INSERT INTO goods
+         (goods_name,unit_name,spec,sell_price,stock,images,remark,status,can_sale,shop_id,
+          owner_type,owner_distributor_id,platform_fee_rate)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,1,1,1,'distributor',$8,$9) RETURNING id`,
+        [row.title, row.unit_name || '件', row.spec || '', row.suggested_price,
+          row.stock_qty || 0, (row.images || []).join(','), brandRemark,
+          row.distributor_id, row.platform_fee_rate]
+      )).rows[0]
+      await pool.query(
+        `INSERT INTO stock_inventory
+         (goods_id,goods_name,goods_code,unit_name,warehouse_id,warehouse_name,qty)
+         VALUES ($1,$2,$3,$4,0,'分销商自营',$5)`,
+        [
+          goods.id,
+          row.title,
+          `DIST-${row.distributor_id}-${goods.id}`,
+          row.unit_name || '件',
+          Number(row.stock_qty || 0)
+        ]
+      )
+      row = (await pool.query(
+        `UPDATE distributor_product_submissions SET goods_id=$1,updated_at=NOW() WHERE id=$2 RETURNING *`,
+        [goods.id, row.id]
+      )).rows[0]
+    }
+    return ok(res, row)
+  } catch (e) { fail(res, e.message) }
+})
+
+app.post('/adminapi/distributor/settlement-config', auth, async (req, res) => {
+  try {
+    const id = parseInt(req.body.id)
+    if (!id) return fail(res, '分销商ID必填')
+    const row = (await pool.query(
+      `UPDATE distributors SET platform_fee_rate=$1,settlement_cycle_days=$2,
+       agreement_type=$3,agreement_no=$4,agreement_url=$5,agreement_start=$6,
+       agreement_end=$7,sub_mchid=$8,merchant_onboarding_status=$9,settlement_mode=$10
+       WHERE id=$11 RETURNING *`,
+      [Number(req.body.platform_fee_rate) || 0, parseInt(req.body.settlement_cycle_days) || 7,
+        req.body.agreement_type || 'offline', req.body.agreement_no || '',
+        req.body.agreement_url || '', req.body.agreement_start || null,
+        req.body.agreement_end || null, req.body.sub_mchid || '',
+        req.body.merchant_onboarding_status || 'not_started',
+        req.body.settlement_mode || 'manual', id]
+    )).rows[0]
+    return ok(res, row)
+  } catch (e) { fail(res, e.message) }
 })
 
 // 分销商自己的素材库

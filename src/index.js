@@ -4184,7 +4184,7 @@ app.post('/miniapi/auth/phoneLogin', async (req, res) => {
           const newUserCoupons = (await pool.query(`SELECT id, validity_days FROM mini_coupons WHERE type='new_user' AND status=1`)).rows
           for (const c of newUserCoupons) {
             const expireAt = new Date(Date.now() + c.validity_days * 86400000)
-            await pool.query(`INSERT INTO mini_user_coupons (user_id, coupon_id, status, expire_at) VALUES ($1,$2,0,$3)`, [user.id, c.id, expireAt])
+            await pool.query(`INSERT INTO mini_user_coupons (user_id, coupon_id, coupon_type, status, expire_at) VALUES ($1,$2,'new_user',0,$3)`, [user.id, c.id, expireAt])
             await pool.query(`UPDATE mini_coupons SET claimed_count=claimed_count+1 WHERE id=$1`, [c.id])
           }
         }
@@ -4216,13 +4216,21 @@ app.post('/miniapi/auth/bindPhone', async (req, res) => {
         `INSERT INTO shop_customer (name, mobile, source, created_at) VALUES ($1,$2,'小程序',NOW()) ON CONFLICT DO NOTHING`,
         [phone, phone]
       ).catch(() => {})
-      // 新客自动发两张满减券
+      // 新客自动发两张满减券（按手机号防重，避免换 openid 重复领）
       try {
-        const newUserCoupons = (await pool.query(`SELECT id, validity_days FROM mini_coupons WHERE type='new_user' AND status=1`)).rows
-        for (const c of newUserCoupons) {
-          const expireAt = new Date(Date.now() + c.validity_days * 86400000)
-          await pool.query(`INSERT INTO mini_user_coupons (user_id, coupon_id, status, expire_at) VALUES ($1,$2,0,$3)`, [user.id, c.id, expireAt])
-          await pool.query(`UPDATE mini_coupons SET claimed_count=claimed_count+1 WHERE id=$1`, [c.id])
+        const phoneAlreadyHasNewCoupon = parseInt((await pool.query(
+          `SELECT COUNT(*) FROM mini_user_coupons uc
+           JOIN mini_users u ON u.id=uc.user_id
+           JOIN mini_coupons c ON c.id=uc.coupon_id
+           WHERE u.phone=$1 AND c.type='new_user'`, [phone]
+        )).rows[0].count)
+        if (phoneAlreadyHasNewCoupon === 0) {
+          const newUserCoupons = (await pool.query(`SELECT id, validity_days FROM mini_coupons WHERE type='new_user' AND status=1`)).rows
+          for (const c of newUserCoupons) {
+            const expireAt = new Date(Date.now() + c.validity_days * 86400000)
+            await pool.query(`INSERT INTO mini_user_coupons (user_id, coupon_id, coupon_type, status, expire_at) VALUES ($1,$2,'new_user',0,$3)`, [user.id, c.id, expireAt])
+            await pool.query(`UPDATE mini_coupons SET claimed_count=claimed_count+1 WHERE id=$1`, [c.id])
+          }
         }
       } catch {}
     }
@@ -4936,6 +4944,29 @@ app.post('/miniapi/order/confirm', miniAuth, async (req, res) => {
       level_price NUMERIC(10,2) NOT NULL DEFAULT 0,
       UNIQUE(level_id, goods_id)
     )`)
+    await pool.query(`CREATE TABLE IF NOT EXISTS distributor_bank_cards (
+      id SERIAL PRIMARY KEY,
+      distributor_id INT NOT NULL,
+      bank_name VARCHAR(50) NOT NULL DEFAULT '',
+      card_no VARCHAR(30) NOT NULL DEFAULT '',
+      holder_name VARCHAR(50) NOT NULL DEFAULT '',
+      is_default BOOLEAN DEFAULT FALSE,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )`)
+    await pool.query(`CREATE TABLE IF NOT EXISTS distributor_withdraws (
+      id SERIAL PRIMARY KEY,
+      distributor_id INT NOT NULL,
+      amount NUMERIC(10,2) NOT NULL DEFAULT 0,
+      bank_card_id INT NOT NULL DEFAULT 0,
+      bank_name VARCHAR(50) DEFAULT '',
+      card_no_snapshot VARCHAR(30) DEFAULT '',
+      holder_name_snapshot VARCHAR(50) DEFAULT '',
+      status INT DEFAULT 0,
+      reject_reason TEXT DEFAULT '',
+      transfer_no VARCHAR(60) DEFAULT '',
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      handled_at TIMESTAMPTZ
+    )`)
   } catch(e) { console.log('distributor init:', e.message) }
 })()
 
@@ -5279,6 +5310,124 @@ app.get('/miniapi/distributor/materials', miniAuth, async (req, res) => {
   } catch(e) { fail(res, e.message) }
 })
 
+// 分销商的客户列表（下单过的用户，按累计佣金聚合）
+app.get('/miniapi/distributor/customers', miniAuth, async (req, res) => {
+  try {
+    const dist = (await pool.query(`SELECT id, code FROM distributors WHERE user_id=$1 AND status=1 LIMIT 1`, [req.miniUser.id])).rows[0]
+    if (!dist) return fail(res, '非分销商')
+    const rows = (await pool.query(
+      `SELECT u.id, u.nickname, u.avatar, u.phone,
+              COUNT(o.id) AS order_count,
+              COALESCE(SUM(o.total_amount),0) AS total_amount,
+              COALESCE(SUM(o.commission),0) AS total_commission,
+              MAX(o.created_at) AS last_order_at
+       FROM mini_orders o
+       JOIN mini_users u ON u.id=o.user_id
+       WHERE o.distributor_code=$1 AND o.status NOT IN (4,5) AND o.deleted_at IS NULL
+       GROUP BY u.id, u.nickname, u.avatar, u.phone
+       ORDER BY last_order_at DESC`,
+      [dist.code]
+    )).rows
+    return ok(res, rows)
+  } catch(e) { fail(res, e.message) }
+})
+
+// 分销商银行卡列表
+app.get('/miniapi/distributor/bank-cards', miniAuth, async (req, res) => {
+  try {
+    const dist = (await pool.query(`SELECT id FROM distributors WHERE user_id=$1 AND status=1 LIMIT 1`, [req.miniUser.id])).rows[0]
+    if (!dist) return fail(res, '非分销商')
+    const rows = (await pool.query(
+      `SELECT id, bank_name, card_no, holder_name, is_default, created_at
+       FROM distributor_bank_cards WHERE distributor_id=$1 ORDER BY is_default DESC, id DESC`,
+      [dist.id]
+    )).rows
+    return ok(res, rows)
+  } catch(e) { fail(res, e.message) }
+})
+
+app.post('/miniapi/distributor/bank-cards/add', miniAuth, async (req, res) => {
+  try {
+    const { bank_name, card_no, holder_name, is_default } = req.body
+    if (!bank_name || !card_no || !holder_name) return fail(res, '请填写完整信息')
+    if (!/^\d{12,25}$/.test(String(card_no))) return fail(res, '银行卡号格式不正确')
+    const dist = (await pool.query(`SELECT id FROM distributors WHERE user_id=$1 AND status=1 LIMIT 1`, [req.miniUser.id])).rows[0]
+    if (!dist) return fail(res, '非分销商')
+    const setDefault = Boolean(is_default) || parseInt((await pool.query(
+      `SELECT COUNT(*) FROM distributor_bank_cards WHERE distributor_id=$1`, [dist.id]
+    )).rows[0].count) === 0
+    if (setDefault) {
+      await pool.query(`UPDATE distributor_bank_cards SET is_default=false WHERE distributor_id=$1`, [dist.id])
+    }
+    await pool.query(
+      `INSERT INTO distributor_bank_cards (distributor_id, bank_name, card_no, holder_name, is_default) VALUES ($1,$2,$3,$4,$5)`,
+      [dist.id, bank_name, card_no, holder_name, setDefault]
+    )
+    return ok(res)
+  } catch(e) { fail(res, e.message) }
+})
+
+app.post('/miniapi/distributor/bank-cards/del', miniAuth, async (req, res) => {
+  try {
+    const { id } = req.body
+    if (!id) return fail(res, 'id必填')
+    const dist = (await pool.query(`SELECT id FROM distributors WHERE user_id=$1 AND status=1 LIMIT 1`, [req.miniUser.id])).rows[0]
+    if (!dist) return fail(res, '非分销商')
+    await pool.query(`DELETE FROM distributor_bank_cards WHERE id=$1 AND distributor_id=$2`, [id, dist.id])
+    return ok(res)
+  } catch(e) { fail(res, e.message) }
+})
+
+// 分销商申请提现
+app.post('/miniapi/distributor/withdraw/apply', miniAuth, async (req, res) => {
+  try {
+    const { amount, bank_card_id } = req.body
+    const amt = parseFloat(amount)
+    if (!(amt > 0)) return fail(res, '提现金额不正确')
+    if (amt < 10) return fail(res, '提现金额至少 10 元')
+    if (!bank_card_id) return fail(res, '请选择银行卡')
+    const dist = (await pool.query(`SELECT id, code FROM distributors WHERE user_id=$1 AND status=1 LIMIT 1`, [req.miniUser.id])).rows[0]
+    if (!dist) return fail(res, '非分销商')
+    const card = (await pool.query(
+      `SELECT bank_name, card_no, holder_name FROM distributor_bank_cards WHERE id=$1 AND distributor_id=$2`,
+      [bank_card_id, dist.id]
+    )).rows[0]
+    if (!card) return fail(res, '银行卡不存在')
+    // 可提现余额 = 已结算佣金 - 已申请中/处理中的提现
+    const settled = parseFloat((await pool.query(
+      `SELECT COALESCE(SUM(commission),0) AS s FROM mini_orders
+       WHERE distributor_code=$1 AND commission_settled=true AND status NOT IN (4,5) AND deleted_at IS NULL`,
+      [dist.code]
+    )).rows[0].s)
+    const locked = parseFloat((await pool.query(
+      `SELECT COALESCE(SUM(amount),0) AS s FROM distributor_withdraws WHERE distributor_id=$1 AND status IN (0,1,2)`,
+      [dist.id]
+    )).rows[0].s)
+    const available = settled - locked
+    if (amt > available + 0.001) return fail(res, `可提现余额不足，当前可提 ¥${available.toFixed(2)}`)
+    await pool.query(
+      `INSERT INTO distributor_withdraws (distributor_id, amount, bank_card_id, bank_name, card_no_snapshot, holder_name_snapshot, status)
+       VALUES ($1,$2,$3,$4,$5,$6,0)`,
+      [dist.id, amt, bank_card_id, card.bank_name, card.card_no, card.holder_name]
+    )
+    return ok(res)
+  } catch(e) { fail(res, e.message) }
+})
+
+// 分销商提现记录
+app.get('/miniapi/distributor/withdraw/list', miniAuth, async (req, res) => {
+  try {
+    const dist = (await pool.query(`SELECT id FROM distributors WHERE user_id=$1 AND status=1 LIMIT 1`, [req.miniUser.id])).rows[0]
+    if (!dist) return fail(res, '非分销商')
+    const rows = (await pool.query(
+      `SELECT id, amount, bank_name, card_no_snapshot, holder_name_snapshot, status, reject_reason, transfer_no, created_at, handled_at
+       FROM distributor_withdraws WHERE distributor_id=$1 ORDER BY id DESC LIMIT 200`,
+      [dist.id]
+    )).rows
+    return ok(res, rows)
+  } catch(e) { fail(res, e.message) }
+})
+
 // ERP后台 — 分销商列表
 app.get('/adminapi/distributor/list', auth, async (req, res) => {
   try {
@@ -5584,6 +5733,58 @@ app.post('/adminapi/distributor/edit', auth, async (req, res) => {
     const { id, commission_rate } = req.body
     if (!id) return fail(res, 'id必填')
     await pool.query(`UPDATE distributors SET commission_rate=$1 WHERE id=$2`, [parseFloat(commission_rate), id])
+    return ok(res)
+  } catch(e) { fail(res, e.message) }
+})
+
+// ERP后台 — 提现申请列表
+app.get('/adminapi/distributor/withdraw/list', auth, async (req, res) => {
+  try {
+    const { status, page = 1, list_rows = 20 } = req.query
+    const offset = (parseInt(page)-1)*parseInt(list_rows)
+    const conds = []
+    const params = []
+    if (status !== undefined && status !== '') {
+      params.push(parseInt(status))
+      conds.push(`w.status=$${params.length}`)
+    }
+    const where = conds.length ? `WHERE ${conds.join(' AND ')}` : ''
+    const total = parseInt((await pool.query(
+      `SELECT COUNT(*) FROM distributor_withdraws w ${where}`, params
+    )).rows[0].count)
+    params.push(parseInt(list_rows), offset)
+    const rows = (await pool.query(
+      `SELECT w.*, d.name AS distributor_name, d.code AS distributor_code, d.phone AS distributor_phone
+       FROM distributor_withdraws w
+       LEFT JOIN distributors d ON d.id=w.distributor_id
+       ${where}
+       ORDER BY w.id DESC LIMIT $${params.length-1} OFFSET $${params.length}`,
+      params
+    )).rows
+    return ok(res, { total, rows })
+  } catch(e) { fail(res, e.message) }
+})
+
+app.post('/adminapi/distributor/withdraw/approve', auth, async (req, res) => {
+  try {
+    const { id, transfer_no = '' } = req.body
+    if (!id) return fail(res, 'id必填')
+    await pool.query(
+      `UPDATE distributor_withdraws SET status=2, transfer_no=$1, handled_at=NOW() WHERE id=$2 AND status IN (0,1)`,
+      [transfer_no, id]
+    )
+    return ok(res)
+  } catch(e) { fail(res, e.message) }
+})
+
+app.post('/adminapi/distributor/withdraw/reject', auth, async (req, res) => {
+  try {
+    const { id, reason = '' } = req.body
+    if (!id) return fail(res, 'id必填')
+    await pool.query(
+      `UPDATE distributor_withdraws SET status=3, reject_reason=$1, handled_at=NOW() WHERE id=$2 AND status IN (0,1)`,
+      [reason, id]
+    )
     return ok(res)
   } catch(e) { fail(res, e.message) }
 })
@@ -6542,8 +6743,8 @@ app.post('/miniapi/coupon/claim', miniAuth, async (req, res) => {
 
     const expireAt = new Date(Date.now() + c.validity_days * 86400000)
     await pool.query(
-      `INSERT INTO mini_user_coupons (user_id, coupon_id, status, expire_at) VALUES ($1,$2,0,$3)`,
-      [uid, coupon_id, expireAt]
+      `INSERT INTO mini_user_coupons (user_id, coupon_id, coupon_type, status, expire_at) VALUES ($1,$2,$3,0,$4)`,
+      [uid, coupon_id, c.type, expireAt]
     )
     await pool.query(`UPDATE mini_coupons SET claimed_count=claimed_count+1 WHERE id=$1`, [coupon_id])
     return ok(res, { message: `领取成功！${c.validity_days}天内有效`, expire_at: expireAt })

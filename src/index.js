@@ -7046,6 +7046,27 @@ app.post('/adminapi/mini/coupons/del', auth, async (req, res) => {
       WHERE content_type='article'
         AND title IN ('从产地到餐桌，我们认真守住每一份新鲜', '黄金纬度，藏在风里的草原滋味')
     `)
+    // 公众号文章同步：将右侧示例卡替换为“草原儿女从小吃到大的营养奶食品”。
+    await pool.query(`
+      UPDATE mini_videos
+      SET title='草原儿女从小吃到大的营养奶食品',
+          description='奶豆腐、奶皮子、奶酪等草原奶食，是味道，也是代代相传的生活记忆。',
+          content='草原奶食陪伴着一代代草原儿女长大。鲜奶经过熬煮、发酵、晾晒与凝结，变成奶豆腐、奶皮子、奶酪等各具风味的传统食品。\\n\\n它们既浓缩了牛奶的营养，也保存着牧区日常生活的温度。左右滑动图片，一起认识这些熟悉又珍贵的草原味道。',
+          cover_url='https://nomaderp.pages.dev/media/covers/1784979366054_rl69wl.jpg',
+          images='[
+            "https://nomaderp.pages.dev/media/covers/1784979366054_rl69wl.jpg",
+            "https://nomaderp.pages.dev/media/covers/1784979365965_qd38k6.jpg",
+            "https://nomaderp.pages.dev/media/covers/1784979365903_8osg7d.jpg",
+            "https://nomaderp.pages.dev/media/covers/1784979365905_r7hwa6.jpg",
+            "https://nomaderp.pages.dev/media/covers/1784979365512_vaxgvp.jpg",
+            "https://nomaderp.pages.dev/media/covers/1784979366190_wde1bf.jpg",
+            "https://nomaderp.pages.dev/media/covers/1784979366188_5osf1v.jpg"
+          ]'::jsonb,
+          goods_id=0,
+          sort=110
+      WHERE content_type='article'
+        AND title IN ('黄金纬度，藏在风里的草原滋味', '草原儿女从小吃到大的营养奶食品')
+    `)
 
     // 为没有评论的视频插入预设评论
     const SEED_COMMENTS = [

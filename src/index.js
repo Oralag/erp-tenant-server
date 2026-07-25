@@ -4863,6 +4863,7 @@ app.post('/miniapi/order/confirm', miniAuth, async (req, res) => {
         id SERIAL PRIMARY KEY,
         distributor_id INT NOT NULL,
         title VARCHAR(160) NOT NULL DEFAULT '',
+        short_title VARCHAR(80) DEFAULT '',
         category VARCHAR(80) DEFAULT '',
         images JSONB DEFAULT '[]',
         detail_images JSONB DEFAULT '[]',
@@ -4872,6 +4873,9 @@ app.post('/miniapi/order/confirm', miniAuth, async (req, res) => {
         suggested_price NUMERIC(12,2) DEFAULT 0,
         stock_qty NUMERIC(12,3) DEFAULT 0,
         freight_template VARCHAR(120) DEFAULT '',
+        ship_origin VARCHAR(120) DEFAULT '',
+        shipping_fee VARCHAR(120) DEFAULT '',
+        delivery_time VARCHAR(120) DEFAULT '',
         qualification_urls JSONB DEFAULT '[]',
         platform_fee_rate NUMERIC(5,2),
         review_status VARCHAR(20) DEFAULT 'pending',
@@ -4885,6 +4889,10 @@ app.post('/miniapi/order/confirm', miniAuth, async (req, res) => {
         deleted_at TIMESTAMPTZ
       )
     `)
+    await pool.query(`ALTER TABLE distributor_product_submissions ADD COLUMN IF NOT EXISTS short_title VARCHAR(80) DEFAULT ''`)
+    await pool.query(`ALTER TABLE distributor_product_submissions ADD COLUMN IF NOT EXISTS ship_origin VARCHAR(120) DEFAULT ''`)
+    await pool.query(`ALTER TABLE distributor_product_submissions ADD COLUMN IF NOT EXISTS shipping_fee VARCHAR(120) DEFAULT ''`)
+    await pool.query(`ALTER TABLE distributor_product_submissions ADD COLUMN IF NOT EXISTS delivery_time VARCHAR(120) DEFAULT ''`)
     await pool.query(`ALTER TABLE mini_order_items ADD COLUMN IF NOT EXISTS seller_type VARCHAR(20) DEFAULT 'official'`)
     await pool.query(`ALTER TABLE mini_order_items ADD COLUMN IF NOT EXISTS seller_distributor_id INT DEFAULT 0`)
     await pool.query(`ALTER TABLE mini_order_items ADD COLUMN IF NOT EXISTS promotion_rate_snapshot NUMERIC(5,2) DEFAULT 0`)
@@ -5174,9 +5182,10 @@ app.post('/miniapi/distributor/product-submissions/save', miniAuth, async (req, 
     )).rows[0]
     if (!dist) return fail(res, '非分销商')
     const {
-      id, title, category = '', images = [], detail_images = [], description = '',
+      id, title, short_title = '', category = '', images = [], detail_images = [], description = '',
       spec = '', unit_name = '件', suggested_price = 0, stock_qty = 0,
-      freight_template = '', qualification_urls = [],
+      freight_template = '', ship_origin = '', shipping_fee = '', delivery_time = '',
+      qualification_urls = [],
     } = req.body
     if (!String(title || '').trim()) return fail(res, '商品名称必填')
     if (!Array.isArray(images) || !images.length) return fail(res, '至少上传一张商品图片')
@@ -5191,28 +5200,37 @@ app.post('/miniapi/distributor/product-submissions/save', miniAuth, async (req, 
       if (old.review_status === 'approved') return fail(res, '已审核商品请在ERP申请修改')
       const row = (await pool.query(
         `UPDATE distributor_product_submissions SET
-          title=$1,category=$2,images=$3,detail_images=$4,description=$5,spec=$6,
-          unit_name=$7,suggested_price=$8,stock_qty=$9,freight_template=$10,
-          qualification_urls=$11,review_status='pending',review_note='',
+          title=$1,short_title=$2,category=$3,images=$4,detail_images=$5,description=$6,spec=$7,
+          unit_name=$8,suggested_price=$9,stock_qty=$10,freight_template=$11,
+          ship_origin=$12,shipping_fee=$13,delivery_time=$14,qualification_urls=$15,
+          review_status='pending',review_note='',
           machine_review_status='pending',updated_at=NOW()
-         WHERE id=$12 AND distributor_id=$13 RETURNING *`,
-        [String(title).trim(), category, JSON.stringify(images.slice(0, 9)),
+         WHERE id=$16 AND distributor_id=$17 RETURNING *`,
+        [String(title).trim(), String(short_title).trim(), category, JSON.stringify(images.slice(0, 9)),
           JSON.stringify(detail_images.slice(0, 20)), description, spec, unit_name,
           Number(suggested_price), Number(stock_qty) || 0, freight_template,
+          ship_origin, shipping_fee, delivery_time,
           JSON.stringify(qualification_urls.slice(0, 12)), id, dist.id]
       )).rows[0]
       return ok(res, row)
     }
     const row = (await pool.query(
       `INSERT INTO distributor_product_submissions
-       (distributor_id,title,category,images,detail_images,description,spec,unit_name,
-        suggested_price,stock_qty,freight_template,qualification_urls)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
-      [dist.id, String(title).trim(), category, JSON.stringify(images.slice(0, 9)),
+       (distributor_id,title,short_title,category,images,detail_images,description,spec,unit_name,
+        suggested_price,stock_qty,freight_template,ship_origin,shipping_fee,delivery_time,qualification_urls)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *`,
+      [dist.id, String(title).trim(), String(short_title).trim(), category, JSON.stringify(images.slice(0, 9)),
         JSON.stringify(detail_images.slice(0, 20)), description, spec, unit_name,
         Number(suggested_price), Number(stock_qty) || 0, freight_template,
+        ship_origin, shipping_fee, delivery_time,
         JSON.stringify(qualification_urls.slice(0, 12))]
     )).rows[0]
+    const notifyKey = process.env.SERVER_JIANG_KEY
+    if (notifyKey) {
+      const notifyTitle = encodeURIComponent('📦 新自营商品申请')
+      const notifyDesp = encodeURIComponent(`商品：${String(title).trim()}\n价格：¥${Number(suggested_price).toFixed(2)}\n请进入 ERP「分销商管理 → 自营商品审核」处理。`)
+      fetch(`https://sctapi.ftqq.com/${notifyKey}.send?title=${notifyTitle}&desp=${notifyDesp}`).catch(() => {})
+    }
     return ok(res, row)
   } catch (e) { fail(res, e.message) }
 })
@@ -5254,6 +5272,8 @@ app.post('/adminapi/distributor/product-submissions/review', auth, async (req, r
       const brandRemark = JSON.stringify({ __brand__: {
         show: true, image: (row.images || [])[0] || '', headerImages: row.images || [],
         detailImages: row.detail_images || [], description: row.description || '',
+        shortTitle: row.short_title || '', shipOrigin: row.ship_origin || '',
+        shippingFee: row.shipping_fee || '', deliveryTime: row.delivery_time || '',
         category: row.category || '', baseSales: 0,
       }})
       const goods = (await pool.query(
@@ -5424,6 +5444,12 @@ app.post('/miniapi/distributor/withdraw/apply', miniAuth, async (req, res) => {
        VALUES ($1,$2,$3,$4,$5,$6,0)`,
       [dist.id, amt, bank_card_id, card.bank_name, card.card_no, card.holder_name]
     )
+    const notifyKey = process.env.SERVER_JIANG_KEY
+    if (notifyKey) {
+      const notifyTitle = encodeURIComponent('💳 新分销提现申请')
+      const notifyDesp = encodeURIComponent(`分销码：${dist.code}\n金额：¥${amt.toFixed(2)}\n收款人：${card.holder_name}\n请进入 ERP「分销提现审批」处理。`)
+      fetch(`https://sctapi.ftqq.com/${notifyKey}.send?title=${notifyTitle}&desp=${notifyDesp}`).catch(() => {})
+    }
     return ok(res)
   } catch(e) { fail(res, e.message) }
 })

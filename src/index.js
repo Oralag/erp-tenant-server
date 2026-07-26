@@ -6366,22 +6366,19 @@ app.get('/miniapi/brand/config', async (req, res) => {
 })
 
 app.post('/miniapi/nova/chat', async (req, res) => {
-  const _dbg = { rowsCount: 0, brandCount: 0, contextChars: 0, err: null, firstBrandName: null }
   try {
     const { messages = [] } = req.body
 
     // 动态加载所有上架商品数据构建上下文
+    // 排序 + LIMIT 500 与 /miniapi/goods/list 对齐，否则品牌可见商品可能落在窗口外
     let productLines = ''
     try {
       const rows = (await pool.query(
-        `SELECT id, goods_name, sell_price, remark, unit_name FROM goods WHERE deleted_at IS NULL AND status=1 AND can_sale=1 LIMIT 200`
+        `SELECT id, goods_name, sell_price, remark, unit_name FROM goods WHERE deleted_at IS NULL AND status=1 AND can_sale=1 ORDER BY sort ASC, id DESC LIMIT 500`
       )).rows
-      _dbg.rowsCount = rows.length
       const brandRows = rows.filter(g => {
         try { return JSON.parse(g.remark || '{}')['__brand__']?.show === true } catch { return false }
       })
-      _dbg.brandCount = brandRows.length
-      _dbg.firstBrandName = brandRows[0]?.goods_name || null
       productLines = brandRows.map(g => {
         let brand = {}
         try { brand = JSON.parse(g.remark || '{}')['__brand__'] || {} } catch {}
@@ -6390,7 +6387,7 @@ app.post('/miniapi/nova/chat', async (req, res) => {
         const desc = brand.description || ''
         return `• ${g.goods_name}，售价¥${g.sell_price}/${g.unit_name || '件'}${skuStr}${desc ? '，' + desc.slice(0, 30) : ''}`
       }).join('\n')
-    } catch (e) { _dbg.err = String(e && e.message || e) }
+    } catch {}
 
     const brandContext = `【在售商品】
 ${productLines || '（暂无实时商品数据，遇到具体价格/规格问题请引导用户去商店页面查看）'}
@@ -6417,9 +6414,8 @@ ${productLines || '（暂无实时商品数据，遇到具体价格/规格问题
         if (d.type === 'text') reply += (d.text || d.content || '')
       } catch {}
     }
-    _dbg.contextChars = brandContext.length
-    return ok(res, { reply: reply || '抱歉，暂时无法回复，请稍后再试。', _debug: _dbg })
-  } catch (e) { _dbg.err = String(e && e.message || e); fail(res, e.message) }
+    return ok(res, { reply: reply || '抱歉，暂时无法回复，请稍后再试。' })
+  } catch (e) { fail(res, e.message) }
 })
 
 // ─── 批发合作意向 ─────────────────────────────────────────────────────────────

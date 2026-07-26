@@ -6392,6 +6392,7 @@ app.post('/miniapi/nova/chat', async (req, res) => {
     const { messages = [] } = req.body
 
     // 商品：SQL 层用 LIKE 预筛只带 __brand__ 标记的行，避免总量超 LIMIT 导致品牌可见商品掉出窗口
+    // 每个商品把 __brand__.productInfo（详情图 OCR 提炼的结构化信息）也塞进上下文，让 Nova 能准确答成分/存储/工艺
     let productLines = ''
     try {
       const rows = (await pool.query(
@@ -6409,8 +6410,26 @@ app.post('/miniapi/nova/chat', async (req, res) => {
         const skus = (b.skuVariants || []).filter(s => s.label)
         const skuStr = skus.length ? '，规格：' + skus.map(s => `${s.label}¥${s.price}`).join('、') : ''
         const desc = b.description || ''
-        return `• ${g.goods_name}，售价¥${g.sell_price}/${g.unit_name || '件'}${skuStr}${desc ? '，' + desc.slice(0, 30) : ''}`
-      }).join('\n')
+        const head = `【${g.goods_name}】售价¥${g.sell_price}/${g.unit_name || '件'}${skuStr}${desc ? '\n  · ' + desc.slice(0, 60) : ''}`
+        const pi = b.productInfo || {}
+        const infoLines = []
+        // productInfo 字段名对应中文标签（未列出的字段按 key 原样输出）
+        const LABELS = {
+          fullName: '正式名称', ingredients: '配料表', ingredientsOriginal: '原味配料',
+          ingredientsSweet: '甜味配料', specs: '规格', shelfLife: '保质期',
+          storage: '存储条件', origin: '产地/奶源', nutritionPer100g: '每100g营养',
+          nutritionHighlight: '营养亮点', nutritionHighlights: '营养亮点',
+          nutritionCreamer: '奶球营养', craft: '工艺', highlights: '产品亮点',
+          certification: '认证', scene: '适用场景', eatMethod: '食用方法',
+          flavors: '口味', materials: '原料', warnings: '注意事项',
+          design: '设计', material: '材质', usage: '用法', type: '类型', note: '说明',
+        }
+        for (const [k, v] of Object.entries(pi)) {
+          if (!v || k === 'fullName') continue
+          infoLines.push(`  · ${LABELS[k] || k}: ${v}`)
+        }
+        return infoLines.length ? head + '\n' + infoLines.join('\n') : head
+      }).join('\n\n')
     } catch {}
 
     // 品牌主页：整份 KV 拉进来，让 Nova 与用户编辑保持同步

@@ -5319,6 +5319,16 @@ app.post('/adminapi/distributor/settlement-config', auth, async (req, res) => {
   try {
     const id = parseInt(req.body.id)
     if (!id) return fail(res, '分销商ID必填')
+    await pool.query(`ALTER TABLE distributors ADD COLUMN IF NOT EXISTS platform_fee_rate NUMERIC(5,2) DEFAULT 10`)
+    await pool.query(`ALTER TABLE distributors ADD COLUMN IF NOT EXISTS settlement_cycle_days INT DEFAULT 7`)
+    await pool.query(`ALTER TABLE distributors ADD COLUMN IF NOT EXISTS agreement_type VARCHAR(20) DEFAULT 'offline'`)
+    await pool.query(`ALTER TABLE distributors ADD COLUMN IF NOT EXISTS agreement_no VARCHAR(80) DEFAULT ''`)
+    await pool.query(`ALTER TABLE distributors ADD COLUMN IF NOT EXISTS agreement_url TEXT DEFAULT ''`)
+    await pool.query(`ALTER TABLE distributors ADD COLUMN IF NOT EXISTS agreement_start DATE`)
+    await pool.query(`ALTER TABLE distributors ADD COLUMN IF NOT EXISTS agreement_end DATE`)
+    await pool.query(`ALTER TABLE distributors ADD COLUMN IF NOT EXISTS sub_mchid VARCHAR(40) DEFAULT ''`)
+    await pool.query(`ALTER TABLE distributors ADD COLUMN IF NOT EXISTS merchant_onboarding_status VARCHAR(30) DEFAULT 'not_started'`)
+    await pool.query(`ALTER TABLE distributors ADD COLUMN IF NOT EXISTS settlement_mode VARCHAR(30) DEFAULT 'manual'`)
     const row = (await pool.query(
       `UPDATE distributors SET platform_fee_rate=$1,settlement_cycle_days=$2,
        agreement_type=$3,agreement_no=$4,agreement_url=$5,agreement_start=$6,

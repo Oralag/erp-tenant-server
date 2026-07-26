@@ -6369,34 +6369,58 @@ app.post('/miniapi/nova/chat', async (req, res) => {
   try {
     const { messages = [] } = req.body
 
-    // 动态加载所有上架商品数据构建上下文
-    // 排序 + LIMIT 500 与 /miniapi/goods/list 对齐，否则品牌可见商品可能落在窗口外
+    // 商品：SQL 层用 LIKE 预筛只带 __brand__ 标记的行，避免总量超 LIMIT 导致品牌可见商品掉出窗口
     let productLines = ''
     try {
       const rows = (await pool.query(
-        `SELECT id, goods_name, sell_price, remark, unit_name FROM goods WHERE deleted_at IS NULL AND status=1 AND can_sale=1 ORDER BY sort ASC, id DESC LIMIT 500`
+        `SELECT id, goods_name, sell_price, remark, unit_name FROM goods
+         WHERE deleted_at IS NULL AND status=1 AND can_sale=1
+           AND remark LIKE '%"__brand__"%'
+         ORDER BY sort ASC, id DESC LIMIT 500`
       )).rows
       const brandRows = rows.filter(g => {
         try { return JSON.parse(g.remark || '{}')['__brand__']?.show === true } catch { return false }
       })
       productLines = brandRows.map(g => {
-        let brand = {}
-        try { brand = JSON.parse(g.remark || '{}')['__brand__'] || {} } catch {}
-        const skus = (brand.skuVariants || []).filter(s => s.label)
+        let b = {}
+        try { b = JSON.parse(g.remark || '{}')['__brand__'] || {} } catch {}
+        const skus = (b.skuVariants || []).filter(s => s.label)
         const skuStr = skus.length ? '，规格：' + skus.map(s => `${s.label}¥${s.price}`).join('、') : ''
-        const desc = brand.description || ''
+        const desc = b.description || ''
         return `• ${g.goods_name}，售价¥${g.sell_price}/${g.unit_name || '件'}${skuStr}${desc ? '，' + desc.slice(0, 30) : ''}`
       }).join('\n')
     } catch {}
 
-    const brandContext = `【在售商品】
-${productLines || '（暂无实时商品数据，遇到具体价格/规格问题请引导用户去商店页面查看）'}
+    // 品牌主页：整份 KV 拉进来，让 Nova 与用户编辑保持同步
+    let brand = {}
+    try {
+      const bcRes = await fetch('https://nomaderp.pages.dev/api/brand-config')
+      brand = (await bcRes.json()).data || {}
+    } catch {}
 
-【物流】基本全店包邮，通常用圆通速递发货
-【售后】7 天无理由退换
-【批发】起订量各品类不同，请引导用户填写采购商申请表或联系客服报价
+    const list = (arr, fn) => (Array.isArray(arr) ? arr : []).map(fn).filter(Boolean).join('\n')
+    const sections = []
+    if (brand.heroTitle || brand.heroSubtitle || brand.heroDesc) {
+      const title = (brand.heroTitle || '').replace(/\n/g, ' ')
+      const sub = brand.heroSubtitle ? `（${brand.heroSubtitle}）` : ''
+      sections.push(`【品牌一句话】${title}${sub}${brand.heroDesc ? '\n' + brand.heroDesc : ''}`)
+    }
+    if (brand.storyText) sections.push(`【品牌故事】${brand.storyText}`)
+    if (brand.totalRating || brand.totalReviews) {
+      sections.push(`【口碑数据】${brand.totalRating || ''}分（${brand.totalReviews || 0}条评价），${brand.recommendRate || 0}% 推荐率`)
+    }
+    if (brand.chapters?.length) sections.push(`【品牌故事章节】\n${list(brand.chapters, c => c.title ? `${c.title}：${c.text || ''}` : '')}`)
+    if (brand.values?.length) sections.push(`【品牌价值观】\n${list(brand.values, v => v.title ? `- ${v.title}：${v.desc || ''}` : '')}`)
+    if (brand.stats?.length) sections.push(`【品牌数据】\n${list(brand.stats, s => s.num ? `- ${s.num} ${s.label || ''}` : '')}`)
+    if (brand.carriers?.length) sections.push(`【物流承运】\n${list(brand.carriers, c => c.name ? `- ${c.name}：${c.time || ''}${c.type ? '（' + c.type + '）' : ''}` : '')}`)
+    if (brand.categories?.length) sections.push(`【商品分类】\n${list(brand.categories, c => c.name ? `- ${c.name}` : '')}`)
+    sections.push(`【在售商品】\n${productLines || '（暂无实时商品数据，请引导用户去商店页面查看）'}`)
+    if (brand.policies?.length) sections.push(`【售后与政策】\n${list(brand.policies, p => p.title ? `- ${p.title}：${p.desc || ''}` : '')}`)
+    if (brand.channels?.length) sections.push(`【销售渠道】\n${list(brand.channels, c => c.title ? `- ${c.title}${c.tag ? '（' + c.tag + '）' : ''}：${c.desc || ''}` : '')}`)
+    if (brand.faqs?.length) sections.push(`【常见问答】\n${brand.faqs.filter(f => f.q).map(f => `Q: ${f.q}\nA: ${f.a || ''}`).join('\n\n')}`)
+    sections.push('回答规则：\n- 产品价格/规格只能从【在售商品】准确引用，不编造数字\n- 【在售商品】里没有的品类，如实说"这个目前没上架"\n- 物流/售后/退换按【售后与政策】和【物流承运】里的最新描述回答，不要用旧信息\n- 用户问"哪里买"按【销售渠道】回答\n- 遇到【常见问答】里已有的问题，用那里的答案回答，不要另行编造')
 
-回答时如果用户问具体产品的价格或规格，只能从上方【在售商品】里准确引用，不要编造数字；商品列表里没有的品类，如实说"这个目前没上架"。`
+    const brandContext = sections.join('\n\n')
 
     const cfRes = await fetch('https://nomaderp.pages.dev/api/brand-chat', {
       method: 'POST',

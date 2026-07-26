@@ -4486,13 +4486,35 @@ app.post('/miniapi/order/create', miniAuth, async (req, res) => {
     )).rows
     const goodsMap = Object.fromEntries(goodsRows.map(g => [g.id, g]))
 
+    // 客户等级单独价：买家手机号 → 客户 → 客户等级 → 该等级下的商品单独价
+    const levelPriceMap = {}
+    let buyerLevelId = 0
+    try {
+      const custRow = (await pool.query(
+        `SELECT cl.id AS level_id
+         FROM sale_customers c
+         JOIN customer_levels cl ON cl.name = c.level_name
+         WHERE c.mobile = (SELECT phone FROM mini_users WHERE id=$1)
+           AND c.deleted_at IS NULL
+         LIMIT 1`, [req.miniUser.id]
+      )).rows[0]
+      if (custRow?.level_id) {
+        buyerLevelId = Number(custRow.level_id)
+        const priceRows = (await pool.query(
+          `SELECT goods_id, level_price FROM customer_level_prices WHERE level_id=$1 AND goods_id=ANY($2)`,
+          [buyerLevelId, goodsIds]
+        )).rows
+        for (const r of priceRows) levelPriceMap[Number(r.goods_id)] = parseFloat(r.level_price)
+      }
+    } catch { /* 等级价查询失败不影响下单，回落到原价 */ }
+
     let originalTotal = 0
     const validItems = []
     for (const item of items) {
       const g = goodsMap[item.goods_id]
       if (!g) return fail(res, `商品不存在: ${item.goods_id}`)
       const qty = Math.max(1, parseInt(item.qty) || 1)
-      const price = parseFloat(g.price)
+      const price = levelPriceMap[g.id] ?? parseFloat(g.price)
       originalTotal += price * qty
       validItems.push({ goods_id: g.id, goods_name: g.name, spec: item.spec || '', price, qty,
         owner_type: g.owner_type || 'official', owner_distributor_id: Number(g.owner_distributor_id || 0),

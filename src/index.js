@@ -23,6 +23,7 @@ const WX_APPSECRET = process.env.WX_SECRET || process.env.WX_APPSECRET || ''
 const TMPL_ORDER_SUCCESS = process.env.TMPL_ORDER_SUCCESS || ''  // 购买成功通知
 const TMPL_SHIP = process.env.TMPL_SHIP || ''                    // 发货提醒
 const TMPL_REFUND = process.env.TMPL_REFUND || ''                // 退款结果通知
+const TMPL_PAY_REMINDER = process.env.TMPL_PAY_REMINDER || ''     // 待付款提醒
 
 let _wxToken = '', _wxTokenExp = 0
 
@@ -4127,6 +4128,14 @@ function miniAuth(req, res, next) {
   }
 }
 
+function optionalMiniAuth(req, _res, next) {
+  const token = req.headers['mini-token']
+  if (token) {
+    try { req.miniUser = jwt.verify(token, MINI_JWT_SECRET) } catch {}
+  }
+  next()
+}
+
 // 公开内容接口可匿名访问；携带有效 token 时补充点赞状态。
 function optionalMiniAuth(req, _res, next) {
   const token = req.headers['mini-token']
@@ -4306,6 +4315,11 @@ function parseBrandGoods(row) {
     rating: brand.rating || 5.0,
     wholesalePrice: brand.wholesalePrice || 0,
     minOrderQuantity: brand.minOrderQuantity || 1,
+    productInfo: brand.productInfo || {},
+    deliveryTime: brand.deliveryTime || '48小时内发货',
+    servicePromises: Array.isArray(brand.servicePromises) && brand.servicePromises.length
+      ? brand.servicePromises
+      : ['正品保障', '破损包赔', '售后无忧'],
     sort: row.sort || 0,
     baseSales: brand.baseSales || 0,
   }
@@ -4468,7 +4482,7 @@ app.get('/miniapi/goods/detail/:id', async (req, res) => {
 // 创建订单
 app.post('/miniapi/order/create', miniAuth, async (req, res) => {
   try {
-    const { items, address, remark, distributor_code, delivery_type, store_id } = req.body
+    const { items, address, remark, distributor_code, delivery_type, store_id, request_discount } = req.body
     const deliveryType = parseInt(delivery_type ?? 0)
     if (!items || items.length === 0) return fail(res, '订单不能为空')
     // 物流/跑腿需要地址；自提不需要
@@ -4564,6 +4578,10 @@ app.post('/miniapi/order/create', miniAuth, async (req, res) => {
 
     await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS coupon_id INT DEFAULT 0`)
     await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS coupon_deduct NUMERIC(8,2) DEFAULT 0`)
+    await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS price_change_requested BOOLEAN DEFAULT FALSE`)
+    await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS payment_reminded_at TIMESTAMP`)
+    await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS payment_expires_at TIMESTAMP`)
+    const paymentExpiresAt = new Date(Date.now() + (request_discount ? 24 * 60 * 60 * 1000 : 30 * 60 * 1000))
     const orderNo = genOrderNo('MP')
     const client = await pool.connect()
     let order
@@ -4682,9 +4700,9 @@ app.post('/miniapi/order/create', miniAuth, async (req, res) => {
       }
 
       const r = await client.query(
-        `INSERT INTO mini_orders (order_no, user_id, total_amount, original_amount, discount, points_used, coupon_id, coupon_deduct, address, remark, distributor_code, commission, delivery_type, store_id, store_name, store_address, status, created_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,0,NOW()) RETURNING *`,
-        [orderNo, req.miniUser.id, serverTotal, originalTotal, discount, usePoints, userCouponId || 0, couponDeduct, JSON.stringify(address || {}), remark || '', distCode, distCommission, deliveryType, storeRow?.id || 0, storeRow?.name || '', storeRow?.address || '']
+        `INSERT INTO mini_orders (order_no, user_id, total_amount, original_amount, discount, points_used, coupon_id, coupon_deduct, address, remark, distributor_code, commission, delivery_type, store_id, store_name, store_address, price_change_requested, payment_expires_at, status, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,0,NOW()) RETURNING *`,
+        [orderNo, req.miniUser.id, serverTotal, originalTotal, discount, usePoints, userCouponId || 0, couponDeduct, JSON.stringify(address || {}), remark || '', distCode, distCommission, deliveryType, storeRow?.id || 0, storeRow?.name || '', storeRow?.address || '', Boolean(request_discount), paymentExpiresAt]
       )
       order = r.rows[0]
 
@@ -5934,6 +5952,11 @@ app.post('/adminapi/distributor/withdraw/reject', auth, async (req, res) => {
     await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS store_id INT DEFAULT 0`)
     await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS store_name VARCHAR(100) DEFAULT ''`)
     await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS store_address TEXT DEFAULT ''`)
+    await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS price_adjusted_from NUMERIC(10,2)`)
+    await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS price_adjustment_note VARCHAR(255) DEFAULT ''`)
+    await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS price_adjusted_at TIMESTAMP`)
+    await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS price_change_requested BOOLEAN DEFAULT FALSE`)
+    await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS payment_expires_at TIMESTAMP`)
   } catch(e) { console.log('mini_orders alter:', e.message) }
 })()
 
@@ -5967,6 +5990,157 @@ app.get('/adminapi/mini/orders', auth, async (req, res) => {
     }
     return ok(res, { rows, total: parseInt(total) })
   } catch (e) { fail(res, e.message) }
+})
+
+// 待付款订单改价（仅允许优惠，客户支付时会读取最新 total_amount）
+app.post('/adminapi/mini/order/adjust-price', auth, async (req, res) => {
+  const client = await pool.connect()
+  try {
+    const orderId = parseInt(req.body.order_id)
+    const amount = Math.round(Number(req.body.amount) * 100) / 100
+    const note = String(req.body.note || '').trim().slice(0, 255)
+    if (!orderId) return fail(res, '缺少订单ID')
+    if (!Number.isFinite(amount) || amount < 0.01) return fail(res, '改价金额必须大于0')
+
+    await client.query('BEGIN')
+    const order = (await client.query(
+      `SELECT id, status, total_amount, price_adjusted_from, commission, price_change_requested
+       FROM mini_orders WHERE id=$1 AND deleted_at IS NULL FOR UPDATE`,
+      [orderId]
+    )).rows[0]
+    if (!order) {
+      await client.query('ROLLBACK')
+      return fail(res, '订单不存在')
+    }
+    if (Number(order.status) !== 0) {
+      await client.query('ROLLBACK')
+      return fail(res, '只有待付款订单可以改价')
+    }
+    if (!order.price_change_requested) {
+      await client.query('ROLLBACK')
+      return fail(res, '客户未申请优惠，不能修改订单价格')
+    }
+
+    const currentAmount = Number(order.total_amount || 0)
+    const adjustmentBase = Number(order.price_adjusted_from ?? currentAmount)
+    if (amount > adjustmentBase) {
+      await client.query('ROLLBACK')
+      return fail(res, `优惠后金额不能高于 ¥${adjustmentBase.toFixed(2)}`)
+    }
+
+    const currentCommission = Number(order.commission || 0)
+    const nextCommission = currentAmount > 0
+      ? Math.round(currentCommission * amount / currentAmount * 100) / 100
+      : 0
+    const updated = (await client.query(
+      `UPDATE mini_orders
+       SET total_amount=$1,
+           price_adjusted_from=COALESCE(price_adjusted_from,$2),
+           price_adjustment_note=$3,
+           price_adjusted_at=NOW(),
+           payment_expires_at=NOW()+INTERVAL '24 hours',
+           commission=$4
+       WHERE id=$5 AND status=0
+       RETURNING *`,
+      [amount, currentAmount, note, nextCommission, orderId]
+    )).rows[0]
+    await client.query('COMMIT')
+    return ok(res, updated)
+  } catch (e) {
+    await client.query('ROLLBACK')
+    return fail(res, e.message)
+  } finally {
+    client.release()
+  }
+})
+
+// 待付款提醒（需要客户授权对应的微信订阅消息模板）
+app.post('/adminapi/mini/order/remind-payment', auth, async (req, res) => {
+  try {
+    const orderId = parseInt(req.body.order_id)
+    if (!orderId) return fail(res, '缺少订单ID')
+    if (!TMPL_PAY_REMINDER) return fail(res, '尚未配置待付款提醒模板 TMPL_PAY_REMINDER')
+    const order = (await pool.query(
+      `SELECT o.id, o.order_no, o.total_amount, o.status, u.openid
+       FROM mini_orders o JOIN mini_users u ON u.id=o.user_id
+       WHERE o.id=$1 AND o.deleted_at IS NULL`,
+      [orderId]
+    )).rows[0]
+    if (!order) return fail(res, '订单不存在')
+    if (Number(order.status) !== 0) return fail(res, '只有待付款订单可以催付')
+    if (!order.openid) return fail(res, '客户未绑定微信账号')
+    const expireTime = new Date(Date.now() + 24 * 60 * 60 * 1000)
+      .toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })
+      .replace(/\//g, '-')
+      .slice(0, 16)
+    await sendSubscribeMsg(order.openid, TMPL_PAY_REMINDER, `pages/order/detail?id=${order.id}`, {
+      character_string1: { value: order.order_no.slice(0, 32) },
+      amount1: { value: Number(order.total_amount || 0).toFixed(2) },
+      thing1: { value: '订单待付款，请确认价格后完成支付' },
+      time1: { value: expireTime },
+    })
+    await pool.query(`UPDATE mini_orders SET payment_reminded_at=NOW() WHERE id=$1`, [orderId])
+    return ok(res, { reminded_at: new Date().toISOString() })
+  } catch (e) { fail(res, e.message) }
+})
+
+// 给待付款订单客户发放优惠券（供客户后续订单使用）
+app.post('/adminapi/mini/order/grant-coupon', auth, async (req, res) => {
+  const client = await pool.connect()
+  try {
+    const orderId = parseInt(req.body.order_id)
+    const couponId = parseInt(req.body.coupon_id)
+    if (!orderId || !couponId) return fail(res, '订单和优惠券必填')
+    await client.query('BEGIN')
+    const order = (await client.query(
+      `SELECT id, user_id, status FROM mini_orders WHERE id=$1 AND deleted_at IS NULL FOR UPDATE`,
+      [orderId]
+    )).rows[0]
+    if (!order) {
+      await client.query('ROLLBACK')
+      return fail(res, '订单不存在')
+    }
+    if (Number(order.status) !== 0) {
+      await client.query('ROLLBACK')
+      return fail(res, '只有待付款订单客户可以发券')
+    }
+    const coupon = (await client.query(
+      `SELECT * FROM mini_coupons
+       WHERE id=$1 AND status=1 AND (end_at IS NULL OR end_at>NOW()) FOR UPDATE`,
+      [couponId]
+    )).rows[0]
+    if (!coupon) {
+      await client.query('ROLLBACK')
+      return fail(res, '优惠券不存在或已停用')
+    }
+    if (Number(coupon.total_count) >= 0 && Number(coupon.claimed_count || 0) >= Number(coupon.total_count)) {
+      await client.query('ROLLBACK')
+      return fail(res, '优惠券已发完')
+    }
+    const activeSame = (await client.query(
+      `SELECT id FROM mini_user_coupons
+       WHERE user_id=$1 AND coupon_id=$2 AND status=0 AND expire_at>NOW() LIMIT 1`,
+      [order.user_id, couponId]
+    )).rows[0]
+    if (activeSame) {
+      await client.query('ROLLBACK')
+      return fail(res, '客户已有一张同类未使用优惠券')
+    }
+    const expireAt = new Date(Date.now() + Number(coupon.validity_days || 30) * 86400000)
+    await client.query(
+      `INSERT INTO mini_user_coupons (user_id,coupon_id,coupon_type,status,expire_at)
+       VALUES ($1,$2,$3,0,$4)`,
+      [order.user_id, coupon.id, coupon.type || 'general', expireAt]
+    )
+    await client.query(`UPDATE mini_coupons SET claimed_count=claimed_count+1 WHERE id=$1`, [coupon.id])
+    await client.query('COMMIT')
+    return ok(res, { coupon_name: coupon.name, expire_at: expireAt })
+  } catch (e) {
+    await client.query('ROLLBACK')
+    return fail(res, e.message)
+  } finally {
+    client.release()
+  }
 })
 
 // 发货（ERP后台）
@@ -6071,6 +6245,10 @@ app.post('/miniapi/pay/unified', miniAuth, async (req, res) => {
     if (!r.rows[0]) return fail(res, '订单不存在')
     const order = r.rows[0]
     if (order.status !== 0) return fail(res, '订单已支付')
+    if (order.payment_expires_at && new Date(order.payment_expires_at).getTime() <= Date.now()) {
+      await expirePendingOrder(order.id)
+      return fail(res, '订单已超时关闭，请重新下单')
+    }
 
     const totalFee = Math.round(parseFloat(order.total_amount || order.total || 0) * 100) // 转分
     const notifyUrl = 'https://erp-server-xsji.onrender.com/miniapi/pay/notify'
@@ -6296,6 +6474,74 @@ async function releaseOrderBenefits(client, order, remark = '订单取消退回'
   }
 }
 
+async function expirePendingOrder(orderId) {
+  const preview = (await pool.query(
+    `SELECT id,order_no,status,payment_expires_at FROM mini_orders WHERE id=$1`,
+    [orderId]
+  )).rows[0]
+  if (!preview || Number(preview.status) !== 0) return false
+
+  // 回调可能延迟，关闭前先向微信确认真实支付状态。
+  try {
+    const wxQuery = await wxV3QueryOrder(preview.order_no)
+    if (wxQuery?.status === 200 && wxQuery.body?.trade_state === 'SUCCESS') {
+      await pool.query(
+        `UPDATE mini_orders SET status=1,paid_at=NOW(),wx_transaction_id=$2
+         WHERE id=$1 AND status=0`,
+        [orderId, wxQuery.body.transaction_id || '']
+      )
+      return false
+    }
+  } catch (e) {
+    console.warn('[order-expire] wx query failed:', e.message)
+  }
+
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    const order = (await client.query(
+      `SELECT * FROM mini_orders WHERE id=$1 AND status=0 FOR UPDATE`,
+      [orderId]
+    )).rows[0]
+    if (!order) {
+      await client.query('ROLLBACK')
+      return false
+    }
+    await releaseOrderBenefits(client, order, '待付款超时自动关闭')
+    await client.query(
+      `UPDATE mini_orders SET status=4,cancel_reason='待付款超时自动关闭' WHERE id=$1`,
+      [orderId]
+    )
+    await client.query('COMMIT')
+    return true
+  } catch (e) {
+    await client.query('ROLLBACK')
+    throw e
+  } finally {
+    client.release()
+  }
+}
+
+;(async () => {
+  try {
+    await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS payment_expires_at TIMESTAMP`)
+    await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS cancel_reason VARCHAR(120) DEFAULT ''`)
+    const sweep = async () => {
+      try {
+        const rows = (await pool.query(
+          `SELECT id FROM mini_orders
+           WHERE status=0 AND payment_expires_at IS NOT NULL AND payment_expires_at<=NOW()
+           ORDER BY payment_expires_at ASC LIMIT 50`
+        )).rows
+        for (const row of rows) await expirePendingOrder(row.id)
+      } catch (e) { console.log('[order-expire]', e.message) }
+    }
+    await sweep()
+    const timer = setInterval(sweep, 60 * 1000)
+    timer.unref?.()
+  } catch (e) { console.log('order expiry init:', e.message) }
+})()
+
 // 会员信息
 app.get('/miniapi/member/info', miniAuth, async (req, res) => {
   try {
@@ -6306,6 +6552,15 @@ app.get('/miniapi/member/info', miniAuth, async (req, res) => {
     const levelInfo = MEMBER_LEVELS[level]
     const nextLevel = MEMBER_LEVELS[Math.min(level + 1, 3)]
     const spent = parseFloat(user.total_spent || 0)
+    const orderCounts = (await pool.query(
+      `SELECT
+         COUNT(*) FILTER (WHERE status=0) AS pending_payment,
+         COUNT(*) FILTER (WHERE status=1) AS pending_shipment,
+         COUNT(*) FILTER (WHERE status=2) AS pending_receipt,
+         COUNT(*) FILTER (WHERE status=5) AS after_sale
+       FROM mini_orders WHERE user_id=$1 AND deleted_at IS NULL`,
+      [req.miniUser.id]
+    )).rows[0]
     return ok(res, {
       points: user.points || 0,
       total_spent: spent,
@@ -6315,6 +6570,12 @@ app.get('/miniapi/member/info', miniAuth, async (req, res) => {
       multiplier: levelInfo.multiplier,
       vip_expire_at: user.vip_expire_at,
       next_level: level < 3 ? { name: nextLevel.name, need: Math.max(0, nextLevel.minSpent - spent) } : null,
+      order_counts: {
+        pending_payment: Number(orderCounts.pending_payment || 0),
+        pending_shipment: Number(orderCounts.pending_shipment || 0),
+        pending_receipt: Number(orderCounts.pending_receipt || 0),
+        after_sale: Number(orderCounts.after_sale || 0),
+      },
     })
   } catch (e) { fail(res, e.message) }
 })
@@ -6438,9 +6699,144 @@ app.get('/miniapi/brand/config', async (req, res) => {
   } catch (e) { fail(res, e.message) }
 })
 
-app.post('/miniapi/nova/chat', async (req, res) => {
+// Nova 商品客服会话：默认保留180天，到期自动清理
+;(async () => {
   try {
-    const { messages = [] } = req.body
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS mini_service_sessions (
+        id BIGSERIAL PRIMARY KEY,
+        user_id INT,
+        client_key VARCHAR(80) NOT NULL DEFAULT '',
+        product_id INT DEFAULT 0,
+        product_name VARCHAR(200) DEFAULT '',
+        product_snapshot JSONB DEFAULT '{}'::jsonb,
+        status VARCHAR(20) DEFAULT 'ai',
+        human_requested_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW(),
+        expires_at TIMESTAMP DEFAULT (NOW() + INTERVAL '180 days')
+      );
+      CREATE TABLE IF NOT EXISTS mini_service_messages (
+        id BIGSERIAL PRIMARY KEY,
+        session_id BIGINT NOT NULL REFERENCES mini_service_sessions(id) ON DELETE CASCADE,
+        role VARCHAR(20) NOT NULL,
+        source VARCHAR(20) DEFAULT 'nova',
+        content TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_service_sessions_user ON mini_service_sessions(user_id, product_id, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_service_sessions_client ON mini_service_sessions(client_key, product_id, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_service_messages_session ON mini_service_messages(session_id, id);
+      CREATE INDEX IF NOT EXISTS idx_service_sessions_expire ON mini_service_sessions(expires_at);
+    `)
+    const cleanup = async () => {
+      try {
+        const r = await pool.query(`DELETE FROM mini_service_sessions WHERE expires_at < NOW()`)
+        if (r.rowCount) console.log(`[service-retention] deleted ${r.rowCount} expired sessions`)
+      } catch (e) { console.log('[service-retention]', e.message) }
+    }
+    await cleanup()
+    const timer = setInterval(cleanup, 24 * 60 * 60 * 1000)
+    timer.unref?.()
+  } catch (e) { console.log('mini service chat init:', e.message) }
+})()
+
+app.post('/miniapi/nova/session/open', optionalMiniAuth, async (req, res) => {
+  try {
+    const clientKey = String(req.body.client_key || '').trim().slice(0, 80)
+    const product = req.body.product || {}
+    const productId = parseInt(product.id || 0) || 0
+    const userId = Number(req.miniUser?.id || 0) || null
+    if (!clientKey) return fail(res, '缺少客服会话标识')
+
+    let session
+    if (userId) {
+      session = (await pool.query(
+        `SELECT * FROM mini_service_sessions
+         WHERE (user_id=$1 OR (user_id IS NULL AND client_key=$2))
+           AND product_id=$3 AND expires_at>NOW()
+         ORDER BY updated_at DESC LIMIT 1`,
+        [userId, clientKey, productId]
+      )).rows[0]
+    } else {
+      session = (await pool.query(
+        `SELECT * FROM mini_service_sessions
+         WHERE user_id IS NULL AND client_key=$1
+           AND product_id=$2 AND expires_at>NOW()
+         ORDER BY updated_at DESC LIMIT 1`,
+        [clientKey, productId]
+      )).rows[0]
+    }
+    if (!session) {
+      session = (await pool.query(
+        `INSERT INTO mini_service_sessions
+         (user_id,client_key,product_id,product_name,product_snapshot,status,created_at,updated_at,expires_at)
+         VALUES ($1,$2,$3,$4,$5,'ai',NOW(),NOW(),NOW()+INTERVAL '180 days')
+         RETURNING *`,
+        [userId, clientKey, productId, String(product.name || '').slice(0, 200), JSON.stringify(product)]
+      )).rows[0]
+    } else {
+      await pool.query(
+        `UPDATE mini_service_sessions
+         SET user_id=COALESCE(user_id,$1), product_name=$2, product_snapshot=$3,
+             updated_at=NOW(), expires_at=NOW()+INTERVAL '180 days'
+         WHERE id=$4`,
+        [userId, String(product.name || '').slice(0, 200), JSON.stringify(product), session.id]
+      )
+    }
+    const messages = (await pool.query(
+      `SELECT id, role, source, content, created_at
+       FROM mini_service_messages WHERE session_id=$1 ORDER BY id DESC LIMIT 100`,
+      [session.id]
+    )).rows.reverse()
+    return ok(res, { session_id: session.id, messages, expires_at: session.expires_at })
+  } catch (e) { fail(res, e.message) }
+})
+
+app.post('/miniapi/nova/session/human', optionalMiniAuth, async (req, res) => {
+  try {
+    const sessionId = parseInt(req.body.session_id)
+    const clientKey = String(req.body.client_key || '').trim().slice(0, 80)
+    if (!sessionId) return fail(res, '缺少会话ID')
+    const r = await pool.query(
+      `UPDATE mini_service_sessions
+       SET status='human_requested', human_requested_at=NOW(), updated_at=NOW(),
+           expires_at=NOW()+INTERVAL '180 days'
+       WHERE id=$1 AND (user_id=$2 OR (user_id IS NULL AND client_key=$3))
+       RETURNING id`,
+      [sessionId, Number(req.miniUser?.id || 0), clientKey]
+    )
+    if (!r.rows[0]) return fail(res, '会话不存在')
+    await pool.query(
+      `INSERT INTO mini_service_messages (session_id,role,source,content)
+       VALUES ($1,'system','human','客户请求转人工客服')`,
+      [sessionId]
+    )
+    return ok(res, {})
+  } catch (e) { fail(res, e.message) }
+})
+
+app.post('/miniapi/nova/chat', optionalMiniAuth, async (req, res) => {
+  try {
+    const { messages = [], message = '', session_id, client_key = '' } = req.body
+    const sessionId = parseInt(session_id)
+    if (sessionId && message) {
+      const owner = (await pool.query(
+        `SELECT id FROM mini_service_sessions
+         WHERE id=$1 AND (user_id=$2 OR (user_id IS NULL AND client_key=$3))`,
+        [sessionId, Number(req.miniUser?.id || 0), String(client_key).slice(0, 80)]
+      )).rows[0]
+      if (!owner) return fail(res, '客服会话不存在')
+      await pool.query(
+        `INSERT INTO mini_service_messages (session_id,role,source,content)
+         VALUES ($1,'user','miniapp',$2)`,
+        [sessionId, String(message).slice(0, 4000)]
+      )
+      await pool.query(
+        `UPDATE mini_service_sessions SET updated_at=NOW(), expires_at=NOW()+INTERVAL '180 days' WHERE id=$1`,
+        [sessionId]
+      )
+    }
 
     // 商品：SQL 层用 LIKE 预筛只带 __brand__ 标记的行，避免总量超 LIMIT 导致品牌可见商品掉出窗口
     // 每个商品把 __brand__.productInfo（详情图 OCR 提炼的结构化信息）也塞进上下文，让 Nova 能准确答成分/存储/工艺
@@ -6530,7 +6926,105 @@ app.post('/miniapi/nova/chat', async (req, res) => {
         if (d.type === 'text') reply += (d.text || d.content || '')
       } catch {}
     }
-    return ok(res, { reply: reply || '抱歉，暂时无法回复，请稍后再试。' })
+    const finalReply = reply || '抱歉，暂时无法回复，请稍后再试。'
+    if (sessionId) {
+      await pool.query(
+        `INSERT INTO mini_service_messages (session_id,role,source,content)
+         VALUES ($1,'assistant','nova',$2)`,
+        [sessionId, finalReply.slice(0, 8000)]
+      )
+      await pool.query(
+        `UPDATE mini_service_sessions SET updated_at=NOW(), expires_at=NOW()+INTERVAL '180 days' WHERE id=$1`,
+        [sessionId]
+      )
+    }
+    return ok(res, { reply: finalReply, session_id: sessionId || null })
+  } catch (e) { fail(res, e.message) }
+})
+
+// ERP后台读取客服留痕
+app.get('/adminapi/mini/service/sessions', auth, async (req, res) => {
+  try {
+    const { page = 1, list_rows = 20, keyword = '' } = req.query
+    const offset = (parseInt(page) - 1) * parseInt(list_rows)
+    const params = []
+    let where = 's.expires_at>NOW()'
+    if (keyword) {
+      params.push(`%${keyword}%`)
+      where += ` AND (s.product_name ILIKE $${params.length} OR u.phone ILIKE $${params.length})`
+    }
+    const countParams = [...params]
+    const total = Number((await pool.query(
+      `SELECT COUNT(*) FROM mini_service_sessions s LEFT JOIN mini_users u ON u.id=s.user_id WHERE ${where}`,
+      countParams
+    )).rows[0].count)
+    params.push(parseInt(list_rows), offset)
+    const rows = (await pool.query(
+      `SELECT s.*,u.phone,
+        (SELECT content FROM mini_service_messages m WHERE m.session_id=s.id ORDER BY m.id DESC LIMIT 1) last_message,
+        (SELECT COUNT(*) FROM mini_service_messages m WHERE m.session_id=s.id) message_count
+       FROM mini_service_sessions s LEFT JOIN mini_users u ON u.id=s.user_id
+       WHERE ${where} ORDER BY s.updated_at DESC
+       LIMIT $${params.length - 1} OFFSET $${params.length}`,
+      params
+    )).rows
+    return ok(res, { rows, total })
+  } catch (e) { fail(res, e.message) }
+})
+
+app.get('/adminapi/mini/service/session/:id', auth, async (req, res) => {
+  try {
+    const session = (await pool.query(
+      `SELECT s.*,u.phone FROM mini_service_sessions s
+       LEFT JOIN mini_users u ON u.id=s.user_id WHERE s.id=$1`,
+      [req.params.id]
+    )).rows[0]
+    if (!session) return fail(res, '会话不存在')
+    session.messages = (await pool.query(
+      `SELECT id,role,source,content,created_at FROM mini_service_messages
+       WHERE session_id=$1 ORDER BY id ASC`,
+      [session.id]
+    )).rows
+    return ok(res, session)
+  } catch (e) { fail(res, e.message) }
+})
+
+app.post('/adminapi/mini/service/session/:id/reply', auth, async (req, res) => {
+  try {
+    const content = String(req.body.content || '').trim().slice(0, 4000)
+    if (!content) return fail(res, '请输入回复内容')
+    const session = (await pool.query(
+      `UPDATE mini_service_sessions SET status='human',updated_at=NOW(),
+       expires_at=NOW()+INTERVAL '180 days' WHERE id=$1 RETURNING id`,
+      [req.params.id]
+    )).rows[0]
+    if (!session) return fail(res, '会话不存在')
+    const message = (await pool.query(
+      `INSERT INTO mini_service_messages(session_id,role,source,content)
+       VALUES($1,'assistant','human',$2) RETURNING *`,
+      [session.id, content]
+    )).rows[0]
+    return ok(res, message)
+  } catch (e) { fail(res, e.message) }
+})
+
+app.post('/miniapi/nova/session/sync', optionalMiniAuth, async (req, res) => {
+  try {
+    const sessionId = parseInt(req.body.session_id)
+    const afterId = Math.max(0, parseInt(req.body.after_id) || 0)
+    const clientKey = String(req.body.client_key || '').slice(0, 80)
+    const owner = (await pool.query(
+      `SELECT id,status FROM mini_service_sessions
+       WHERE id=$1 AND (user_id=$2 OR (user_id IS NULL AND client_key=$3))`,
+      [sessionId, Number(req.miniUser?.id || 0), clientKey]
+    )).rows[0]
+    if (!owner) return fail(res, '会话不存在')
+    const messages = (await pool.query(
+      `SELECT id,role,source,content,created_at FROM mini_service_messages
+       WHERE session_id=$1 AND id>$2 ORDER BY id ASC LIMIT 100`,
+      [sessionId, afterId]
+    )).rows
+    return ok(res, { messages, status: owner.status })
   } catch (e) { fail(res, e.message) }
 })
 
@@ -8025,12 +8519,23 @@ app.post('/miniapi/cart/validate', async (req, res) => {
     if (!items?.length) return ok(res, { invalid: [] })
     const ids = items.map(i => i.goods_id)
     const rows = (await pool.query(
-      `SELECT id FROM goods WHERE id=ANY($1) AND deleted_at IS NULL AND status=1 AND can_sale=1`,
+      `SELECT g.id, g.sell_price, COALESCE(SUM(si.qty), 0) AS stock
+       FROM goods g
+       LEFT JOIN stock_inventory si ON si.goods_id=g.id
+       WHERE g.id=ANY($1) AND g.deleted_at IS NULL AND g.status=1 AND g.can_sale=1
+       GROUP BY g.id, g.sell_price`,
       [ids]
     )).rows
     const validIds = new Set(rows.map(r => r.id))
     const invalid = items.filter(i => !validIds.has(i.goods_id)).map(i => i.goods_id)
-    ok(res, { invalid })
+    ok(res, {
+      invalid,
+      goods: rows.map(r => ({
+        goods_id: r.id,
+        price: Number(r.sell_price || 0),
+        stock: Number(r.stock || 0),
+      })),
+    })
   } catch(e) { fail(res, e.message) }
 })
 
@@ -8346,6 +8851,7 @@ app.get('/miniapi/config/tmpl-ids', (req, res) => {
     ship: TMPL_SHIP,
     refund: TMPL_REFUND,
     order_success: TMPL_ORDER_SUCCESS,
+    pay_reminder: TMPL_PAY_REMINDER,
   })
 })
 

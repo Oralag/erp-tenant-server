@@ -6972,6 +6972,29 @@ app.get('/adminapi/mini/service/sessions', auth, async (req, res) => {
   } catch (e) { fail(res, e.message) }
 })
 
+app.get('/adminapi/mini/service/export', auth, async (req, res) => {
+  try {
+    const keyword = String(req.query.keyword || '').trim()
+    const params = []
+    let where = 's.expires_at>NOW()'
+    if (keyword) {
+      params.push(`%${keyword}%`)
+      where += ` AND (s.product_name ILIKE $1 OR u.phone ILIKE $1)`
+    }
+    const rows = (await pool.query(
+      `SELECT s.id,s.status,s.product_name,s.created_at,s.updated_at,s.expires_at,u.phone,
+              m.role,m.source,m.content,m.created_at AS message_created_at
+       FROM mini_service_sessions s
+       LEFT JOIN mini_users u ON u.id=s.user_id
+       LEFT JOIN mini_service_messages m ON m.session_id=s.id
+       WHERE ${where}
+       ORDER BY s.updated_at DESC,m.id ASC`,
+      params
+    )).rows
+    return ok(res, rows)
+  } catch (e) { fail(res, e.message) }
+})
+
 app.get('/adminapi/mini/service/session/:id', auth, async (req, res) => {
   try {
     const session = (await pool.query(
@@ -6986,6 +7009,17 @@ app.get('/adminapi/mini/service/session/:id', auth, async (req, res) => {
       [session.id]
     )).rows
     return ok(res, session)
+  } catch (e) { fail(res, e.message) }
+})
+
+app.post('/adminapi/mini/service/session/:id/delete', auth, async (req, res) => {
+  try {
+    const deleted = (await pool.query(
+      `DELETE FROM mini_service_sessions WHERE id=$1 RETURNING id`,
+      [req.params.id]
+    )).rows[0]
+    if (!deleted) return fail(res, '会话不存在或已删除')
+    return ok(res, { id: deleted.id })
   } catch (e) { fail(res, e.message) }
 })
 

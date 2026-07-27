@@ -4318,8 +4318,8 @@ function parseBrandGoods(row) {
     productInfo: brand.productInfo || {},
     deliveryTime: brand.deliveryTime || '48小时内发货',
     servicePromises: Array.isArray(brand.servicePromises) && brand.servicePromises.length
-      ? brand.servicePromises
-      : ['正品保障', '破损包赔', '售后无忧'],
+      ? brand.servicePromises.filter(item => item !== '破损包赔' && item !== '破损包退')
+      : ['正品保障', '售后无忧'],
     sort: row.sort || 0,
     baseSales: brand.baseSales || 0,
   }
@@ -4375,8 +4375,10 @@ async function getDistributorScope(req) {
 // 商品列表 — 只返回品牌主页标记 show:true 的商品（与 shopStore.ts 逻辑一致）
 app.get('/miniapi/goods/list', async (req, res) => {
   try {
-    const { page = 1, list_rows = 10, category_id, keyword } = req.query
+    const { page = 1, list_rows = 10, category_id, keyword, scene } = req.query
     const pageNum = parseInt(page), pageSize = parseInt(list_rows)
+    // scene=delivery：门店外卖场景，商品池 = 商城已上架 ∪ 门店独有，减去显式排除的
+    const isDelivery = scene === 'delivery'
     const params = []
     let where = `WHERE deleted_at IS NULL AND status=1 AND can_sale=1`
     const distScope = await getDistributorScope(req)
@@ -4396,7 +4398,13 @@ app.get('/miniapi/goods/list', async (req, res) => {
     // 配置了分销商品池时，以商品池为准；未配置时仍只展示品牌主页已上架商品。
     const hiddenSet = new Set(distScope.hiddenIds || [])
     const brandRows = (distScope.restricted ? rows : rows.filter(g => {
-      try { return JSON.parse(g.remark || '{}')['__brand__']?.show === true } catch { return false }
+      try {
+        const b = JSON.parse(g.remark || '{}')['__brand__'] || {}
+        // 商城：只看 show；外卖：show 的默认都能送（商城商品门店基本都有），
+        // 再并上只在门店卖的 delivery=true，最后剔除显式标记不可外卖的 deliveryOff
+        if (isDelivery) return (b.show === true || b.delivery === true) && b.deliveryOff !== true
+        return b.show === true
+      } catch { return false }
     })).filter(g => !hiddenSet.has(Number(g.id))).filter(g =>
       (g.owner_type || 'official') === 'official' ||
       Number(g.owner_distributor_id || 0) === Number(distScope.distributor?.id || 0)

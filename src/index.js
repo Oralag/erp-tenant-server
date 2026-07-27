@@ -4623,9 +4623,10 @@ app.post('/miniapi/order/create', miniAuth, async (req, res) => {
           }
           // 分销商自己设了佣金率就用自己的，否则用等级统一设置
           const rate = parseFloat(distRow.own_rate ?? distRow.level_rate ?? 0)
-          // 该用户已绑定客户等级（走等级价体系）= 批发商模式，利润 = 售价 − 等级价，不再抽佣
-          activePromotionRate = buyerLevelId > 0 ? 0 : rate
-          distCommission = buyerLevelId > 0
+          // 命中 customer_level_prices 单独价 = 批发商模式，利润在售价−等级价里，不再抽佣
+          const wholesaleMode = Object.keys(levelPriceMap).length > 0
+          activePromotionRate = wholesaleMode ? 0 : rate
+          distCommission = wholesaleMode
             ? 0
             : Math.round(serverTotal * rate / 100 * 100) / 100
           const configuredGoods = (await client.query(
@@ -5523,7 +5524,12 @@ app.get('/adminapi/distributor/list', auth, async (req, res) => {
       `SELECT d.*,
         (SELECT COUNT(*) FROM mini_orders WHERE distributor_code=d.code AND status!=4 AND deleted_at IS NULL) as order_count,
         COALESCE((SELECT SUM(commission) FROM mini_orders WHERE distributor_code=d.code AND status!=4 AND deleted_at IS NULL),0) as total_commission,
-        (SELECT sc.level_name FROM sale_customers sc WHERE sc.mobile=d.phone AND sc.deleted_at IS NULL ORDER BY sc.id LIMIT 1) as customer_level_name,
+        (SELECT sc.level_name FROM sale_customers sc
+          WHERE sc.mobile=d.phone AND sc.deleted_at IS NULL
+            AND EXISTS(SELECT 1 FROM customer_level_prices clp
+                       JOIN customer_levels cl ON cl.id=clp.level_id
+                       WHERE cl.name = sc.level_name)
+          ORDER BY sc.id LIMIT 1) as customer_level_name,
         (SELECT sc.id FROM sale_customers sc WHERE sc.mobile=d.phone AND sc.deleted_at IS NULL ORDER BY sc.id LIMIT 1) as customer_id
        FROM distributors d ${where} ORDER BY d.id DESC LIMIT $1 OFFSET $2`,
       [parseInt(list_rows), offset]

@@ -5526,10 +5526,15 @@ app.get('/adminapi/distributor/list', auth, async (req, res) => {
         COALESCE((SELECT SUM(commission) FROM mini_orders WHERE distributor_code=d.code AND status!=4 AND deleted_at IS NULL),0) as total_commission,
         (SELECT sc.level_name FROM sale_customers sc
           WHERE sc.mobile=d.phone AND sc.deleted_at IS NULL
-            AND EXISTS(SELECT 1 FROM customer_level_prices clp
-                       JOIN customer_levels cl ON cl.id=clp.level_id
-                       WHERE cl.name = sc.level_name)
+            AND sc.level_name != '' AND sc.level_name != '分销商'
           ORDER BY sc.id LIMIT 1) as customer_level_name,
+        (SELECT EXISTS(
+          SELECT 1 FROM customer_level_prices clp
+          JOIN customer_levels cl ON cl.id=clp.level_id
+          WHERE cl.name = (SELECT sc2.level_name FROM sale_customers sc2
+                            WHERE sc2.mobile=d.phone AND sc2.deleted_at IS NULL
+                            ORDER BY sc2.id LIMIT 1)
+        )) as has_level_prices,
         (SELECT sc.id FROM sale_customers sc WHERE sc.mobile=d.phone AND sc.deleted_at IS NULL ORDER BY sc.id LIMIT 1) as customer_id
        FROM distributors d ${where} ORDER BY d.id DESC LIMIT $1 OFFSET $2`,
       [parseInt(list_rows), offset]
@@ -5826,6 +5831,41 @@ app.post('/adminapi/distributor/edit', auth, async (req, res) => {
     if (!id) return fail(res, 'id必填')
     await pool.query(`UPDATE distributors SET commission_rate=$1 WHERE id=$2`, [parseFloat(commission_rate), id])
     return ok(res)
+  } catch(e) { fail(res, e.message) }
+})
+
+// 把分销商关联到客户等级（走等级价体系）
+// level_name = '' 表示解绑，回到默认"分销商"等级
+app.post('/adminapi/distributor/bind-customer-level', auth, async (req, res) => {
+  try {
+    const id = parseInt(req.body.id)
+    const levelName = String(req.body.level_name || '').trim()
+    if (!id) return fail(res, 'id必填')
+    const dist = (await pool.query(`SELECT phone, name FROM distributors WHERE id=$1`, [id])).rows[0]
+    if (!dist) return fail(res, '分销商不存在')
+    if (!dist.phone) return fail(res, '该分销商未填写手机号，无法关联客户等级')
+    if (levelName) {
+      const lvExists = (await pool.query(`SELECT 1 FROM customer_levels WHERE name=$1 LIMIT 1`, [levelName])).rows[0]
+      if (!lvExists) return fail(res, `客户等级「${levelName}」不存在，请先到"客户等级"创建`)
+    }
+    const existing = (await pool.query(
+      `SELECT id FROM sale_customers WHERE mobile=$1 AND deleted_at IS NULL LIMIT 1`,
+      [dist.phone]
+    )).rows[0]
+    const targetLevel = levelName || '分销商' // 解绑 = 回到默认
+    if (existing) {
+      await pool.query(
+        `UPDATE sale_customers SET level_name=$1, update_time=NOW() WHERE id=$2`,
+        [targetLevel, existing.id]
+      )
+    } else {
+      await pool.query(
+        `INSERT INTO sale_customers (name, mobile, level_name, source_name, status, create_time, update_time)
+         VALUES ($1,$2,$3,'小程序分销',1,NOW(),NOW())`,
+        [dist.name || dist.phone, dist.phone, targetLevel]
+      )
+    }
+    return ok(res, { bound_to: targetLevel })
   } catch(e) { fail(res, e.message) }
 })
 

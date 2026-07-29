@@ -7222,6 +7222,10 @@ app.post('/miniapi/review/create', miniAuth, async (req, res) => {
     const photoBonus = Array.isArray(imgArr) ? Math.min(imgArr.length, 6) : 0
     const totalPoints = 10 + photoBonus
     await pool.query(`UPDATE mini_users SET points=COALESCE(points,0)+$1 WHERE id=$2`, [totalPoints, req.miniUser.id])
+    await pool.query(
+      `INSERT INTO mini_points_log (user_id,points,type,remark,order_id,created_at) VALUES ($1,$2,'earn',$3,$4,NOW())`,
+      [req.miniUser.id, totalPoints, photoBonus > 0 ? `评价晒图（评价10+图片${photoBonus}）` : '商品评价', order_id]
+    )
     const msg = photoBonus > 0
       ? `评价成功！获得${totalPoints}积分（评价+10，图片+${photoBonus}）`
       : '评价成功，获得10积分'
@@ -8338,6 +8342,10 @@ app.post('/miniapi/signin', miniAuth, async (req, res) => {
     const points = streak >= 7 ? 10 : streak >= 4 ? 8 : 5
     await pool.query(`INSERT INTO user_signin (user_id, signin_date, points_earned, streak) VALUES ($1,$2,$3,$4)`, [uid, today, points, streak])
     await pool.query(`UPDATE mini_users SET points=COALESCE(points,0)+$1 WHERE id=$2`, [points, uid])
+    await pool.query(
+      `INSERT INTO mini_points_log (user_id,points,type,remark,created_at) VALUES ($1,$2,'earn',$3,NOW())`,
+      [uid, points, `每日签到（连签${streak}天）`]
+    )
     // 连签7天整数倍时发签到券
     let coupon_reward = null
     if (streak % 7 === 0) {

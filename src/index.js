@@ -2637,16 +2637,102 @@ router.post('/finance/Invoice/del', async (req, res) => {
 router.get('/finance/Statement/index', async (req, res) => {
   try {
     const { page, list_rows, offset } = pageParams(req.query)
-    await listQuery(res, 'finance_statements', { keyword: req.query.keyword, keywordCols: ['statement_no','customer_name'], baseWhere: shopBase(req, 'deleted_at IS NULL'), orderBy: 'id DESC', page, list_rows, offset })
+    const extras = []
+    const extraParams = []
+    if (req.query.statement_no) {
+      extraParams.push(`%${req.query.statement_no}%`)
+      extras.push(`statement_no ILIKE $${extraParams.length}`)
+    }
+    if (req.query.customer_name) {
+      extraParams.push(`%${req.query.customer_name}%`)
+      extras.push(`(customer_name ILIKE $${extraParams.length} OR supplier_name ILIKE $${extraParams.length})`)
+    }
+    if (req.query.status !== undefined && req.query.status !== '') {
+      extraParams.push(parseInt(req.query.status))
+      extras.push(`status = $${extraParams.length}`)
+    }
+    await listQuery(res, 'finance_statements', {
+      keyword: req.query.keyword,
+      keywordCols: ['statement_no', 'customer_name', 'supplier_name'],
+      extra: extras.join(' AND '),
+      extraParams,
+      baseWhere: shopBase(req, 'deleted_at IS NULL'),
+      orderBy: 'id DESC', page, list_rows, offset,
+    })
   } catch (e) { fail(res, e.message) }
 })
+router.get('/finance/Statement/read', async (req, res) => {
+  try {
+    const id = parseInt(req.query.id)
+    if (!id) return fail(res, 'id不能为空')
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    const r = await pool.query('SELECT * FROM finance_statements WHERE id=$1 AND shop_id=$2 AND deleted_at IS NULL', [id, shopId])
+    if (!r.rows.length) return fail(res, '对账单不存在')
+    return ok(res, r.rows[0])
+  } catch (e) { fail(res, e.message) }
+})
+
+// detail 是 JSONB，node-pg 会把 JS 数组转成 postgres 数组字面量导致报错，必须先 stringify
+function normalizeStatementBody(body) {
+  const b = { ...body }
+  if (b.detail !== undefined && typeof b.detail !== 'string') b.detail = JSON.stringify(b.detail ?? [])
+  return b
+}
+
 router.post('/finance/Statement/add', async (req, res) => {
   try {
-    const b = filterBodyCols('finance_statements', { statement_no: genOrderNo('DZ'), ...req.body, shop_id: parseInt(req.admin?.shop_id) || 1 })
+    const b = filterBodyCols('finance_statements', normalizeStatementBody({ statement_no: genOrderNo('DZ'), ...req.body, shop_id: parseInt(req.admin?.shop_id) || 1 }))
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
     const vals = cols.map(k => b[k])
     const r = await pool.query(`INSERT INTO finance_statements (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
     return ok(res, r.rows[0])
+  } catch (e) { fail(res, e.message) }
+})
+router.post('/finance/Statement/edit', async (req, res) => {
+  try {
+    const { id, ...rest } = req.body
+    if (!id) return fail(res, 'id不能为空')
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    // 已确认(2)/已结清(4)的对账单是双方认过的凭据，不允许再改明细和金额
+    const cur = await pool.query('SELECT status FROM finance_statements WHERE id=$1 AND shop_id=$2 AND deleted_at IS NULL', [id, shopId])
+    if (!cur.rows.length) return fail(res, '对账单不存在')
+    if ([2, 4].includes(Number(cur.rows[0].status))) return fail(res, '对方已确认的对账单不允许修改，请先撤回')
+    const b = filterBodyCols('finance_statements', normalizeStatementBody(rest))
+    delete b.shop_id
+    delete b.statement_no
+    const cols = Object.keys(b).filter(k => b[k] !== undefined)
+    if (!cols.length) return fail(res, '无有效字段')
+    const sets = cols.map((k, i) => `${k}=$${i + 1}`)
+    const vals = cols.map(k => b[k])
+    const r = await pool.query(`UPDATE finance_statements SET ${sets.join(',')} WHERE id=$${vals.length + 1} AND shop_id=$${vals.length + 2} RETURNING *`, [...vals, id, shopId])
+    return ok(res, r.rows[0])
+  } catch (e) { fail(res, e.message) }
+})
+// 状态流转：0草稿 → 1已发出 → 2对方已确认 / 3有异议 → 4已结清
+router.post('/finance/Statement/confirm', async (req, res) => {
+  try {
+    const { id, status, confirm_remark } = req.body
+    if (!id) return fail(res, 'id不能为空')
+    const next = Number(status)
+    if (![0, 1, 2, 3, 4].includes(next)) return fail(res, '状态值不合法')
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    const stamp = [2, 3, 4].includes(next) ? 'NOW()' : 'NULL'
+    const r = await pool.query(
+      `UPDATE finance_statements SET status=$1, confirm_remark=$2, confirm_time=${stamp} WHERE id=$3 AND shop_id=$4 AND deleted_at IS NULL RETURNING *`,
+      [next, String(confirm_remark || ''), id, shopId],
+    )
+    if (!r.rows.length) return fail(res, '对账单不存在')
+    return ok(res, r.rows[0])
+  } catch (e) { fail(res, e.message) }
+})
+router.post('/finance/Statement/batchDel', async (req, res) => {
+  try {
+    const { ids } = req.body
+    if (!ids || !ids.length) return fail(res, 'ids不能为空')
+    const idArr = Array.isArray(ids) ? ids : String(ids).split(',').map(Number)
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    await pool.query('UPDATE finance_statements SET deleted_at=NOW() WHERE id=ANY($1) AND shop_id=$2', [idArr, shopId])
+    return ok(res)
   } catch (e) { fail(res, e.message) }
 })
 router.post('/finance/Statement/del', async (req, res) => {

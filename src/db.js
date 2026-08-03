@@ -324,6 +324,45 @@ async function initDb() {
     await client.query("ALTER TABLE purchase_order ADD COLUMN IF NOT EXISTS attachments_info JSONB DEFAULT '[]'").catch(() => {})
     await client.query("ALTER TABLE purchase_order ADD COLUMN IF NOT EXISTS fee_items JSONB DEFAULT '[]'").catch(() => {})
     await client.query("ALTER TABLE contract_order ADD COLUMN IF NOT EXISTS expense_amount DECIMAL(10,2) DEFAULT 0").catch(() => {})
+
+    // 往来单位：客户档案关联供应商档案（同一单位既供货给我、我又从他拿货）
+    await client.query("ALTER TABLE sale_customers ADD COLUMN IF NOT EXISTS linked_supplier_id INT DEFAULT 0").catch(() => {})
+
+    // 对账单重构：往来对账（借贷双栏 + 期初/本期/期末 + 明细快照 + 确认流程）
+    const statementAlters = [
+      // 往来单位（partner = 客户档案 id；双向单位再带上关联的供应商 id）
+      "ALTER TABLE finance_statements ADD COLUMN IF NOT EXISTS supplier_id INT DEFAULT 0",
+      "ALTER TABLE finance_statements ADD COLUMN IF NOT EXISTS supplier_name VARCHAR(200) DEFAULT ''",
+      // 'customer' 单向应收 | 'supplier' 单向应付 | 'both' 购销双向
+      "ALTER TABLE finance_statements ADD COLUMN IF NOT EXISTS partner_type VARCHAR(20) DEFAULT 'customer'",
+      // 期初：两侧各自结转 + 净额（正数=对方欠我，负数=我欠对方）
+      "ALTER TABLE finance_statements ADD COLUMN IF NOT EXISTS opening_recv DECIMAL(12,2) DEFAULT 0",
+      "ALTER TABLE finance_statements ADD COLUMN IF NOT EXISTS opening_pay DECIMAL(12,2) DEFAULT 0",
+      "ALTER TABLE finance_statements ADD COLUMN IF NOT EXISTS opening_balance DECIMAL(12,2) DEFAULT 0",
+      // 本期发生：recv=我应收(借方) pay=我应付(贷方)
+      "ALTER TABLE finance_statements ADD COLUMN IF NOT EXISTS recv_amount DECIMAL(12,2) DEFAULT 0",
+      "ALTER TABLE finance_statements ADD COLUMN IF NOT EXISTS pay_amount DECIMAL(12,2) DEFAULT 0",
+      // 本期收付
+      "ALTER TABLE finance_statements ADD COLUMN IF NOT EXISTS collected_amount DECIMAL(12,2) DEFAULT 0",
+      "ALTER TABLE finance_statements ADD COLUMN IF NOT EXISTS paid_amount DECIMAL(12,2) DEFAULT 0",
+      // 期末：closing_recv=对方还欠我 closing_pay=我还欠对方 net=净额(仅参考,全额结算不据此收付)
+      "ALTER TABLE finance_statements ADD COLUMN IF NOT EXISTS closing_recv DECIMAL(12,2) DEFAULT 0",
+      "ALTER TABLE finance_statements ADD COLUMN IF NOT EXISTS closing_pay DECIMAL(12,2) DEFAULT 0",
+      "ALTER TABLE finance_statements ADD COLUMN IF NOT EXISTS net_amount DECIMAL(12,2) DEFAULT 0",
+      // 'full' 全额结算（各走各的两笔）| 'net' 轧差结算（预留）
+      "ALTER TABLE finance_statements ADD COLUMN IF NOT EXISTS settle_mode VARCHAR(20) DEFAULT 'full'",
+      // 明细快照：对账单一旦出具就固化，后续改单据不影响已出的对账单
+      "ALTER TABLE finance_statements ADD COLUMN IF NOT EXISTS detail JSONB DEFAULT '[]'",
+      // 0草稿 1已发出 2对方已确认 3有异议 4已结清
+      "ALTER TABLE finance_statements ADD COLUMN IF NOT EXISTS confirm_time TIMESTAMP",
+      "ALTER TABLE finance_statements ADD COLUMN IF NOT EXISTS confirm_remark TEXT DEFAULT ''",
+      "ALTER TABLE finance_statements ADD COLUMN IF NOT EXISTS admin_name VARCHAR(100) DEFAULT ''",
+      "ALTER TABLE finance_statements ALTER COLUMN status SET DEFAULT 0",
+    ]
+    for (const sql of statementAlters) {
+      await client.query(sql).catch(() => {})
+    }
+
     console.log('Database initialized successfully')
   } finally {
     client.release()

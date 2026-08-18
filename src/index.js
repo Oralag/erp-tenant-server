@@ -117,6 +117,13 @@ app.use(express.json({
 }))
 app.use(express.urlencoded({ extended: true }))
 
+// 有人动小程序订单时，顺手扫一遍超时未付款的单（内部节流 5 分钟）。
+// 取代原来每 60 秒一次的后台轮询，原因见文件末尾 maybeSweepExpiredOrders 处注释。
+app.use('/miniapi/order', (req, res, next) => {
+  try { global.maybeSweepExpiredOrders?.() } catch { /* 不影响请求 */ }
+  next()
+})
+
 // ─── 表列名缓存（启动后加载，写入时自动过滤非法字段）─────────────────────────
 const tableColsCache = {}
 async function loadTableCols() {
@@ -6631,7 +6638,19 @@ async function expirePendingOrder(orderId) {
       } catch (e) { console.log('[order-expire]', e.message) }
     }
     await sweep()
-    const timer = setInterval(sweep, 60 * 1000)
+
+    // 这里以前是 setInterval(sweep, 60 * 1000)。Neon 免费版靠「闲 5 分钟自动休眠」
+    // 省额度，每分钟塞一条 SQL 等于让数据库 24 小时睡不着 —— 2026-08 就是这么把
+    // 100 CU-hrs 的月额度烧穿（17 天用掉 110.32），整个 ERP + 小程序停机的。
+    // 改成「有人用小程序订单时顺手扫一遍」（节流 5 分钟，见 app.use('/miniapi/order')）
+    // + 6 小时兜底，后台常态零流量，数据库该睡就能睡。
+    let lastSweepAt = Date.now()
+    global.maybeSweepExpiredOrders = () => {
+      if (Date.now() - lastSweepAt < 5 * 60 * 1000) return
+      lastSweepAt = Date.now()
+      sweep()
+    }
+    const timer = setInterval(() => { lastSweepAt = Date.now(); sweep() }, 6 * 60 * 60 * 1000)
     timer.unref?.()
   } catch (e) { console.log('order expiry init:', e.message) }
 })()

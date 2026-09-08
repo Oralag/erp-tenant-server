@@ -8828,7 +8828,7 @@ app.get('/adminapi/refund/list', auth, async (req, res) => {
 // 管理端：处理退款（同意/拒绝）
 app.post('/adminapi/refund/handle', auth, async (req, res) => {
   try {
-    const { id, action, note = '' } = req.body  // action: 'approve' | 'reject'
+    const { id, action, resolution = '', note = '' } = req.body  // action: 'approve' | 'reject' | 'negotiate'
     if (!id || !action) return fail(res, '参数缺失')
     const refund = (await pool.query(
       `SELECT r.*, o.order_no, o.wx_transaction_id, o.total_amount as order_amount, o.user_id, u.openid
@@ -8877,6 +8877,15 @@ app.post('/adminapi/refund/handle', auth, async (req, res) => {
       } finally {
         client.release()
       }
+    } else if (action === 'negotiate') {
+      // 协商方案不直接退款，也不关闭申请；保留待处理状态，方便客服继续沟通。
+      const labels = { refund: '协商退款', exchange: '换货', resend: '补发', compensate: '部分退款/补偿' }
+      const prefix = labels[resolution] || '协商处理'
+      const finalNote = `[${prefix}]${note ? ` ${note}` : ''}`.trim()
+      await pool.query(
+        `UPDATE mini_refunds SET note=$1, handled_at=NOW() WHERE id=$2`,
+        [finalNote, id]
+      )
     } else {
       // 拒绝：还原订单原始状态
       await pool.query(

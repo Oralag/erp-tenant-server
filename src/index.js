@@ -2813,9 +2813,14 @@ router.post('/retail/order/add', async (req, res) => {
       const a = await pool.query('SELECT name FROM admins WHERE id=$1', [req.admin?.id])
       adminName = a.rows[0]?.name || ''
     } catch {}
+    const memberId = Number(req.body.member_id || 0)
+    const storeId = Number(req.body.store_id || 0)
+    if (!Number.isSafeInteger(memberId) || memberId < 0 || !Number.isSafeInteger(storeId) || storeId < 0) return fail(res, '会员或门店 ID 无效，请刷新页面后重试')
     const b = filterBodyCols('retail_orders', {
       order_sn: genOrderNo('LS'),
       ...req.body,
+      member_id: memberId,
+      store_id: storeId,
       admin_id: parseInt(req.admin?.id) || 0,
       admin_name: adminName,
       status: 0,

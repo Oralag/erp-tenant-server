@@ -30,10 +30,15 @@ function createAuditService(pool) {
     if (value == null || value === '' || ![0, 1].includes(n)) throw new Error('status必须是0或1')
     return n
   }
+  function positiveInteger(value, label = '商品ID') {
+    const n = Number(value)
+    if (!Number.isSafeInteger(n) || n <= 0) throw new Error(`${label}无效，请刷新商品列表后重试`)
+    return n
+  }
   function itemsOf(raw) {
     const items = typeof raw === 'string' ? JSON.parse(raw) : raw
     if (!Array.isArray(items)) throw new Error('商品明细格式错误')
-    return items.filter(i => Number(i.goods_id) > 0 && Number(i.num) > 0)
+    return items.filter(i => Number(i.num) > 0).map(i => ({ ...i, goods_id: positiveInteger(i.goods_id), num: Number(i.num) }))
   }
   async function lockOrder(client, table, id, shopId) {
     const { rows } = await client.query(`SELECT * FROM ${table} WHERE id=$1 AND shop_id=$2 FOR UPDATE`, [id, shopId])

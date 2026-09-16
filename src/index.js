@@ -615,7 +615,9 @@ router.get('/goods/GoodsUnitConvert/index', async (req, res) => {
   try {
     const { goods_id } = req.query
     if (!goods_id) return ok(res, { rows: [], total: 0 })
-    const r = await pool.query('SELECT * FROM goods_unit_convert WHERE goods_id=$1 ORDER BY id ASC', [goods_id])
+    const goodsId = Number(goods_id)
+    if (!Number.isSafeInteger(goodsId) || goodsId <= 0) return fail(res, '商品ID无效，请刷新商品列表后重试')
+    const r = await pool.query('SELECT * FROM goods_unit_convert WHERE goods_id=$1 ORDER BY id ASC', [goodsId])
     return ok(res, { rows: r.rows, total: r.rows.length })
   } catch (e) { fail(res, e.message) }
 })
@@ -624,15 +626,17 @@ router.post('/goods/GoodsUnitConvert/save', async (req, res) => {
   try {
     const { goods_id, units } = req.body
     if (!goods_id) return fail(res, 'goods_id不能为空')
-    await pool.query('DELETE FROM goods_unit_convert WHERE goods_id=$1', [goods_id])
+    const goodsId = Number(goods_id)
+    if (!Number.isSafeInteger(goodsId) || goodsId <= 0) return fail(res, '商品ID无效，请刷新商品列表后重试')
+    await pool.query('DELETE FROM goods_unit_convert WHERE goods_id=$1', [goodsId])
     if (Array.isArray(units) && units.length) {
       for (const u of units) {
         if (u.unit_name && u.ratio > 0) {
-          await pool.query('INSERT INTO goods_unit_convert (goods_id,unit_name,ratio) VALUES ($1,$2,$3)', [goods_id, u.unit_name, u.ratio])
+          await pool.query('INSERT INTO goods_unit_convert (goods_id,unit_name,ratio) VALUES ($1,$2,$3)', [goodsId, u.unit_name, u.ratio])
         }
       }
     }
-    const r = await pool.query('SELECT * FROM goods_unit_convert WHERE goods_id=$1 ORDER BY id ASC', [goods_id])
+    const r = await pool.query('SELECT * FROM goods_unit_convert WHERE goods_id=$1 ORDER BY id ASC', [goodsId])
     return ok(res, { rows: r.rows })
   } catch (e) { fail(res, e.message) }
 })

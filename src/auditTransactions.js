@@ -4,6 +4,21 @@ function createAuditService(pool) {
   let schemaReady
   function ensureSchema() {
     if (!schemaReady) schemaReady = (async () => {
+      // Existing installations used integer stock quantities. Weighing requires
+      // fractional base units; widen without rounding or changing stored values.
+      await pool.query(`DO $$
+        DECLARE col RECORD;
+        BEGIN
+          PERFORM pg_advisory_xact_lock(731204916);
+          FOR col IN SELECT table_name, column_name FROM information_schema.columns
+            WHERE table_schema = current_schema() AND data_type IN ('smallint','integer','bigint')
+              AND ((table_name = 'stock_inventory' AND column_name = 'qty')
+                OR (table_name = 'stock_flow' AND column_name IN ('qty','before_qty','after_qty')))
+          LOOP
+            EXECUTE format('ALTER TABLE %I ALTER COLUMN %I TYPE NUMERIC USING %I::numeric',
+              col.table_name, col.column_name, col.column_name);
+          END LOOP;
+        END $$`)
       await pool.query(`CREATE TABLE IF NOT EXISTS retail_audit_effects (
         order_id INTEGER PRIMARY KEY, shop_id INTEGER NOT NULL,
         fund_id INTEGER NOT NULL, amount NUMERIC(18,2) NOT NULL,

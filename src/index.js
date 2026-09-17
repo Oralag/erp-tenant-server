@@ -185,7 +185,7 @@ async function migrateMultiTenant() {
 
 // 健康检查（含DB诊断）
 app.get('/health', (req, res) => {
-  res.json({ ok: true })
+  res.json({ ok: true, revision: process.env.RENDER_GIT_COMMIT || null })
 })
 
 function fail(res, message = '操作失败', status = 200) {

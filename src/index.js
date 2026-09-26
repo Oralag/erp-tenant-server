@@ -18,6 +18,25 @@ const https = require('https')
 const app = express()
 const PORT = process.env.PORT || 8888
 
+// ERP 页面通过 SSE 接收新订单事件；只在新订单付款成功时推送，不轮询数据库。
+const miniOrderStreams = new Set()
+function publishMiniOrderEvent(order, items = []) {
+  if (!order) return
+  const payload = JSON.stringify({
+    id: order.id,
+    order_no: order.order_no,
+    total_amount: order.total_amount || order.total || 0,
+    items: items.map(item => ({ goods_name: item.goods_name, qty: item.qty })),
+  })
+  for (const client of miniOrderStreams) {
+    if (client.destroyed || client.writableEnded) {
+      miniOrderStreams.delete(client)
+      continue
+    }
+    client.write(`event: new_order\ndata: ${payload}\n\n`)
+  }
+}
+
 // ─── 微信订阅消息 ─────────────────────────────────────────────────────────────
 const WX_APPID = process.env.WX_APPID || 'wxdbe895428fd5c21a'
 const WX_APPSECRET = process.env.WX_SECRET || process.env.WX_APPSECRET || ''
@@ -5934,6 +5953,26 @@ app.get('/miniapi/stores', async (req, res) => {
 })
 
 // 订单列表（ERP后台）
+app.get('/adminapi/mini/orders/events', auth, (req, res) => {
+  res.status(200)
+  res.set({
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  })
+  res.flushHeaders?.()
+  res.write(': connected\n\n')
+  miniOrderStreams.add(res)
+  const keepAlive = setInterval(() => {
+    if (!res.destroyed && !res.writableEnded) res.write(': keep-alive\n\n')
+  }, 20000)
+  res.on('close', () => {
+    clearInterval(keepAlive)
+    miniOrderStreams.delete(res)
+  })
+})
+
 app.get('/adminapi/mini/orders', auth, async (req, res) => {
   try {
     const { page = 1, list_rows = 20, status, keyword } = req.query
@@ -6220,6 +6259,10 @@ app.post('/miniapi/pay/unified', miniAuth, async (req, res) => {
 
     if (totalFee <= 0) {
       const updOrder = (await pool.query(`UPDATE mini_orders SET status=1, paid_at=NOW() WHERE id=$1 AND status=0 RETURNING *`, [order.id])).rows[0]
+      if (updOrder) {
+        const items = (await pool.query(`SELECT goods_name, qty FROM mini_order_items WHERE order_id=$1`, [updOrder.id])).rows
+        publishMiniOrderEvent(updOrder, items)
+      }
       if (updOrder && parseInt(updOrder.coupon_id || 0) > 0) {
         await pool.query(
           `UPDATE mini_user_coupons SET status=1, used_at=NOW()
@@ -6328,6 +6371,7 @@ app.post('/miniapi/pay/notify', async (req, res) => {
           }).catch(() => {})
         }
         notifyAdminNewOrder(updOrder, paidItems).catch(() => {})
+        publishMiniOrderEvent(updOrder, paidItems)
         const lvl = calcLevel(paidUser)
         const mult = MEMBER_LEVELS[lvl].multiplier
         const earnPoints = Math.floor(parseFloat(updOrder.total_amount || updOrder.total || 0) * POINTS_PER_YUAN * mult)

@@ -10,6 +10,12 @@ function registerExhibitions(router, pool, { ok, fail, genOrderNo }) {
       owner_name VARCHAR(100) NOT NULL DEFAULT '', remark TEXT NOT NULL DEFAULT '',
       created_at TIMESTAMP NOT NULL DEFAULT NOW(), UNIQUE(shop_id, name, start_date)
     );
+    CREATE TABLE IF NOT EXISTS retail_returns (
+      id SERIAL PRIMARY KEY, shop_id INTEGER NOT NULL, return_no VARCHAR(100) NOT NULL DEFAULT '',
+      order_id INTEGER NOT NULL DEFAULT 0, order_no VARCHAR(100) NOT NULL DEFAULT '',
+      amount NUMERIC(12,2) NOT NULL DEFAULT 0, return_date DATE, goods_info JSONB NOT NULL DEFAULT '[]',
+      remark TEXT NOT NULL DEFAULT '', status INTEGER NOT NULL DEFAULT 0, created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    );
     ALTER TABLE retail_orders ADD COLUMN IF NOT EXISTS exhibition_id INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE finance_expenses ADD COLUMN IF NOT EXISTS exhibition_id INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE finance_expenses ADD COLUMN IF NOT EXISTS exhibition_payment_id INTEGER NOT NULL DEFAULT 0;
@@ -54,6 +60,16 @@ function registerExhibitions(router, pool, { ok, fail, genOrderNo }) {
   router.get('/retail/exhibition/index', route(async (req, res) => {
     const r = await pool.query('SELECT * FROM retail_exhibitions WHERE shop_id=$1 ORDER BY start_date DESC, id DESC', [sid(req)])
     ok(res, { rows: r.rows, total: r.rows.length })
+  }))
+  router.get('/retail/return/index', route(async (req, res) => {
+    const page = Math.max(1, Number(req.query.page || 1))
+    const size = Math.min(500, Math.max(1, Number(req.query.list_rows || 20)))
+    const offset = (page - 1) * size
+    const [rows, total] = await Promise.all([
+      pool.query('SELECT * FROM retail_returns WHERE shop_id=$1 ORDER BY return_date DESC NULLS LAST,id DESC LIMIT $2 OFFSET $3', [sid(req), size, offset]),
+      pool.query('SELECT COUNT(*) FROM retail_returns WHERE shop_id=$1', [sid(req)]),
+    ])
+    ok(res, { rows: rows.rows, total: Number(total.rows[0].count), page, list_rows: size })
   }))
   router.post('/finance/Expense/edit', route(async (req, res) => {
     const b = req.body

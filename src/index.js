@@ -7,6 +7,7 @@ const bcrypt = require('bcryptjs')
 const { pool, initDb } = require('./db')
 const audits = require('./auditTransactions').createAuditService(pool)
 const { loadAccess, canAccess } = require('./adminPermissions')
+const { registerExhibitions } = require('./exhibitions')
 const { execSync } = require('child_process')
 const fs = require('fs')
 const path = require('path')
@@ -461,6 +462,7 @@ function makeCRUD(router, path, table, opts = {}) {
 // ─── router setup ───────────────────────────────────────────────────────────
 
 const router = express.Router()
+const exhibitions = registerExhibitions(router, pool, { ok, fail, genOrderNo })
 app.use('/adminapi', router)
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2603,6 +2605,7 @@ router.post('/finance/Statement/del', async (req, res) => {
 // Expense (费用)
 router.get('/finance/Expense/index', async (req, res) => {
   try {
+    await exhibitions.ensure()
     const { page, list_rows, offset } = pageParams(req.query)
     await listQuery(res, 'finance_expenses', { keyword: req.query.keyword, keywordCols: ['expense_no','name'], baseWhere: shopBase(req, '1=1'), orderBy: 'id DESC', page, list_rows, offset })
   } catch (e) { fail(res, e.message) }
@@ -2610,7 +2613,7 @@ router.get('/finance/Expense/index', async (req, res) => {
 router.post('/finance/Expense/add', async (req, res) => {
   try {
     const shopId = parseInt(req.admin?.shop_id) || 1
-    const ALLOWED = new Set(['expense_no','name','amount','expense_date','fund_id','fund_name','remark','status','contact_name','pay_date','shop_id'])
+    const ALLOWED = new Set(['expense_no','name','amount','expense_date','fund_id','fund_name','remark','status','contact_name','pay_date','shop_id','exhibition_id'])
     const b = { expense_no: genOrderNo('FY'), ...req.body, shop_id: shopId }
     const cols = Object.keys(b).filter(k => ALLOWED.has(k) && b[k] !== undefined)
     const vals = cols.map(k => b[k])
@@ -2811,6 +2814,7 @@ async function ensureAdminCols(table) {
 const ensureRetailAdminCols = () => ensureAdminCols('retail_orders')
 
 router.get('/retail/order/index', async (req, res) => {
+  try { await exhibitions.ensure() } catch (e) { return fail(res, e.message) }
   try { await pool.query(`ALTER TABLE retail_orders ADD COLUMN IF NOT EXISTS fee_items JSONB DEFAULT '[]'`) } catch {}
   await ensureRetailAdminCols()
   try {
@@ -2861,7 +2865,7 @@ router.post('/retail/order/add', async (req, res) => {
 })
 router.post('/retail/order/edit', async (req, res) => {
   try {
-    const { id, goods_info, order_date, member_id, member_name, store_id, store_name, pay_type, remark, total_amount, discount_amount, pay_amount, fee_items } = req.body
+    const { id, goods_info, order_date, member_id, member_name, store_id, store_name, pay_type, remark, total_amount, discount_amount, pay_amount, fee_items, exhibition_id } = req.body
     if (!id) return fail(res, '缺少零售单 ID')
     if (!goods_info) return fail(res, '缺少 goods_info')
     const shopId = parseInt(req.admin?.shop_id) || 1
@@ -2874,10 +2878,10 @@ router.post('/retail/order/edit', async (req, res) => {
     await pool.query(
       `UPDATE retail_orders SET goods_info=$1, total_amount=$2, discount_amount=$3, pay_amount=$4,
        order_date=$5, member_id=$6, member_name=$7, store_id=$8, store_name=$9, pay_type=$10, remark=$11,
-       fee_items = COALESCE($12::jsonb, fee_items)
-       WHERE id=$13 AND shop_id=$14`,
+       fee_items = COALESCE($12::jsonb, fee_items), exhibition_id = COALESCE($13::int, exhibition_id)
+       WHERE id=$14 AND shop_id=$15`,
       [goodsStr, total_amount??0, discount_amount??0, pay_amount??0,
-       order_date||null, member_id||0, member_name||'', store_id||0, store_name||'', pay_type||'cash', remark||'', feeStr, id, shopId]
+       order_date||null, member_id||0, member_name||'', store_id||0, store_name||'', pay_type||'cash', remark||'', feeStr, exhibition_id ?? null, id, shopId]
     )
     const r = await pool.query('SELECT * FROM retail_orders WHERE id=$1 AND shop_id=$2', [id, shopId])
     return ok(res, r.rows[0])

@@ -6107,6 +6107,72 @@ app.post('/adminapi/mini/order/remind-payment', auth, async (req, res) => {
   } catch (e) { fail(res, e.message) }
 })
 
+// ERP 后台通过小程序客服会话给订单客户发送私信
+app.post('/adminapi/mini/order/private-message', auth, async (req, res) => {
+  const client = await pool.connect()
+  try {
+    const orderId = parseInt(req.body.order_id)
+    const content = String(req.body.content || '').trim().slice(0, 4000)
+    if (!orderId) return fail(res, '缺少订单ID')
+    if (!content) return fail(res, '私信内容不能为空')
+
+    await client.query('BEGIN')
+    const order = (await client.query(
+      `SELECT o.id, o.user_id, o.order_no, o.total_amount, u.phone
+       FROM mini_orders o
+       LEFT JOIN mini_users u ON u.id=o.user_id
+       WHERE o.id=$1 AND o.deleted_at IS NULL
+       FOR UPDATE OF o`,
+      [orderId]
+    )).rows[0]
+    if (!order) {
+      await client.query('ROLLBACK')
+      return fail(res, '订单不存在')
+    }
+    if (!order.user_id) {
+      await client.query('ROLLBACK')
+      return fail(res, '该订单没有关联小程序客户，无法发送私信')
+    }
+
+    // 与小程序默认客服会话（product_id=0）保持同一会话，客户打开客服即可收到。
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1), $2::int)', ['mini-service-private-message', Number(order.user_id)])
+    let session = (await client.query(
+      `SELECT id FROM mini_service_sessions
+       WHERE user_id=$1 AND product_id=0 AND expires_at>NOW()
+       ORDER BY updated_at DESC LIMIT 1 FOR UPDATE`,
+      [order.user_id]
+    )).rows[0]
+
+    if (!session) {
+      session = (await client.query(
+        `INSERT INTO mini_service_sessions
+         (user_id,client_key,product_id,product_name,product_snapshot,status,created_at,updated_at,expires_at)
+         VALUES ($1,'',0,'订单咨询',$2,'human',NOW(),NOW(),NOW()+INTERVAL '180 days')
+         RETURNING id`,
+        [order.user_id, JSON.stringify({ order_id: order.id, order_no: order.order_no })]
+      )).rows[0]
+    } else {
+      await client.query(
+        `UPDATE mini_service_sessions SET status='human',updated_at=NOW(),expires_at=NOW()+INTERVAL '180 days' WHERE id=$1`,
+        [session.id]
+      )
+    }
+
+    const message = (await client.query(
+      `INSERT INTO mini_service_messages(session_id,role,source,content)
+       VALUES($1,'assistant','human',$2) RETURNING id,session_id,content,created_at`,
+      [session.id, content]
+    )).rows[0]
+    await client.query('COMMIT')
+    return ok(res, { ...message, order_no: order.order_no, phone: order.phone || '' })
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    fail(res, e.message)
+  } finally {
+    client.release()
+  }
+})
+
 // 给待付款订单客户发放优惠券（供客户后续订单使用）
 app.post('/adminapi/mini/order/grant-coupon', auth, async (req, res) => {
   const client = await pool.connect()

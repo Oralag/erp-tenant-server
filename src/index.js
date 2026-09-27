@@ -5953,7 +5953,7 @@ app.get('/miniapi/stores', async (req, res) => {
 })
 
 // 订单列表（ERP后台）
-app.get('/adminapi/mini/orders/events', auth, (req, res) => {
+app.get('/adminapi/mini/orders/events', auth, async (req, res) => {
   res.status(200)
   res.set({
     'Content-Type': 'text/event-stream; charset=utf-8',
@@ -5964,6 +5964,21 @@ app.get('/adminapi/mini/orders/events', auth, (req, res) => {
   res.flushHeaders?.()
   res.write(': connected\n\n')
   miniOrderStreams.add(res)
+  if (req.query.include_pending === '1') {
+    try {
+      const pending = await pool.query(
+        `SELECT id, order_no, total_amount, total, COUNT(*) OVER()::int AS pending_total
+         FROM mini_orders WHERE deleted_at IS NULL AND status=1
+         ORDER BY id DESC LIMIT 20`
+      )
+      if (!res.destroyed && !res.writableEnded) {
+        const orders = pending.rows.map(({ pending_total, ...order }) => order)
+        res.write(`event: pending_orders\ndata: ${JSON.stringify({ orders, total: Number(pending.rows[0]?.pending_total || 0) })}\n\n`)
+      }
+    } catch (e) {
+      console.error('[mini-order-events] initial pending-order lookup failed:', e.message)
+    }
+  }
   const keepAlive = setInterval(() => {
     if (!res.destroyed && !res.writableEnded) res.write(': keep-alive\n\n')
   }, 20000)

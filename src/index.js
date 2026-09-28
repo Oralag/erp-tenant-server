@@ -6248,6 +6248,30 @@ app.post('/adminapi/mini/order/ship', auth, async (req, res) => {
       [express_company || '', tracking_no || '', order_id]
     )
     if (!r.rows[0]) return fail(res, '操作失败')
+    // 使用这次保存的同一组字段通知客户，订单详情即可读取并展示物流信息。
+    const shippedOrder = r.rows[0]
+    if (TMPL_SHIP) {
+      try {
+        const user = (await pool.query(`SELECT openid FROM mini_users WHERE id=$1`, [shippedOrder.user_id])).rows[0]
+        if (user?.openid) {
+          const items = (await pool.query(`SELECT goods_name FROM mini_order_items WHERE order_id=$1`, [order_id])).rows
+          const goodsName = items.map(i => i.goods_name).join('、').slice(0, 20) || '订单商品'
+          const shippedAt = new Date(shippedOrder.shipped_at || Date.now())
+            .toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })
+            .replace(/\//g, '-')
+            .slice(0, 16)
+          await sendSubscribeMsg(user.openid, TMPL_SHIP, `pages/order/detail?id=${order_id}`, {
+            thing1: { value: goodsName },
+            thing2: { value: express_company || '快递' },
+            character_string1: { value: tracking_no || '待更新' },
+            time1: { value: shippedAt },
+          })
+        }
+      } catch (notifyError) {
+        // 通知失败不应回滚已经成功保存的发货信息。
+        console.warn('[mini order ship] subscription notification failed:', notifyError.message)
+      }
+    }
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })

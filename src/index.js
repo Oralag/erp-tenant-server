@@ -5935,6 +5935,7 @@ app.post('/adminapi/distributor/withdraw/reject', auth, async (req, res) => {
     await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS express_company VARCHAR(50) DEFAULT ''`)
     await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS tracking_no VARCHAR(100) DEFAULT ''`)
     await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS shipped_at TIMESTAMP`)
+    await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS tracking_registered_at TIMESTAMP`)
     // delivery_type: 0=物流发货 1=跑腿送货 2=自提
     await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS delivery_type INT DEFAULT 0`)
     await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS store_id INT DEFAULT 0`)
@@ -6273,6 +6274,57 @@ app.post('/adminapi/mini/order/ship', auth, async (req, res) => {
       }
     }
     return ok(res, r.rows[0])
+  } catch (e) { fail(res, e.message) }
+})
+
+// 17TRACK 物流轨迹：密钥仅保存在部署环境变量，不会下发给浏览器。
+const TRACK17_API = 'https://api.17track.net/track/v2.4'
+async function track17(path, body) {
+  const key = process.env.TRACK17_API_KEY
+  if (!key) throw new Error('物流查询服务尚未配置')
+  const response = await fetch(`${TRACK17_API}${path}`, {
+    method: 'POST',
+    headers: { '17token': key, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  const data = await response.json().catch(() => null)
+  if (!response.ok || !data || data.code !== 0) throw new Error(data?.message || '物流服务暂时不可用')
+  return data.data || {}
+}
+
+function format17Track(item) {
+  const info = item?.track_info || {}
+  const providers = info?.tracking?.providers || []
+  const events = providers.flatMap(p => p?.events || []).map(event => ({
+    time: event.time_iso || event.time_utc || event.time_raw?.date || '',
+    description: event.description_translation?.description || event.description || '',
+    location: event.location || event.address?.city || '',
+    stage: event.stage || event.sub_status || '',
+  })).sort((a, b) => String(b.time).localeCompare(String(a.time)))
+  return {
+    number: item?.number || '', carrier: providers[0]?.provider?.name || '',
+    status: info?.latest_status?.status || 'NotFound',
+    latest: info?.latest_event || null, events,
+  }
+}
+
+app.get('/adminapi/mini/order/tracking/:id', auth, async (req, res) => {
+  try {
+    const order = (await pool.query(
+      `SELECT id, tracking_no, tracking_registered_at FROM mini_orders WHERE id=$1 AND deleted_at IS NULL`, [req.params.id]
+    )).rows[0]
+    if (!order?.tracking_no) return fail(res, '该订单尚未填写快递单号')
+    if (!process.env.TRACK17_API_KEY) return fail(res, '物流查询服务正在配置，请稍后再试')
+    if (!order.tracking_registered_at) {
+      const registered = await track17('/register', [{ number: order.tracking_no, lang: 'zh' }])
+      const rejected = registered.rejected?.[0]
+      if (rejected && rejected.error?.code !== -18019904) return fail(res, rejected.error?.message || '运单注册失败')
+      await pool.query(`UPDATE mini_orders SET tracking_registered_at=NOW() WHERE id=$1`, [order.id])
+    }
+    const details = await track17('/gettrackinfo', [{ number: order.tracking_no }])
+    const item = details.accepted?.[0]
+    if (!item) return ok(res, { number: order.tracking_no, status: 'NotFound', events: [] })
+    return ok(res, format17Track(item))
   } catch (e) { fail(res, e.message) }
 })
 

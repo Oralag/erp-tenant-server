@@ -4787,6 +4787,24 @@ app.get('/miniapi/order/detail/:id', miniAuth, async (req, res) => {
   } catch (e) { fail(res, e.message) }
 })
 
+app.get('/miniapi/order/tracking/:id', miniAuth, async (req, res) => {
+  try {
+    const order = (await pool.query(`SELECT id, tracking_no, express_company, tracking_registered_at FROM mini_orders WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL`, [req.params.id, req.miniUser.id])).rows[0]
+    if (!order?.tracking_no) return fail(res, '暂无快递单号')
+    const key = process.env.TRACK17_API_KEY || req.get('x-track17-token') || ''
+    if (!key) return fail(res, '物流查询服务正在配置，请稍后再试')
+    if (!order.tracking_registered_at) {
+      const registered = await track17('/register', [{ number: order.tracking_no }], key)
+      const rejected = registered.rejected?.[0]
+      if (rejected && rejected.error?.code !== -18019904) return fail(res, rejected.error?.message || '运单注册失败')
+      await pool.query(`UPDATE mini_orders SET tracking_registered_at=NOW() WHERE id=$1`, [order.id])
+    }
+    const details = await track17('/gettrackinfo', [{ number: order.tracking_no }], key)
+    const item = details.accepted?.[0]
+    return ok(res, item ? format17Track(item) : { number: order.tracking_no, carrier: order.express_company, status: 'NotFound', events: [] })
+  } catch (e) { fail(res, e.message) }
+})
+
 // 取消待支付订单并释放预扣积分/预占优惠券
 app.post('/miniapi/order/cancel', miniAuth, async (req, res) => {
   const client = await pool.connect()

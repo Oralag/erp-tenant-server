@@ -6317,7 +6317,7 @@ app.get('/adminapi/mini/order/tracking/:id', auth, async (req, res) => {
     if (!order?.tracking_no) return fail(res, '该订单尚未填写快递单号')
     if (!process.env.TRACK17_API_KEY && !trackingKey) return fail(res, '物流查询服务正在配置，请稍后再试')
     if (!order.tracking_registered_at) {
-      const registered = await track17('/register', [{ number: order.tracking_no, lang: 'zh' }], trackingKey)
+      const registered = await track17('/register', [{ number: order.tracking_no, lang: 'zh-CN' }], trackingKey)
       const rejected = registered.rejected?.[0]
       if (rejected && rejected.error?.code !== -18019904) return fail(res, rejected.error?.message || '运单注册失败')
       await pool.query(`UPDATE mini_orders SET tracking_registered_at=NOW() WHERE id=$1`, [order.id])

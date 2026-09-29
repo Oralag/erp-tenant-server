@@ -6279,8 +6279,8 @@ app.post('/adminapi/mini/order/ship', auth, async (req, res) => {
 
 // 17TRACK 物流轨迹：密钥仅保存在部署环境变量，不会下发给浏览器。
 const TRACK17_API = 'https://api.17track.net/track/v2.4'
-async function track17(path, body) {
-  const key = process.env.TRACK17_API_KEY
+async function track17(path, body, suppliedKey = '') {
+  const key = process.env.TRACK17_API_KEY || suppliedKey
   if (!key) throw new Error('物流查询服务尚未配置')
   const response = await fetch(`${TRACK17_API}${path}`, {
     method: 'POST',
@@ -6310,18 +6310,19 @@ function format17Track(item) {
 
 app.get('/adminapi/mini/order/tracking/:id', auth, async (req, res) => {
   try {
+    const trackingKey = req.get('x-track17-token') || ''
     const order = (await pool.query(
       `SELECT id, tracking_no, tracking_registered_at FROM mini_orders WHERE id=$1 AND deleted_at IS NULL`, [req.params.id]
     )).rows[0]
     if (!order?.tracking_no) return fail(res, '该订单尚未填写快递单号')
-    if (!process.env.TRACK17_API_KEY) return fail(res, '物流查询服务正在配置，请稍后再试')
+    if (!process.env.TRACK17_API_KEY && !trackingKey) return fail(res, '物流查询服务正在配置，请稍后再试')
     if (!order.tracking_registered_at) {
-      const registered = await track17('/register', [{ number: order.tracking_no, lang: 'zh' }])
+      const registered = await track17('/register', [{ number: order.tracking_no, lang: 'zh' }], trackingKey)
       const rejected = registered.rejected?.[0]
       if (rejected && rejected.error?.code !== -18019904) return fail(res, rejected.error?.message || '运单注册失败')
       await pool.query(`UPDATE mini_orders SET tracking_registered_at=NOW() WHERE id=$1`, [order.id])
     }
-    const details = await track17('/gettrackinfo', [{ number: order.tracking_no }])
+    const details = await track17('/gettrackinfo', [{ number: order.tracking_no }], trackingKey)
     const item = details.accepted?.[0]
     if (!item) return ok(res, { number: order.tracking_no, status: 'NotFound', events: [] })
     return ok(res, format17Track(item))

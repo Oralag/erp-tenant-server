@@ -7199,6 +7199,21 @@ app.post('/miniapi/nova/chat', optionalMiniAuth, async (req, res) => {
       const brandRows = rows.filter(g => {
         try { return JSON.parse(g.remark || '{}')['__brand__']?.show === true } catch { return false }
       })
+      // 控制 token：Groq 免费档每分钟只有 8K token，全量商品详情一次就 7-9K。
+      // 只给「和当前问题相关」的商品（最多 3 个）附详情，其余只列名称/价格/规格。
+      const askText = [
+        String(message || ''),
+        ...(Array.isArray(messages) ? messages : []).filter(m => m?.role === 'user').slice(-3).map(m => String(m.content || '')),
+        String(req.body.product?.name || ''),
+      ].join(' ')
+      const ctxProductId = parseInt(req.body.product?.id || 0) || 0
+      const isRelevant = g => {
+        if (ctxProductId && Number(g.id) === ctxProductId) return true
+        const name = String(g.goods_name || '').split('/')[0].replace(/成品|牧区|纯坊|\s/g, '')
+        for (let i = 0; i + 2 <= name.length; i++) if (askText.includes(name.slice(i, i + 2))) return true
+        return false
+      }
+      const detailIds = new Set(brandRows.filter(isRelevant).slice(0, 3).map(g => g.id))
       productLines = brandRows.map(g => {
         let b = {}
         try { b = JSON.parse(g.remark || '{}')['__brand__'] || {} } catch {}
@@ -7206,6 +7221,7 @@ app.post('/miniapi/nova/chat', optionalMiniAuth, async (req, res) => {
         const skuStr = skus.length ? '，规格：' + skus.map(s => `${s.label}¥${s.price}`).join('、') : ''
         const desc = b.description || ''
         const head = `【${g.goods_name}】售价¥${g.sell_price}/${g.unit_name || '件'}${skuStr}${desc ? '\n  · ' + desc.slice(0, 60) : ''}`
+        if (!detailIds.has(g.id)) return head
         const pi = b.productInfo || {}
         const infoLines = []
         // productInfo 字段名对应中文标签（未列出的字段按 key 原样输出）
@@ -7261,7 +7277,8 @@ app.post('/miniapi/nova/chat', optionalMiniAuth, async (req, res) => {
     const cfRes = await fetch('https://nomaderp.pages.dev/api/brand-chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ messages, brandContext }),
+      // 只带最近 8 条对话，避免长会话把 token 额度吃光
+      body: JSON.stringify({ messages: (Array.isArray(messages) ? messages : []).slice(-8), brandContext }),
     })
 
     const text = await cfRes.text()

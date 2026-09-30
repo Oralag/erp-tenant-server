@@ -6080,6 +6080,7 @@ app.post('/adminapi/distributor/withdraw/reject', auth, async (req, res) => {
     await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS price_adjusted_at TIMESTAMP`)
     await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS price_change_requested BOOLEAN DEFAULT FALSE`)
     await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS payment_expires_at TIMESTAMP`)
+    backfillMiniOrderShippingToWx().catch(e => console.warn('[wx shipping startup backfill error]', e.message))
   } catch(e) { console.log('mini_orders alter:', e.message) }
 })()
 

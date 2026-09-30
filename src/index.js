@@ -1137,7 +1137,8 @@ router.get('/stock/PurchaseOrder/index', async (req, res) => {
     const conditions = ['deleted_at IS NULL']
     if (req.query.status !== undefined && req.query.status !== '') conditions.push(`status=${parseInt(req.query.status)}`)
     if (req.query.supplier_name) conditions.push(`supplier_name ILIKE '%${req.query.supplier_name.replace(/'/g,"''")}%'`)
-    await listQuery(res, 'purchase_order', { keyword: req.query.keyword, keywordCols: ['order_no'], baseWhere: shopBase(req, conditions.join(' AND ')), orderBy: 'id DESC', page, list_rows, offset })
+    const orderKeyword = req.query.keyword || req.query.order_no || req.query.order_sn || ''
+    await listQuery(res, 'purchase_order', { keyword: orderKeyword, keywordCols: ['order_no','order_sn'], baseWhere: shopBase(req, conditions.join(' AND ')), orderBy: 'id DESC', page, list_rows, offset })
   } catch (e) { fail(res, e.message) }
 })
 router.post('/stock/PurchaseOrder/add', async (req, res) => {

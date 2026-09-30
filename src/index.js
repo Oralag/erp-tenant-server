@@ -97,6 +97,120 @@ async function sendSubscribeMsg(openid, tmplId, page, data) {
   })
 }
 
+async function postWxApi(url, payload) {
+  const body = JSON.stringify(payload)
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body,
+  })
+  const text = await resp.text()
+  try { return JSON.parse(text) } catch { return { errcode: -1, errmsg: text || `HTTP ${resp.status}` } }
+}
+
+function formatWxUploadTime(value = new Date()) {
+  const date = value instanceof Date ? value : new Date(value)
+  const pad = n => String(n).padStart(2, '0')
+  const ms = String(date.getMilliseconds()).padStart(3, '0')
+  const offset = 8 * 60
+  const local = new Date(date.getTime() + offset * 60 * 1000)
+  return `${local.getUTCFullYear()}-${pad(local.getUTCMonth() + 1)}-${pad(local.getUTCDate())}T${pad(local.getUTCHours())}:${pad(local.getUTCMinutes())}:${pad(local.getUTCSeconds())}.${ms}+08:00`
+}
+
+function maskContactPhone(phone = '') {
+  const digits = String(phone || '').replace(/\D/g, '')
+  if (digits.length < 7) return String(phone || '').slice(0, 20)
+  return `${digits.slice(0, 3)}****${digits.slice(-4)}`
+}
+
+async function uploadMiniOrderShippingToWx(orderId) {
+  if (!orderId) return { skipped: true, reason: 'missing order id' }
+  const token = await getWxAccessToken()
+  if (!token) return { skipped: true, reason: 'missing wx access token' }
+  if (!WX_MCH_ID) return { skipped: true, reason: 'missing WX_MCH_ID' }
+
+  const order = (await pool.query(
+    `SELECT o.*, u.openid
+     FROM mini_orders o
+     LEFT JOIN mini_users u ON u.id=o.user_id
+     WHERE o.id=$1 AND o.deleted_at IS NULL`,
+    [orderId]
+  )).rows[0]
+  if (!order) return { skipped: true, reason: 'order not found' }
+  if (!order.openid) return { skipped: true, reason: 'missing openid' }
+  if (!order.wx_transaction_id && !order.order_no) return { skipped: true, reason: 'missing pay order number' }
+
+  const deliveryType = parseInt(order.delivery_type || 0)
+  const address = typeof order.address === 'string'
+    ? (() => { try { return JSON.parse(order.address || '{}') } catch { return {} } })()
+    : (order.address || {})
+  const items = (await pool.query(`SELECT goods_name, qty FROM mini_order_items WHERE order_id=$1 ORDER BY id ASC`, [order.id])).rows
+  const itemDesc = items.map(item => `${item.goods_name || '商品'}×${item.qty || 1}`).join('、').slice(0, 120) || '订单商品'
+  const receiverContact = maskContactPhone(deliveryType === 2 ? (address.phone || '') : (address.phone || ''))
+  const orderKey = order.wx_transaction_id
+    ? { order_number_type: 2, transaction_id: order.wx_transaction_id }
+    : { order_number_type: 1, mchid: WX_MCH_ID, out_trade_no: order.order_no }
+  const shippingItem = {
+    item_desc: itemDesc,
+    contact: {
+      receiver_contact: receiverContact,
+    },
+  }
+  let logisticsType = 1
+  if (deliveryType === 0) {
+    shippingItem.tracking_no = order.tracking_no || ''
+    shippingItem.express_company = order.express_company || '快递'
+  } else if (deliveryType === 1) {
+    logisticsType = 2
+    shippingItem.express_company = '同城配送'
+  } else if (deliveryType === 2) {
+    logisticsType = 4
+    shippingItem.express_company = order.store_name || '到店自提'
+  }
+
+  const payload = {
+    order_key: orderKey,
+    logistics_type: logisticsType,
+    delivery_mode: 1,
+    is_all_delivered: true,
+    shipping_list: [shippingItem],
+    upload_time: formatWxUploadTime(order.shipped_at || new Date()),
+    payer: { openid: order.openid },
+  }
+  const result = await postWxApi(`https://api.weixin.qq.com/wxa/sec/order/upload_shipping_info?access_token=${token}`, payload)
+  if (Number(result.errcode || 0) !== 0) {
+    const message = result.errmsg || JSON.stringify(result)
+    await pool.query(
+      `UPDATE mini_orders SET wx_shipping_sync_error=$1 WHERE id=$2`,
+      [message.slice(0, 500), order.id]
+    ).catch(() => {})
+    return { ok: false, result }
+  }
+  await pool.query(
+    `UPDATE mini_orders SET wx_shipping_synced_at=NOW(), wx_shipping_sync_error='' WHERE id=$1`,
+    [order.id]
+  ).catch(() => {})
+  return { ok: true, result }
+}
+
+async function backfillMiniOrderShippingToWx(limit = 10) {
+  const rows = (await pool.query(
+    `SELECT id FROM mini_orders
+     WHERE deleted_at IS NULL
+       AND status >= 2
+       AND COALESCE(wx_shipping_synced_at, TIMESTAMP 'epoch') = TIMESTAMP 'epoch'
+       AND COALESCE(wx_transaction_id, '') <> ''
+     ORDER BY shipped_at DESC NULLS LAST, id DESC
+     LIMIT $1`,
+    [limit]
+  )).rows
+  for (const row of rows) {
+    uploadMiniOrderShippingToWx(row.id).then(result => {
+      if (result?.ok === false) console.warn('[wx shipping backfill failed]', row.id, JSON.stringify(result.result))
+    }).catch(e => console.warn('[wx shipping backfill error]', row.id, e.message))
+  }
+}
+
 async function notifyAdminNewOrder(order, items = []) {
   const key = process.env.SERVER_JIANG_KEY
   if (!key || !order) return
@@ -5954,6 +6068,8 @@ app.post('/adminapi/distributor/withdraw/reject', auth, async (req, res) => {
     await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS tracking_no VARCHAR(100) DEFAULT ''`)
     await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS shipped_at TIMESTAMP`)
     await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS tracking_registered_at TIMESTAMP`)
+    await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS wx_shipping_synced_at TIMESTAMP`)
+    await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS wx_shipping_sync_error TEXT DEFAULT ''`)
     // delivery_type: 0=物流发货 1=跑腿送货 2=自提
     await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS delivery_type INT DEFAULT 0`)
     await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS store_id INT DEFAULT 0`)
@@ -6052,6 +6168,7 @@ app.get('/adminapi/mini/orders', auth, async (req, res) => {
       o.items = (await pool.query(`SELECT * FROM mini_order_items WHERE order_id=$1`, [o.id])).rows
       o.address = typeof o.address === 'string' ? JSON.parse(o.address || '{}') : (o.address || {})
     }
+    backfillMiniOrderShippingToWx().catch(e => console.warn('[wx shipping backfill error]', e.message))
     return ok(res, { rows, total: parseInt(total), status_counts })
   } catch (e) { fail(res, e.message) }
 })
@@ -6291,6 +6408,13 @@ app.post('/adminapi/mini/order/ship', auth, async (req, res) => {
     if (!r.rows[0]) return fail(res, '操作失败')
     // 使用这次保存的同一组字段通知客户，订单详情即可读取并展示物流信息。
     const shippedOrder = r.rows[0]
+    try {
+      const wxShippingResult = await uploadMiniOrderShippingToWx(shippedOrder.id)
+      if (wxShippingResult?.ok === false) console.warn('[mini order ship] wx shipping sync failed:', JSON.stringify(wxShippingResult.result))
+    } catch (syncError) {
+      // 微信平台发货信息同步失败不应回滚已经成功保存的 ERP 发货信息。
+      console.warn('[mini order ship] wx shipping sync error:', syncError.message)
+    }
     if (TMPL_SHIP) {
       try {
         const user = (await pool.query(`SELECT openid FROM mini_users WHERE id=$1`, [shippedOrder.user_id])).rows[0]

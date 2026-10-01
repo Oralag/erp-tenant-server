@@ -7378,7 +7378,7 @@ async function novaLeaveMessage(kind, content, reportDate = null) {
   } catch (e) { console.log('[nova-message]', e.message) }
 }
 
-// 每日工作汇报：北京时间 21:00 后生成当天的；Render 免费版会休眠，所以在读消息时补生成
+// 每日问题汇报（仅当天有解决不了的问题时）：北京时间 21:00 后生成当天的；Render 免费版会休眠，所以在读消息时补生成
 async function ensureNovaDailyReport() {
   const bj = new Date(Date.now() + 8 * 3600 * 1000)
   const today = bj.toISOString().slice(0, 10)
@@ -7402,6 +7402,8 @@ async function ensureNovaDailyReport() {
   const issues = (await pool.query(
     `SELECT category, question, reason FROM nova_feedback
      WHERE created_at BETWEEN $1::timestamptz AND $2::timestamptz ORDER BY created_at`, range)).rows
+  // 只有当天有解决不了的问题才汇报，没问题的日子不打扰老板
+  if (!issues.length) return
   const openTotal = Number((await pool.query(`SELECT COUNT(*) FROM nova_feedback WHERE status='open'`)).rows[0].count)
 
   const lines = [`【${day} 工作汇报】`]
@@ -7422,8 +7424,6 @@ async function ensureNovaDailyReport() {
     const gaps = issues.filter(i => i.category === '缺少信息' && i.reason).slice(0, 3)
     if (gaps.length) lines.push('', '建议：把这些信息补进品牌主页「常见问答」或商品详情，我下次就能直接答了：', ...gaps.map(g => `- ${String(g.reason).slice(0, 80)}`))
     if (byCat['系统异常']) lines.push('', `另外有 ${byCat['系统异常'].length} 次我没能回复上（AI 服务额度或网络问题），客户看到的是「暂时无法回复」。`)
-  } else if (Number(stat.questions)) {
-    lines.push('', '今天的问题我都答上了。')
   }
   if (openTotal) lines.push('', `目前累计还有 ${openTotal} 个待改进的问题。`)
   await novaLeaveMessage('report', lines.join('\n'), day)

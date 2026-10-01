@@ -7301,11 +7301,23 @@ app.post('/miniapi/nova/chat', optionalMiniAuth, async (req, res) => {
         const lastUser = [...(Array.isArray(messages) ? messages : [])].reverse().find(m => m?.role === 'user')
         const question = String(message || lastUser?.content || '').trim().slice(0, 1000)
         if (question) {
+          const category = unresolved ? String(unresolved.category || '其他').slice(0, 20) : '系统异常'
+          if (['投诉不满', '需要人工'].includes(category)) {
+            // 紧急情况：Nova 马上给老板留言
+            let who = '游客'
+            try {
+              if (req.miniUser?.id) who = (await pool.query(`SELECT phone FROM mini_users WHERE id=$1`, [req.miniUser.id])).rows[0]?.phone || '已登录客户'
+            } catch {}
+            await novaLeaveMessage('alert',
+              `【需要您处理·${category}】\n客户：${who}\n问：${question.slice(0, 200)}\n我的回答：${finalReply.slice(0, 200)}` +
+              (unresolved?.reason ? `\n情况：${String(unresolved.reason).slice(0, 200)}` : '') +
+              `\n可以在 ERP「小程序客服」里找到这个会话直接回复客户。`)
+          }
           await pool.query(
             `INSERT INTO nova_feedback (session_id,question,reply,category,reason)
              VALUES ($1,$2,$3,$4,$5)`,
             [sessionId || null, question, finalReply.slice(0, 4000),
-             unresolved ? String(unresolved.category || '其他').slice(0, 20) : '系统异常',
+             category,
              unresolved ? String(unresolved.reason || '').slice(0, 200) : 'AI 没有返回内容（额度/网络/模型异常）']
           )
         }
@@ -7343,9 +7355,97 @@ app.post('/miniapi/nova/chat', optionalMiniAuth, async (req, res) => {
         handled_at TIMESTAMP
       );
       CREATE INDEX IF NOT EXISTS idx_nova_feedback_status ON nova_feedback(status, created_at DESC);
+      CREATE TABLE IF NOT EXISTS nova_messages (
+        id BIGSERIAL PRIMARY KEY,
+        kind VARCHAR(10) DEFAULT 'report',
+        report_date DATE,
+        content TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW(),
+        read_at TIMESTAMP
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_nova_messages_daily ON nova_messages(report_date) WHERE kind='report';
     `)
   } catch (e) { console.log('nova feedback init:', e.message) }
 })()
+
+// Nova 给老板留言（手机端 ERP「消息」里的 Nova 会话）
+async function novaLeaveMessage(kind, content, reportDate = null) {
+  try {
+    await pool.query(
+      `INSERT INTO nova_messages (kind, report_date, content) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`,
+      [kind, reportDate, String(content).slice(0, 8000)]
+    )
+  } catch (e) { console.log('[nova-message]', e.message) }
+}
+
+// 每日工作汇报：北京时间 21:00 后生成当天的；Render 免费版会休眠，所以在读消息时补生成
+async function ensureNovaDailyReport() {
+  const bj = new Date(Date.now() + 8 * 3600 * 1000)
+  const today = bj.toISOString().slice(0, 10)
+  const day = bj.getUTCHours() >= 21 ? today : new Date(bj.getTime() - 86400000).toISOString().slice(0, 10)
+  const exists = (await pool.query(`SELECT 1 FROM nova_messages WHERE kind='report' AND report_date=$1`, [day])).rows[0]
+  if (exists) return
+  // 以北京时间自然日统计
+  const range = [`${day} 00:00:00+08`, `${day} 23:59:59.999+08`]
+  const stat = (await pool.query(
+    `SELECT COUNT(DISTINCT m.session_id) AS sessions,
+            COUNT(*) FILTER (WHERE m.role='user') AS questions,
+            COUNT(DISTINCT s.user_id) FILTER (WHERE s.user_id IS NOT NULL) AS members
+     FROM mini_service_messages m JOIN mini_service_sessions s ON s.id=m.session_id
+     WHERE m.created_at BETWEEN $1::timestamptz AND $2::timestamptz
+       AND s.client_key !~ '[''"]'`, range)).rows[0]
+  const top = (await pool.query(
+    `SELECT trim(m.content) q, COUNT(*) n FROM mini_service_messages m JOIN mini_service_sessions s ON s.id=m.session_id
+     WHERE m.role='user' AND m.created_at BETWEEN $1::timestamptz AND $2::timestamptz
+       AND s.client_key !~ '[''"]' AND char_length(trim(m.content)) BETWEEN 2 AND 200
+     GROUP BY 1 ORDER BY n DESC LIMIT 5`, range)).rows
+  const issues = (await pool.query(
+    `SELECT category, question, reason FROM nova_feedback
+     WHERE created_at BETWEEN $1::timestamptz AND $2::timestamptz ORDER BY created_at`, range)).rows
+  const openTotal = Number((await pool.query(`SELECT COUNT(*) FROM nova_feedback WHERE status='open'`)).rows[0].count)
+
+  const lines = [`【${day} 工作汇报】`]
+  if (!Number(stat.questions)) {
+    lines.push('今天小程序里没有客户来咨询。')
+  } else {
+    lines.push(`今天接待了 ${stat.sessions} 个会话，客户共提问 ${stat.questions} 次（其中登录会员 ${stat.members} 位）。`)
+    if (top.length) lines.push('', '客户问得最多的：', ...top.map((t, i) => `${i + 1}. ${t.q}（${t.n} 次）`))
+  }
+  const byCat = {}
+  for (const it of issues) (byCat[it.category] = byCat[it.category] || []).push(it)
+  if (issues.length) {
+    lines.push('', `今天有 ${issues.length} 个问题我没能解决好：`)
+    for (const [cat, list] of Object.entries(byCat)) {
+      lines.push(`· ${cat} ${list.length} 条`)
+      for (const it of list.slice(0, 5)) lines.push(`  - 「${String(it.question).slice(0, 60)}」${it.reason ? '：' + String(it.reason).slice(0, 80) : ''}`)
+    }
+    const gaps = issues.filter(i => i.category === '缺少信息' && i.reason).slice(0, 3)
+    if (gaps.length) lines.push('', '建议：把这些信息补进品牌主页「常见问答」或商品详情，我下次就能直接答了：', ...gaps.map(g => `- ${String(g.reason).slice(0, 80)}`))
+    if (byCat['系统异常']) lines.push('', `另外有 ${byCat['系统异常'].length} 次我没能回复上（AI 服务额度或网络问题），客户看到的是「暂时无法回复」。`)
+  } else if (Number(stat.questions)) {
+    lines.push('', '今天的问题我都答上了。')
+  }
+  if (openTotal) lines.push('', `目前累计还有 ${openTotal} 个待改进的问题。`)
+  await novaLeaveMessage('report', lines.join('\n'), day)
+}
+
+app.get('/adminapi/mini/nova/messages', auth, async (req, res) => {
+  try {
+    try { await ensureNovaDailyReport() } catch (e) { console.log('[nova-report]', e.message) }
+    const rows = (await pool.query(
+      `SELECT id, kind, report_date, content, created_at, read_at FROM nova_messages ORDER BY id DESC LIMIT 60`
+    )).rows.reverse()
+    const unread = Number((await pool.query(`SELECT COUNT(*) FROM nova_messages WHERE read_at IS NULL`)).rows[0].count)
+    return ok(res, { rows, unread })
+  } catch (e) { fail(res, e.message) }
+})
+
+app.post('/adminapi/mini/nova/messages/read', auth, async (req, res) => {
+  try {
+    await pool.query(`UPDATE nova_messages SET read_at=NOW() WHERE read_at IS NULL`)
+    return ok(res, {})
+  } catch (e) { fail(res, e.message) }
+})
 
 app.get('/adminapi/mini/nova/feedback', auth, async (req, res) => {
   try {

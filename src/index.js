@@ -7285,14 +7285,32 @@ app.post('/miniapi/nova/chat', optionalMiniAuth, async (req, res) => {
     const text = await cfRes.text()
     // 解析 SSE 拼接完整回复
     let reply = ''
+    let unresolved = null
     for (const line of text.split('\n')) {
       if (!line.startsWith('data: ') || line === 'data: [DONE]') continue
       try {
         const d = JSON.parse(line.slice(6))
         if (d.type === 'text') reply += (d.text || d.content || '')
+        else if (d.type === 'unresolved') unresolved = d
       } catch {}
     }
     const finalReply = reply || '抱歉，暂时无法回复，请稍后再试。'
+    // Nova 自己解决不了的问题 / 系统没回上来的，记进「Nova 待改进」给老板看
+    if (unresolved || !reply) {
+      try {
+        const lastUser = [...(Array.isArray(messages) ? messages : [])].reverse().find(m => m?.role === 'user')
+        const question = String(message || lastUser?.content || '').trim().slice(0, 1000)
+        if (question) {
+          await pool.query(
+            `INSERT INTO nova_feedback (session_id,question,reply,category,reason)
+             VALUES ($1,$2,$3,$4,$5)`,
+            [sessionId || null, question, finalReply.slice(0, 4000),
+             unresolved ? String(unresolved.category || '其他').slice(0, 20) : '系统异常',
+             unresolved ? String(unresolved.reason || '').slice(0, 200) : 'AI 没有返回内容（额度/网络/模型异常）']
+          )
+        }
+      } catch (e) { console.log('[nova-feedback]', e.message) }
+    }
     if (sessionId) {
       await pool.query(
         `INSERT INTO mini_service_messages (session_id,role,source,content)
@@ -7305,6 +7323,80 @@ app.post('/miniapi/nova/chat', optionalMiniAuth, async (req, res) => {
       )
     }
     return ok(res, { reply: finalReply, session_id: sessionId || null })
+  } catch (e) { fail(res, e.message) }
+})
+
+// Nova 待改进：Nova 解决不了的问题，供老板补知识库/改进
+;(async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS nova_feedback (
+        id BIGSERIAL PRIMARY KEY,
+        session_id BIGINT,
+        question TEXT NOT NULL,
+        reply TEXT DEFAULT '',
+        category VARCHAR(20) DEFAULT '其他',
+        reason VARCHAR(200) DEFAULT '',
+        status VARCHAR(10) DEFAULT 'open',
+        note VARCHAR(500) DEFAULT '',
+        created_at TIMESTAMP DEFAULT NOW(),
+        handled_at TIMESTAMP
+      );
+      CREATE INDEX IF NOT EXISTS idx_nova_feedback_status ON nova_feedback(status, created_at DESC);
+    `)
+  } catch (e) { console.log('nova feedback init:', e.message) }
+})()
+
+app.get('/adminapi/mini/nova/feedback', auth, async (req, res) => {
+  try {
+    const status = ['open', 'done'].includes(req.query.status) ? req.query.status : 'open'
+    const page = Math.max(1, parseInt(req.query.page) || 1)
+    const listRows = Math.min(100, Math.max(1, parseInt(req.query.list_rows) || 20))
+    const total = Number((await pool.query(`SELECT COUNT(*) FROM nova_feedback WHERE status=$1`, [status])).rows[0].count)
+    const rows = (await pool.query(
+      `SELECT f.*,
+         (SELECT COUNT(*) FROM nova_feedback x WHERE lower(trim(x.question))=lower(trim(f.question))) AS same_count
+       FROM nova_feedback f WHERE f.status=$1
+       ORDER BY f.created_at DESC LIMIT $2 OFFSET $3`,
+      [status, listRows, (page - 1) * listRows]
+    )).rows
+    const openCount = status === 'open' ? total
+      : Number((await pool.query(`SELECT COUNT(*) FROM nova_feedback WHERE status='open'`)).rows[0].count)
+    return ok(res, { rows, total, open_count: openCount })
+  } catch (e) { fail(res, e.message) }
+})
+
+app.post('/adminapi/mini/nova/feedback/handle', auth, async (req, res) => {
+  try {
+    const id = parseInt(req.body.id)
+    const status = req.body.status === 'open' ? 'open' : 'done'
+    if (!id) return fail(res, '缺少id')
+    const r = await pool.query(
+      `UPDATE nova_feedback SET status=$1, note=$2, handled_at=${status === 'done' ? 'NOW()' : 'NULL'}
+       WHERE id=$3 RETURNING id`,
+      [status, String(req.body.note || '').slice(0, 500), id]
+    )
+    if (!r.rows[0]) return fail(res, '记录不存在')
+    return ok(res, {})
+  } catch (e) { fail(res, e.message) }
+})
+
+// 客户最常问的问题（小程序 Nova 会话里的客户原话）
+app.get('/adminapi/mini/nova/top-questions', auth, async (req, res) => {
+  try {
+    const days = Math.min(365, Math.max(1, parseInt(req.query.days) || 30))
+    const rows = (await pool.query(
+      `SELECT trim(m.content) AS question, COUNT(*) AS times, MAX(m.created_at) AS last_at
+       FROM mini_service_messages m
+       JOIN mini_service_sessions s ON s.id=m.session_id
+       WHERE m.role='user' AND m.created_at > NOW() - make_interval(days => $1)
+         AND s.client_key !~ '[''"]'
+         AND char_length(trim(m.content)) BETWEEN 2 AND 200
+       GROUP BY trim(m.content)
+       ORDER BY times DESC, last_at DESC LIMIT 20`,
+      [days]
+    )).rows
+    return ok(res, rows)
   } catch (e) { fail(res, e.message) }
 })
 

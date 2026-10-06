@@ -2812,10 +2812,51 @@ router.post('/finance/Fund/edit', async (req, res) => {
     if (!cols.length) return fail(res, '无有效字段')
     const sets = cols.map((k,i) => `${k}=$${i+1}`)
     const vals = cols.map(k => b[k])
-    const r = await pool.query(`UPDATE finance_funds SET ${sets.join(',')}, update_time=NOW() WHERE id=$${vals.length+1} AND shop_id=$${vals.length+2} RETURNING *`, [...vals, id, shopId])
-    return ok(res, r.rows[0])
+    const client = await pool.connect()
+    try {
+      await client.query('BEGIN')
+      const before = (await client.query('SELECT name FROM finance_funds WHERE id=$1 AND shop_id=$2 FOR UPDATE', [id, shopId])).rows[0]
+      const r = await client.query(`UPDATE finance_funds SET ${sets.join(',')}, update_time=NOW() WHERE id=$${vals.length+1} AND shop_id=$${vals.length+2} RETURNING *`, [...vals, id, shopId])
+      const oldName = String(before?.name || '').trim()
+      const newName = String(r.rows[0]?.name || '').trim()
+      if (oldName && newName && oldName !== newName) await cascadeFundRename(client, Number(id), shopId, oldName, newName)
+      await client.query('COMMIT')
+      return ok(res, r.rows[0])
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {})
+      throw e
+    } finally {
+      client.release()
+    }
   } catch (e) { fail(res, e.message) }
 })
+
+// 资金账户改名 → 所有单据里存的账户名一起改（同一事务）。
+// 动态扫描存账户名的列：fund_name / xxx_fund_name（有对应 xxx_fund_id 时按 id 匹配），
+// receive_account / pay_account（只存名称，按旧名匹配）。
+async function cascadeFundRename(client, fundId, shopId, oldName, newName) {
+  const { rows } = await client.query(`
+    SELECT table_name, column_name FROM information_schema.columns
+    WHERE table_schema='public' AND table_name <> 'finance_funds'
+      AND data_type IN ('character varying','text')
+      AND (column_name IN ('fund_name','receive_account','pay_account') OR column_name LIKE '%\\_fund_name')`)
+  const all = (await client.query(`SELECT table_name, column_name FROM information_schema.columns WHERE table_schema='public'`)).rows
+  const colsByTable = {}
+  for (const c of all) (colsByTable[c.table_name] ||= new Set()).add(c.column_name)
+  for (const { table_name: t, column_name: col } of rows) {
+    const tableCols = colsByTable[t] || new Set()
+    const idCol = col.endsWith('fund_name') ? col.replace(/fund_name$/, 'fund_id') : null
+    const params = [newName, oldName]
+    let where = `"${col}"=$2`
+    if (idCol && tableCols.has(idCol)) {
+      // 有 id 的按 id 认；id 为空/0 的老数据按旧名认
+      params.push(String(fundId))
+      where = `(CAST("${idCol}" AS TEXT)=$3 OR (COALESCE(CAST("${idCol}" AS TEXT),'') IN ('','0') AND "${col}"=$2))`
+    }
+    if (tableCols.has('shop_id')) { params.push(shopId); where += ` AND shop_id=$${params.length}` }
+    await client.query(`UPDATE "${t}" SET "${col}"=$1 WHERE ${where} AND "${col}" IS DISTINCT FROM $1`, params)
+  }
+}
 router.post('/finance/Fund/del', async (req, res) => {
   try {
     const { id } = req.body

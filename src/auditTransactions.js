@@ -80,7 +80,9 @@ function createAuditService(pool) {
     const before = Number(rows[0]?.qty || 0)
     const after = Math.round((before + delta) * 10000) / 10000
     if (rows[0]) {
-      await client.query('UPDATE stock_inventory SET qty=$1, update_time=NOW() WHERE id=$2 AND shop_id=$3', [after, rows[0].id, shopId])
+      // 顺手把库存行单位校正成商品基础单位（历史上被单据单位覆盖过，如「箱」「捆」）
+      const unit = await baseUnitOf(client, item)
+      await client.query('UPDATE stock_inventory SET qty=$1, unit_name=COALESCE(NULLIF($4,\'\'),unit_name), update_time=NOW() WHERE id=$2 AND shop_id=$3', [after, rows[0].id, shopId, unit])
     } else {
       await client.query(`INSERT INTO stock_inventory (goods_id,goods_name,unit_name,warehouse_id,warehouse_name,qty,shop_id)
         VALUES ($1,$2,$3,$4,$5,$6,$7)`, [item.goods_id, item.goods_name || '', await baseUnitOf(client, item), warehouseId, warehouseName, after, shopId])

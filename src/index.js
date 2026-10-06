@@ -1396,8 +1396,8 @@ router.post('/stock/SaleReturnOrder/audit', async (req, res) => {
       if (existing.rows.length > 0) {
         beforeQty = parseFloat(existing.rows[0].qty) || 0
         const afterQty = Math.max(0, beforeQty + change)
-        await pool.query('UPDATE stock_inventory SET qty=$1, goods_name=$2, unit_name=COALESCE(NULLIF(unit_name,\'\'),$3), update_time=NOW() WHERE goods_id=$4 AND warehouse_id=$5',
-          [afterQty, item.goods_name || '', item.unit_name || '', goodsId, warehouseId])
+        await pool.query('UPDATE stock_inventory SET qty=$1, goods_name=$2, unit_name=$3, update_time=NOW() WHERE goods_id=$4 AND warehouse_id=$5',
+          [afterQty, item.goods_name || '', await stockUnitName(pool, item), goodsId, warehouseId])
         await pool.query('INSERT INTO stock_flow (goods_id, goods_name, warehouse_id, warehouse_name, type, qty, before_qty, after_qty, order_no, remark) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)',
           [goodsId, item.goods_name || '', warehouseId, warehouseName, isAudit ? 'sale_return' : 'sale_return_reverse', change, beforeQty, afterQty, orderNo, isAudit ? '销售退货审核' : '销售退货反审核'])
       } else if (isAudit && warehouseId) {
@@ -1544,8 +1544,8 @@ async function applySampleStock(client, order, goodsInfo, direction) {
     const beforeQty = Number(existing.rows[0].qty || 0)
     const afterQty = beforeQty + change
     await client.query(
-      'UPDATE stock_inventory SET qty=$1, goods_name=$2, unit_name=COALESCE(NULLIF(unit_name,\'\'),$3), update_time=NOW() WHERE goods_id=$4 AND warehouse_id=$5',
-      [afterQty, item.goods_name || '', item.unit_name || '', goodsId, warehouseId],
+      'UPDATE stock_inventory SET qty=$1, goods_name=$2, unit_name=$3, update_time=NOW() WHERE goods_id=$4 AND warehouse_id=$5',
+      [afterQty, item.goods_name || '', await stockUnitName(client, item), goodsId, warehouseId],
     )
     await client.query(
       'INSERT INTO stock_flow (goods_id, goods_name, warehouse_id, warehouse_name, type, qty, before_qty, after_qty, order_no, remark) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)',
@@ -1926,8 +1926,8 @@ router.post('/stock/OtherIn/audit', async (req, res) => {
       if (existing.rows.length > 0) {
         beforeQty = parseFloat(existing.rows[0].qty) || 0
         const afterQty = Math.max(0, beforeQty + change)
-        await pool.query('UPDATE stock_inventory SET qty=$1, goods_name=$2, unit_name=COALESCE(NULLIF(unit_name,\'\'),$3), update_time=NOW() WHERE goods_id=$4 AND warehouse_id=$5',
-          [afterQty, item.goods_name || '', item.unit_name || '', goodsId, warehouseId])
+        await pool.query('UPDATE stock_inventory SET qty=$1, goods_name=$2, unit_name=$3, update_time=NOW() WHERE goods_id=$4 AND warehouse_id=$5',
+          [afterQty, item.goods_name || '', await stockUnitName(pool, item), goodsId, warehouseId])
         await pool.query('INSERT INTO stock_flow (goods_id, goods_name, warehouse_id, warehouse_name, type, qty, before_qty, after_qty, order_no, remark) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)',
           [goodsId, item.goods_name || '', warehouseId, warehouseName, isAudit ? 'other_in' : 'other_in_reverse', change, beforeQty, afterQty, orderNo, isAudit ? '其他入库审核' : '其他入库反审核'])
       } else if (isAudit) {
@@ -2296,8 +2296,8 @@ router.post('/procure/ProcureInhouse/audit', async (req, res) => {
       if (existing.rows.length > 0) {
         beforeQty = parseFloat(existing.rows[0].qty) || 0
         const afterQty = Math.round((beforeQty + change) * 10000) / 10000
-        await pool.query('UPDATE stock_inventory SET qty=$1, goods_name=$2, unit_name=COALESCE(NULLIF(unit_name,\'\'),$3), update_time=NOW() WHERE goods_id=$4 AND warehouse_id=$5',
-          [afterQty, item.goods_name || '', item.unit_name || '', goodsId, warehouseId])
+        await pool.query('UPDATE stock_inventory SET qty=$1, goods_name=$2, unit_name=$3, update_time=NOW() WHERE goods_id=$4 AND warehouse_id=$5',
+          [afterQty, item.goods_name || '', await stockUnitName(pool, item), goodsId, warehouseId])
       } else if (isAudit) {
         await pool.query('INSERT INTO stock_inventory (goods_id, goods_name, goods_code, unit_name, warehouse_id, warehouse_name, qty) VALUES ($1,$2,$3,$4,$5,$6,$7)',
           [goodsId, item.goods_name || '', item.goods_sn || '', await stockUnitName(pool, item), warehouseId, warehouseName, change])
@@ -3766,7 +3766,7 @@ router.post('/stock/SaleExchangeOrder/audit', async (req, res) => {
       if (existing.rows.length > 0) {
         const beforeQty = parseFloat(existing.rows[0].qty) || 0
         const afterQty = Math.max(0, beforeQty + change)
-        await pool.query('UPDATE stock_inventory SET qty=$1, goods_name=$2, unit_name=COALESCE(NULLIF(unit_name,\'\'),$3), update_time=NOW() WHERE goods_id=$4 AND warehouse_id=$5', [afterQty, item.goods_name || '', item.unit_name || '', goodsId, warehouseId])
+        await pool.query('UPDATE stock_inventory SET qty=$1, goods_name=$2, unit_name=$3, update_time=NOW() WHERE goods_id=$4 AND warehouse_id=$5', [afterQty, item.goods_name || '', await stockUnitName(pool, item), goodsId, warehouseId])
         await pool.query('INSERT INTO stock_flow (goods_id, goods_name, warehouse_id, warehouse_name, type, qty, before_qty, after_qty, order_no, remark) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)',
           [goodsId, item.goods_name || '', warehouseId, warehouseName, isAudit ? 'exchange_return_in' : 'exchange_return_in_reverse', change, beforeQty, afterQty, orderNo, isAudit ? '换货退入审核' : '换货退入反审核'])
       } else if (isAudit && warehouseId) {
@@ -3787,7 +3787,7 @@ router.post('/stock/SaleExchangeOrder/audit', async (req, res) => {
       if (existing.rows.length > 0) {
         const beforeQty = parseFloat(existing.rows[0].qty) || 0
         const afterQty = Math.max(0, beforeQty + change)
-        await pool.query('UPDATE stock_inventory SET qty=$1, goods_name=$2, unit_name=COALESCE(NULLIF(unit_name,\'\'),$3), update_time=NOW() WHERE goods_id=$4 AND warehouse_id=$5', [afterQty, item.goods_name || '', item.unit_name || '', goodsId, warehouseId])
+        await pool.query('UPDATE stock_inventory SET qty=$1, goods_name=$2, unit_name=$3, update_time=NOW() WHERE goods_id=$4 AND warehouse_id=$5', [afterQty, item.goods_name || '', await stockUnitName(pool, item), goodsId, warehouseId])
         await pool.query('INSERT INTO stock_flow (goods_id, goods_name, warehouse_id, warehouse_name, type, qty, before_qty, after_qty, order_no, remark) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)',
           [goodsId, item.goods_name || '', warehouseId, warehouseName, isAudit ? 'exchange_out' : 'exchange_out_reverse', change, beforeQty, afterQty, orderNo, isAudit ? '换货发出审核' : '换货发出反审核'])
       }

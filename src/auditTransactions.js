@@ -65,6 +65,13 @@ function createAuditService(pool) {
       WHERE id=$2 AND shop_id=$3 AND deleted_at IS NULL RETURNING id`, [amount, fundId, shopId])
     if (!r.rows.length) throw new Error('资金账户不存在或不属于当前公司')
   }
+  // 新建库存行用商品档案的基础单位，不用单据行选的单位
+  async function baseUnitOf(client, item) {
+    const r = await client.query('SELECT unit_name FROM goods WHERE id=$1 LIMIT 1', [item.goods_id]).catch(() => ({ rows: [] }))
+    if (r.rows[0]?.unit_name) return r.rows[0].unit_name
+    const ratio = Number(item.unit_ratio)
+    return ratio > 0 && ratio !== 1 ? '' : (item.unit_name || '')
+  }
   async function stockDelta(client, shopId, warehouseId, warehouseName, item, delta) {
     // Also serializes creation when an inventory row does not exist yet.
     await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [`stock:${shopId}:${warehouseId}:${item.goods_id}`])
@@ -76,13 +83,15 @@ function createAuditService(pool) {
       await client.query('UPDATE stock_inventory SET qty=$1, update_time=NOW() WHERE id=$2 AND shop_id=$3', [after, rows[0].id, shopId])
     } else {
       await client.query(`INSERT INTO stock_inventory (goods_id,goods_name,unit_name,warehouse_id,warehouse_name,qty,shop_id)
-        VALUES ($1,$2,$3,$4,$5,$6,$7)`, [item.goods_id, item.goods_name || '', item.unit_name || '', warehouseId, warehouseName, after, shopId])
+        VALUES ($1,$2,$3,$4,$5,$6,$7)`, [item.goods_id, item.goods_name || '', await baseUnitOf(client, item), warehouseId, warehouseName, after, shopId])
     }
     return { before, after }
   }
   async function applyOutbound(client, order, shopId, type) {
     for (const item of itemsOf(order.goods_info).sort((a,b) => Number(a.goods_id)-Number(b.goods_id))) {
-      const delta = -Number(item.num)
+      // num 是所选单位的数量，换算成基础单位再扣（1 所选单位 = unit_ratio 基础单位）
+      const ratio = Number(item.unit_ratio)
+      const delta = -Math.round(Number(item.num) * (ratio > 0 ? ratio : 1) * 10000) / 10000
       const { before, after } = await stockDelta(client, shopId, order.warehouse_id || 0, order.warehouse_name || '', item, delta)
       await client.query(`INSERT INTO stock_flow (goods_id,goods_name,warehouse_id,warehouse_name,type,qty,before_qty,after_qty,order_no,remark,shop_id)
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
@@ -163,7 +172,7 @@ function createAuditService(pool) {
       if (funds.rows.length > 1) throw new Error('存在多个零售收款账户，请先核对')
       let fund = funds.rows[0]
       if (!fund) fund = (await client.query(`INSERT INTO finance_funds (name,fund_type,balance,shop_id) VALUES ('零售收款账户',2,0,$1) RETURNING *`, [shopId])).rows[0]
-      const items = itemsOf(order.goods_info).map(i => ({...i,num:Math.round(Number(i.num)*(Number(i.unit_ratio)||1)*10000)/10000}))
+      const items = itemsOf(order.goods_info).map(i => ({...i,num:Math.round(Number(i.num)*(Number(i.unit_ratio)||1)*10000)/10000,unit_ratio:1}))
       let outId = 0
       if (items.length) {
         const wh = (await client.query('SELECT * FROM warehouses WHERE shop_id=$1 ORDER BY id LIMIT 1', [shopId])).rows[0]

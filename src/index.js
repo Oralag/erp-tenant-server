@@ -223,7 +223,7 @@ async function notifyAdminNewOrder(order, items = []) {
   const receiver = parseInt(order.delivery_type || 0) === 2
     ? (order.store_name || '到店自提')
     : `${address.name || ''} ${address.phone || ''}`.trim()
-  const title = '🔔 小程序新订单'
+  const title = order.source === 'web' ? '🔔 官网新订单（已付款）' : '🔔 小程序新订单'
   const desp = [
     `订单号：${order.order_no}`,
     `实付金额：¥${parseFloat(order.total_amount || order.total || 0).toFixed(2)}`,
@@ -4120,13 +4120,19 @@ router.post('/goods/BomGoods/del', async (req, res) => {
 
 const MINI_JWT_SECRET = process.env.MINI_JWT_SECRET || 'mini_secret_2024'
 const WX_SECRET = process.env.WX_SECRET || ''
-const WX_MCH_ID = process.env.WX_MCH_ID || ''
+// 商户配置：先取环境变量，ERP「收款设置」里填过的会在启动/保存时覆盖（见 applyPaySettings）。
+// 每家客户是独立后端 + 独立数据库，配置存在自己库里，互不可见。
+let WX_MCH_ID = process.env.WX_MCH_ID || ''
 const WX_MCH_KEY = process.env.WX_MCH_KEY || ''
-const WX_MCH_CERT_SERIAL = process.env.WX_MCH_CERT_SERIAL || ''
-const WX_API_V3_KEY = process.env.WX_API_V3_KEY || ''
-const WX_MCH_PUBLIC_KEY_ID = process.env.WX_MCH_PUBLIC_KEY_ID || ''
+let WX_MCH_CERT_SERIAL = process.env.WX_MCH_CERT_SERIAL || ''
+let WX_API_V3_KEY = process.env.WX_API_V3_KEY || ''
+let WX_MCH_PUBLIC_KEY_ID = process.env.WX_MCH_PUBLIC_KEY_ID || ''
 // 私钥：env var 里 \n 是字面量，需替换为真实换行
-const WX_MCH_PRIVATE_KEY = (process.env.WX_MCH_PRIVATE_KEY || '').replace(/\\n/g, '\n')
+let WX_MCH_PRIVATE_KEY = (process.env.WX_MCH_PRIVATE_KEY || '').replace(/\\n/g, '\n')
+// Native 扫码支付用的 appid（默认跟小程序同一个）；JSAPI 必须用小程序 WX_APPID 不能换
+let WX_PAY_APPID = process.env.WX_PAY_APPID || WX_APPID
+// 支付回调要打回「这台后端自己」，不能写死某一家的地址
+const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || process.env.RENDER_EXTERNAL_URL || 'https://erp-server-xsji.onrender.com').replace(/\/$/, '')
 
 // WeChat Pay V3 签名与请求
 function wxV3Auth(method, urlPath, body) {
@@ -4229,7 +4235,7 @@ function wxPaySign(params) {
 }
 
 // V3 平台公钥（用 PEM 格式），用于验回调签名。需在 env 配置 WX_PLATFORM_PUBLIC_KEY
-const WX_PLATFORM_PUBLIC_KEY = (process.env.WX_PLATFORM_PUBLIC_KEY || '').replace(/\\n/g, '\n')
+let WX_PLATFORM_PUBLIC_KEY = (process.env.WX_PLATFORM_PUBLIC_KEY || '').replace(/\\n/g, '\n')
 
 // V3 回调验签：根据微信请求头 + body 校验
 function wxV3VerifyCallback(headers, body) {
@@ -6645,7 +6651,7 @@ app.post('/miniapi/pay/unified', miniAuth, async (req, res) => {
     }
 
     const totalFee = Math.round(parseFloat(order.total_amount || order.total || 0) * 100) // 转分
-    const notifyUrl = 'https://erp-server-xsji.onrender.com/miniapi/pay/notify'
+    const notifyUrl = `${PUBLIC_BASE_URL}/miniapi/pay/notify`
 
     if (totalFee <= 0) {
       const updOrder = (await pool.query(`UPDATE mini_orders SET status=1, paid_at=NOW() WHERE id=$1 AND status=0 RETURNING *`, [order.id])).rows[0]
@@ -6771,6 +6777,11 @@ app.post('/miniapi/pay/notify', async (req, res) => {
           [earnPoints, parseFloat(updOrder.total_amount || updOrder.total || 0), newLevel, updOrder.user_id])
         await pool.query(`INSERT INTO mini_points_log (user_id,points,type,remark,order_id,created_at) VALUES ($1,$2,'earn','消费送积分',$3,NOW())`,
           [updOrder.user_id, earnPoints, updOrder.id])
+      } else {
+        // 官网订单没有小程序用户：不发积分/订阅消息，但老板通知和 ERP 实时推送照发
+        const paidItems = (await pool.query(`SELECT goods_name, qty FROM mini_order_items WHERE order_id=$1`, [updOrder.id])).rows
+        notifyAdminNewOrder(updOrder, paidItems).catch(() => {})
+        publishMiniOrderEvent(updOrder, paidItems)
       }
     }
     return res.json({ code: 'SUCCESS', message: 'OK' })
@@ -6778,6 +6789,491 @@ app.post('/miniapi/pay/notify', async (req, res) => {
     console.error('[pay/notify V3] error:', e.message)
     return res.status(500).json({ code: 'FAIL', message: e.message })
   }
+})
+
+// ─── 收款设置（每家客户在 ERP 里自己填商户号/证书，存自己库里）─────────────────
+// 敏感字段（私钥、APIv3 密钥）AES-256-GCM 加密后入库，接口永远只回掩码。
+// 共用后端（试用版，shops 表里不止一家）不允许配置：mini_orders 没有按店铺隔离，
+// 一家的商户号会收到别家的订单钱。
+function paySecretKey() {
+  return require('crypto').createHash('sha256').update(process.env.PAY_CONFIG_KEY || JWT_SECRET).digest()
+}
+function encryptPaySecret(plain) {
+  if (!plain) return ''
+  const crypto = require('crypto')
+  const iv = crypto.randomBytes(12)
+  const c = crypto.createCipheriv('aes-256-gcm', paySecretKey(), iv)
+  const enc = Buffer.concat([c.update(String(plain), 'utf8'), c.final()])
+  return ['v1', iv.toString('base64'), c.getAuthTag().toString('base64'), enc.toString('base64')].join(':')
+}
+function decryptPaySecret(blob) {
+  if (!blob) return ''
+  const [ver, iv, tag, data] = String(blob).split(':')
+  if (ver !== 'v1') return ''
+  const d = require('crypto').createDecipheriv('aes-256-gcm', paySecretKey(), Buffer.from(iv, 'base64'))
+  d.setAuthTag(Buffer.from(tag, 'base64'))
+  return Buffer.concat([d.update(Buffer.from(data, 'base64')), d.final()]).toString('utf8')
+}
+const normPem = v => String(v || '').replace(/\\n/g, '\n').replace(/\r/g, '').trim()
+
+async function ensurePaySettingsTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS pay_settings (
+      shop_id INTEGER PRIMARY KEY,
+      wx_appid VARCHAR(40) DEFAULT '',
+      wx_mchid VARCHAR(40) DEFAULT '',
+      wx_cert_serial VARCHAR(80) DEFAULT '',
+      wx_private_key_enc TEXT DEFAULT '',
+      wx_apiv3_key_enc TEXT DEFAULT '',
+      wx_pub_key_id VARCHAR(80) DEFAULT '',
+      wx_platform_public_key TEXT DEFAULT '',
+      updated_at TIMESTAMP DEFAULT NOW(),
+      updated_by VARCHAR(60) DEFAULT ''
+    )`)
+}
+
+// 把库里的配置覆盖到运行时变量；没填的字段保留环境变量的值
+function applyPaySettings(row) {
+  if (!row) return
+  try {
+    if (row.wx_appid) WX_PAY_APPID = row.wx_appid
+    if (row.wx_mchid) WX_MCH_ID = row.wx_mchid
+    if (row.wx_cert_serial) WX_MCH_CERT_SERIAL = row.wx_cert_serial
+    if (row.wx_pub_key_id) WX_MCH_PUBLIC_KEY_ID = row.wx_pub_key_id
+    if (row.wx_platform_public_key) WX_PLATFORM_PUBLIC_KEY = normPem(row.wx_platform_public_key)
+    const pk = decryptPaySecret(row.wx_private_key_enc)
+    if (pk) WX_MCH_PRIVATE_KEY = normPem(pk)
+    const v3 = decryptPaySecret(row.wx_apiv3_key_enc)
+    if (v3) WX_API_V3_KEY = v3
+  } catch (e) {
+    console.error('[pay settings] apply failed (PAY_CONFIG_KEY/JWT_SECRET 变了？):', e.message)
+  }
+}
+
+async function loadPaySettings() {
+  await ensurePaySettingsTable()
+  const row = (await pool.query(`SELECT * FROM pay_settings WHERE shop_id=1`)).rows[0]
+  applyPaySettings(row)
+  return row
+}
+;(async () => {
+  try { await loadPaySettings() } catch (e) { console.log('pay settings init:', e.message) }
+})()
+
+async function isSharedBackend() {
+  const n = (await pool.query(`SELECT COUNT(*)::int AS n FROM shops`).catch(() => ({ rows: [{ n: 1 }] }))).rows[0].n
+  return n > 1
+}
+
+function requireOwner(req, res) {
+  if (!req.admin?.is_owner) { fail(res, '只有老板账号可以查看和修改收款设置', 403); return false }
+  if (Number(req.admin.shop_id || 1) !== 1) { fail(res, '当前账号不能配置收款', 403); return false }
+  return true
+}
+
+const mask = (v, keep = 4) => (v ? (v.length <= keep * 2 ? '已填写' : `${v.slice(0, keep)}****${v.slice(-keep)}`) : '')
+
+app.get('/adminapi/system/PaySettings/index', auth, async (req, res) => {
+  try {
+    if (!requireOwner(req, res)) return
+    await ensurePaySettingsTable()
+    const row = (await pool.query(`SELECT * FROM pay_settings WHERE shop_id=1`)).rows[0] || {}
+    return ok(res, {
+      shared_backend: await isSharedBackend(),
+      notify_url: `${PUBLIC_BASE_URL}/miniapi/pay/notify`,
+      wx_appid: row.wx_appid || '',
+      wx_mchid: row.wx_mchid || '',
+      wx_cert_serial: row.wx_cert_serial || '',
+      wx_pub_key_id: row.wx_pub_key_id || '',
+      has_private_key: !!row.wx_private_key_enc,
+      has_apiv3_key: !!row.wx_apiv3_key_enc,
+      has_platform_public_key: !!row.wx_platform_public_key,
+      // 没在后台填、但服务器环境变量里有的，告诉老板「正在用服务器配置」
+      env_fallback: {
+        wx_mchid: !row.wx_mchid && !!process.env.WX_MCH_ID,
+        private_key: !row.wx_private_key_enc && !!process.env.WX_MCH_PRIVATE_KEY,
+        apiv3_key: !row.wx_apiv3_key_enc && !!process.env.WX_API_V3_KEY,
+        platform_public_key: !row.wx_platform_public_key && !!process.env.WX_PLATFORM_PUBLIC_KEY,
+      },
+      active: {
+        appid: WX_PAY_APPID || '',
+        mchid: WX_MCH_ID || '',
+        cert_serial: mask(WX_MCH_CERT_SERIAL, 6),
+        ready: !!(WX_MCH_ID && WX_MCH_PRIVATE_KEY && WX_MCH_CERT_SERIAL && WX_API_V3_KEY && WX_PLATFORM_PUBLIC_KEY),
+      },
+      updated_at: row.updated_at || null,
+      updated_by: row.updated_by || '',
+    })
+  } catch (e) { fail(res, e.message) }
+})
+
+// 只更新传了的字段；密钥类字段留空 = 不改
+app.post('/adminapi/system/PaySettings/save', auth, async (req, res) => {
+  try {
+    if (!requireOwner(req, res)) return
+    if (await isSharedBackend()) return fail(res, '试用版是多家共用的服务器，不能配置在线收款。开通独立版后再来设置。')
+    const b = req.body || {}
+    const sets = [], vals = []
+    const put = (col, v) => { vals.push(v); sets.push(`${col}=$${vals.length}`) }
+    const str = (v, max) => String(v ?? '').trim().slice(0, max)
+    if (b.wx_appid !== undefined) {
+      const v = str(b.wx_appid, 40)
+      if (v && !/^wx[0-9a-f]{16}$/i.test(v)) return fail(res, 'AppID 格式不对，应为 wx 开头 18 位')
+      put('wx_appid', v)
+    }
+    if (b.wx_mchid !== undefined) {
+      const v = str(b.wx_mchid, 40)
+      if (v && !/^\d{8,12}$/.test(v)) return fail(res, '商户号应为 8～12 位数字')
+      put('wx_mchid', v)
+    }
+    if (b.wx_cert_serial !== undefined) put('wx_cert_serial', str(b.wx_cert_serial, 80).toUpperCase())
+    if (b.wx_pub_key_id !== undefined) put('wx_pub_key_id', str(b.wx_pub_key_id, 80))
+    if (b.wx_private_key) {
+      const pem = normPem(b.wx_private_key)
+      if (!/-----BEGIN (RSA )?PRIVATE KEY-----/.test(pem)) return fail(res, '商户私钥应是 apiclient_key.pem 的完整内容（含 BEGIN/END 行）')
+      try { require('crypto').createPrivateKey(pem) } catch { return fail(res, '商户私钥无法解析，请粘贴完整的 apiclient_key.pem') }
+      put('wx_private_key_enc', encryptPaySecret(pem))
+    }
+    if (b.wx_apiv3_key) {
+      const v = String(b.wx_apiv3_key).trim()
+      if (Buffer.byteLength(v) !== 32) return fail(res, 'APIv3 密钥必须是 32 位')
+      put('wx_apiv3_key_enc', encryptPaySecret(v))
+    }
+    if (b.wx_platform_public_key) {
+      const pem = normPem(b.wx_platform_public_key)
+      try { require('crypto').createPublicKey(pem) } catch { return fail(res, '微信支付公钥无法解析，请粘贴 pub_key.pem 的完整内容') }
+      put('wx_platform_public_key', pem)
+    }
+    if (!sets.length) return fail(res, '没有要保存的内容')
+    put('updated_by', String(req.admin.name || req.admin.account || '').slice(0, 60))
+    await ensurePaySettingsTable()
+    await pool.query(`INSERT INTO pay_settings (shop_id) VALUES (1) ON CONFLICT (shop_id) DO NOTHING`)
+    await pool.query(`UPDATE pay_settings SET ${sets.join(',')}, updated_at=NOW() WHERE shop_id=1`, vals)
+    await loadPaySettings()
+    return ok(res, {}, '已保存')
+  } catch (e) { fail(res, e.message) }
+})
+
+// 测试连接：查一个不存在的订单。返回「订单不存在」= 商户号/证书/私钥都对
+app.post('/adminapi/system/PaySettings/test', auth, async (req, res) => {
+  try {
+    if (!requireOwner(req, res)) return
+    if (!WX_MCH_ID || !WX_MCH_PRIVATE_KEY || !WX_MCH_CERT_SERIAL) return fail(res, '商户号、证书序列号、商户私钥还没填全')
+    const r = await wxV3Get(`/v3/pay/transactions/out-trade-no/PAYTEST${Date.now()}?mchid=${WX_MCH_ID}`)
+    const code = r.body?.code || ''
+    if (r.status === 404 || code === 'ORDER_NOT_EXIST') {
+      const missing = []
+      if (!WX_API_V3_KEY) missing.push('APIv3 密钥')
+      if (!WX_PLATFORM_PUBLIC_KEY) missing.push('微信支付公钥')
+      // 再试一下 Native 扫码权限：向微信要一张 0.01 元的测试支付码，拿到就立刻关单。
+      // 只在微信侧生成预支付单，不建 ERP 订单、不动库存，没人扫就不会扣钱。
+      const testNo = `PAYTEST${Date.now()}`
+      const nat = await wxV3Post('/v3/pay/transactions/native', {
+        appid: WX_PAY_APPID, mchid: WX_MCH_ID, description: '收款设置连接测试', out_trade_no: testNo,
+        time_expire: webTimeExpire(new Date(Date.now() + 5 * 60 * 1000)),
+        notify_url: `${PUBLIC_BASE_URL}/miniapi/pay/notify`, amount: { total: 1, currency: 'CNY' },
+      })
+      let native = 'ok'
+      if (nat?.code_url) {
+        wxV3Post(`/v3/pay/transactions/out-trade-no/${testNo}/close`, { mchid: WX_MCH_ID }).catch(() => {})
+      } else {
+        native = nat?.code === 'NO_AUTH' ? 'no_auth' : (nat?.message || nat?.code || 'unknown')
+        console.warn('[pay settings test] native:', JSON.stringify(nat))
+      }
+      const notes = []
+      if (missing.length) notes.push(`还缺：${missing.join('、')}（收不到付款通知）`)
+      if (native === 'no_auth') notes.push('商户号还没开通「Native 支付」，官网扫码付款用不了：去 pay.weixin.qq.com → 产品中心申请开通')
+      else if (native !== 'ok') notes.push(`官网扫码支付测试失败：${native}`)
+      return ok(res, { connected: true, missing, native },
+        notes.length ? `商户号和私钥验证通过。${notes.join('；')}` : '连接成功：小程序和官网扫码都可以收款')
+    }
+    const reasons = {
+      SIGN_ERROR: '签名错误：证书序列号和商户私钥对不上',
+      INVALID_REQUEST: '请求无效：请检查证书序列号',
+      MCH_NOT_EXISTS: '商户号不存在',
+      NO_AUTH: '商户号没有这个权限',
+    }
+    return fail(res, `连接失败：${reasons[code] || r.body?.message || `HTTP ${r.status}`}`)
+  } catch (e) { fail(res, `连接失败：${e.message}`) }
+})
+
+// ─── 官网（品牌站 H5）零售下单 + 微信 Native 扫码支付 ─────────────────────────
+// 官网顾客不登录，订单挂在 user_id=0、source='web' 上，跟小程序订单同一张表，
+// ERP「小程序订单」里一起处理发货；支付回调复用 /miniapi/pay/notify。
+// 访问凭证是下单时发的 web_token（只有下单的浏览器知道），防止按单号遍历。
+const WEB_ORDER_PAY_MINUTES = 15         // 订单保留时长（页面倒计时 5 分钟，超时后还能在订单查询里继续付）
+const WEB_FREE_SHIPPING_THRESHOLD = 500  // 跟官网结账页显示的规则一致
+const WEB_SHIPPING_FEE = 25
+const WEB_PENDING_LIMIT = 3              // 同一手机号 30 分钟内最多挂 3 张待付款单，防止匿名接口把库存锁光
+
+;(async () => {
+  try {
+    await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS source VARCHAR(20) DEFAULT 'mini'`)
+    await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS web_token VARCHAR(64) DEFAULT ''`)
+    await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS web_code_url TEXT DEFAULT ''`)
+    await pool.query(`ALTER TABLE mini_orders ADD COLUMN IF NOT EXISTS freight_amount NUMERIC(10,2) DEFAULT 0`)
+  } catch (e) { console.log('web order columns init:', e.message) }
+})()
+
+function webTimeExpire(date) {
+  // 微信要 RFC3339 带时区：2026-10-08T15:30:00+08:00
+  return new Date(date.getTime() + 8 * 3600 * 1000).toISOString().slice(0, 19) + '+08:00'
+}
+
+// 付款成功后的收尾：改状态 + 通知老板 + 推送 ERP 实时订单。回调和主动查单共用。
+async function markWebOrderPaid(orderNo, transactionId) {
+  const upd = (await pool.query(
+    `UPDATE mini_orders SET status=1, paid_at=NOW(), wx_transaction_id=$2 WHERE order_no=$1 AND status=0 RETURNING *`,
+    [orderNo, transactionId || '']
+  )).rows[0]
+  if (!upd) return null
+  const items = (await pool.query(`SELECT goods_name, qty FROM mini_order_items WHERE order_id=$1`, [upd.id])).rows
+  notifyAdminNewOrder(upd, items).catch(() => {})
+  publishMiniOrderEvent(upd, items)
+  return upd
+}
+
+async function cancelWebOrder(orderId, reason) {
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    const order = (await client.query(`SELECT * FROM mini_orders WHERE id=$1 AND status=0 FOR UPDATE`, [orderId])).rows[0]
+    if (order) {
+      await releaseOrderBenefits(client, order, reason)
+      await client.query(`UPDATE mini_orders SET status=4, cancel_reason=$2 WHERE id=$1`, [orderId, reason])
+    }
+    await client.query('COMMIT')
+  } catch (e) {
+    await client.query('ROLLBACK')
+    console.error('[web order cancel]', e.message)
+  } finally {
+    client.release()
+  }
+}
+
+app.use('/miniapi/web', (req, res, next) => {
+  try { global.maybeSweepExpiredOrders?.() } catch { /* 不影响请求 */ }
+  next()
+})
+
+// 同一 IP 10 分钟最多下 10 单（内存计数，重启清零即可）。手机号限额防不住换号刷单锁库存
+const webOrderIpHits = new Map()
+function webOrderIpLimited(req) {
+  const ip = String(req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for'] || req.ip || '').split(',')[0].trim()
+  if (!ip) return false
+  const now = Date.now()
+  const hits = (webOrderIpHits.get(ip) || []).filter(t => now - t < 10 * 60 * 1000)
+  if (hits.length >= 10) return true
+  hits.push(now)
+  webOrderIpHits.set(ip, hits)
+  if (webOrderIpHits.size > 5000) webOrderIpHits.clear()
+  return false
+}
+
+// 官网下单：服务端按商品现价重算，扣库存，向微信要 Native 支付码
+app.post('/miniapi/web/order/create', async (req, res) => {
+  try {
+    if (webOrderIpLimited(req)) return fail(res, '下单太频繁，请稍后再试')
+    const { items, contact = {}, remark = '' } = req.body || {}
+    if (!Array.isArray(items) || !items.length) return fail(res, '购物车是空的')
+    const name = String(contact.name || '').trim().slice(0, 30)
+    const mobile = String(contact.mobile || '').trim()
+    const region = String(contact.region || '').trim().slice(0, 60)
+    const detail = String(contact.address || '').trim().slice(0, 120)
+    const postcode = String(contact.postcode || '').trim().slice(0, 10)
+    if (!name || !region || !detail) return fail(res, '请填写收货人和收货地址')
+    if (!/^1[3-9]\d{9}$/.test(mobile)) return fail(res, '请输入正确的11位手机号')
+    if (!WX_MCH_ID || !WX_MCH_PRIVATE_KEY || !WX_MCH_CERT_SERIAL) return fail(res, '在线支付暂未开通，请联系客服下单')
+    if (await isSharedBackend()) return fail(res, '本店暂未开通在线支付，请联系客服下单')
+
+    const pending = (await pool.query(
+      `SELECT COUNT(*)::int AS n FROM mini_orders
+       WHERE source='web' AND status=0 AND address->>'phone'=$1 AND created_at > NOW() - INTERVAL '30 minutes'`,
+      [mobile]
+    )).rows[0].n
+    if (pending >= WEB_PENDING_LIMIT) return fail(res, '您有多笔订单待付款，请先完成付款或稍后再试')
+
+    const qtyById = new Map()
+    for (const it of items) {
+      const id = parseInt(it.goods_id)
+      const qty = Math.min(999, Math.max(1, parseInt(it.qty) || 1))
+      if (!id) return fail(res, '商品信息有误，请刷新页面后重新加入购物车')
+      qtyById.set(id, (qtyById.get(id) || 0) + qty)
+    }
+    const goodsRows = (await pool.query(
+      `SELECT id, goods_name AS name, sell_price AS price, spec, owner_type
+       FROM goods WHERE id = ANY($1) AND status=1 AND can_sale=1`,
+      [[...qtyById.keys()]]
+    )).rows
+    const goodsMap = new Map(goodsRows.map(g => [Number(g.id), g]))
+    const validItems = []
+    let goodsTotal = 0
+    for (const [id, qty] of qtyById) {
+      const g = goodsMap.get(id)
+      if (!g) return fail(res, '有商品已下架，请刷新页面后重新下单')
+      if ((g.owner_type || 'official') !== 'official') return fail(res, `商品「${g.name}」不支持官网购买`)
+      const price = parseFloat(g.price) || 0
+      if (price <= 0) return fail(res, `商品「${g.name}」暂未定价，请联系客服`)
+      goodsTotal += price * qty
+      validItems.push({ goods_id: id, goods_name: g.name, spec: typeof g.spec === 'string' && !/^[\[{]/.test(g.spec) ? g.spec.slice(0, 60) : '', price, qty })
+    }
+    goodsTotal = Math.round(goodsTotal * 100) / 100
+    const freight = goodsTotal >= WEB_FREE_SHIPPING_THRESHOLD ? 0 : WEB_SHIPPING_FEE
+    const total = Math.round((goodsTotal + freight) * 100) / 100
+
+    const crypto = require('crypto')
+    const token = crypto.randomBytes(24).toString('hex')
+    const orderNo = genOrderNo('WEB')
+    const expiresAt = new Date(Date.now() + WEB_ORDER_PAY_MINUTES * 60 * 1000)
+    const address = { name, phone: mobile, detail: `${region} ${detail}`, region, postcode }
+
+    const client = await pool.connect()
+    let order
+    try {
+      await client.query('BEGIN')
+      const stockSnapshot = []
+      for (const item of validItems) {
+        const inv = (await client.query(
+          `SELECT qty, warehouse_id, warehouse_name FROM stock_inventory
+           WHERE goods_id=$1 ORDER BY warehouse_id ASC LIMIT 1 FOR UPDATE`,
+          [item.goods_id]
+        )).rows[0]
+        const before = inv ? parseFloat(inv.qty) : 0
+        if (!inv || before < item.qty) {
+          const err = new Error(`商品「${item.goods_name}」库存不足${inv ? `，剩余 ${before}` : ''}`)
+          err.userMessage = err.message
+          throw err
+        }
+        stockSnapshot.push({ ...item, warehouse_id: inv.warehouse_id, warehouse_name: inv.warehouse_name, before })
+      }
+      order = (await client.query(
+        `INSERT INTO mini_orders (order_no, user_id, total_amount, original_amount, discount, address, remark,
+           delivery_type, payment_expires_at, source, web_token, freight_amount, status, created_at)
+         VALUES ($1,0,$2,$3,1,$4,$5,0,$6,'web',$7,$8,0,NOW()) RETURNING *`,
+        [orderNo, total, goodsTotal, JSON.stringify(address), `[官网] ${String(remark).trim().slice(0, 200)}`.trim(), expiresAt, token, freight]
+      )).rows[0]
+      for (const item of validItems) {
+        await client.query(
+          `INSERT INTO mini_order_items (order_id, goods_id, goods_name, spec, price, qty, seller_type)
+           VALUES ($1,$2,$3,$4,$5,$6,'official')`,
+          [order.id, item.goods_id, item.goods_name, item.spec, item.price, item.qty]
+        )
+      }
+      for (const s of stockSnapshot) {
+        const after = s.before - s.qty
+        await client.query(
+          `UPDATE stock_inventory SET qty=$1, update_time=NOW() WHERE goods_id=$2 AND warehouse_id=$3`,
+          [after, s.goods_id, s.warehouse_id]
+        )
+        await client.query(
+          `INSERT INTO stock_flow (goods_id, goods_name, warehouse_id, warehouse_name, type, qty, before_qty, after_qty, order_no, remark)
+           VALUES ($1,$2,$3,$4,'mini_order',$5,$6,$7,$8,'官网下单扣减')`,
+          [s.goods_id, s.goods_name, s.warehouse_id, s.warehouse_name || '', -s.qty, s.before, after, orderNo]
+        )
+      }
+      await client.query('COMMIT')
+    } catch (e) {
+      await client.query('ROLLBACK')
+      if (e.userMessage) return fail(res, e.userMessage)
+      throw e
+    } finally {
+      client.release()
+    }
+
+    const description = (validItems.map(i => i.goods_name).join('、') || '牧区纯坊商品').slice(0, 120)
+    const wxRes = await wxV3Post('/v3/pay/transactions/native', {
+      appid: WX_PAY_APPID,
+      mchid: WX_MCH_ID,
+      description,
+      out_trade_no: orderNo,
+      time_expire: webTimeExpire(expiresAt),
+      notify_url: `${PUBLIC_BASE_URL}/miniapi/pay/notify`,
+      amount: { total: Math.round(total * 100), currency: 'CNY' },
+    })
+    if (!wxRes?.code_url) {
+      console.error('[web native pay] failed:', JSON.stringify(wxRes))
+      await cancelWebOrder(order.id, '官网下单：微信支付码生成失败')
+      const reason = wxRes?.code === 'NO_AUTH' ? '商户号未开通 Native 支付' : (wxRes?.message || '未知原因')
+      return fail(res, `暂时无法生成支付码（${reason}），请稍后再试或联系客服`)
+    }
+    await pool.query(`UPDATE mini_orders SET web_code_url=$2 WHERE id=$1`, [order.id, wxRes.code_url])
+
+    return ok(res, {
+      order_no: orderNo, token, code_url: wxRes.code_url,
+      total_amount: total, goods_amount: goodsTotal, freight_amount: freight,
+      expires_at: expiresAt.toISOString(),
+      items: validItems.map(i => ({ goods_name: i.goods_name, qty: i.qty, price: i.price })),
+    })
+  } catch (e) { fail(res, e.message) }
+})
+
+// 官网轮询付款状态。check=1 时如果还没收到回调，主动向微信查一次（前端每 ~10 秒带一次）
+app.get('/miniapi/web/order/status', async (req, res) => {
+  try {
+    const no = String(req.query.no || '')
+    const token = String(req.query.token || '')
+    if (!no || !token) return fail(res, '参数错误')
+    let order = (await pool.query(
+      `SELECT id, order_no, status, total_amount, payment_expires_at, web_code_url FROM mini_orders
+       WHERE order_no=$1 AND source='web' AND web_token=$2 LIMIT 1`,
+      [no, token]
+    )).rows[0]
+    if (!order) return fail(res, '订单不存在')
+    if (Number(order.status) === 0 && req.query.check === '1') {
+      try {
+        const q = await wxV3QueryOrder(order.order_no)
+        if (q?.status === 200 && q.body?.trade_state === 'SUCCESS'
+            && parseInt(q.body.amount?.total) === Math.round(parseFloat(order.total_amount) * 100)) {
+          if (await markWebOrderPaid(order.order_no, q.body.transaction_id)) order = { ...order, status: 1 }
+        }
+      } catch (e) { console.warn('[web order status] wx query failed:', e.message) }
+    }
+    if (Number(order.status) === 0 && order.payment_expires_at && new Date(order.payment_expires_at) <= new Date()) {
+      await expirePendingOrder(order.id)
+      order = (await pool.query(`SELECT id, order_no, status, total_amount, payment_expires_at, web_code_url FROM mini_orders WHERE id=$1`, [order.id])).rows[0]
+    }
+    const status = Number(order.status)
+    return ok(res, {
+      order_no: order.order_no,
+      status,
+      paid: status >= 1 && status <= 3,
+      total_amount: parseFloat(order.total_amount),
+      expires_at: order.payment_expires_at,
+      code_url: status === 0 ? order.web_code_url : '',
+    })
+  } catch (e) { fail(res, e.message) }
+})
+
+// 官网「订单查询」：按收货手机号查。只回订单号/时间/状态/商品/金额，不回地址和姓名
+app.get('/miniapi/web/order/lookup', async (req, res) => {
+  try {
+    const mobile = String(req.query.mobile || '').trim()
+    if (!/^1[3-9]\d{9}$/.test(mobile)) return fail(res, '请输入正确的11位手机号')
+    const rows = (await pool.query(
+      `SELECT * FROM mini_orders
+       WHERE address->>'phone'=$1 AND deleted_at IS NULL
+       ORDER BY id DESC LIMIT 20`,
+      [mobile]
+    )).rows
+    const ids = rows.map(r => r.id)
+    const items = ids.length
+      ? (await pool.query(`SELECT order_id, goods_name, qty, price FROM mini_order_items WHERE order_id = ANY($1)`, [ids])).rows
+      : []
+    return ok(res, {
+      rows: rows.map(r => ({
+        order_no: r.order_no,
+        status: Number(r.status),
+        total_amount: parseFloat(r.total_amount || 0),
+        freight_amount: parseFloat(r.freight_amount || 0),
+        source: r.source || 'mini',
+        created_at: r.created_at,
+        paid_at: r.paid_at,
+        tracking_no: r.tracking_no || '',
+        express_company: r.express_company || '',
+        items: items.filter(i => i.order_id === r.id).map(i => ({ goods_name: i.goods_name, qty: i.qty, price: parseFloat(i.price) })),
+      })),
+    })
+  } catch (e) { fail(res, e.message) }
 })
 
 // ─── 会员系统 ─────────────────────────────────────────────────────────────────
@@ -7013,7 +7509,7 @@ app.post('/miniapi/member/buy-vip', miniAuth, async (req, res) => {
       mchid: WX_MCH_ID,
       description: '牧区纯坊品牌直营',
       out_trade_no: orderNo,
-      notify_url: 'https://erp-server-xsji.onrender.com/miniapi/pay/vip-notify',
+      notify_url: `${PUBLIC_BASE_URL}/miniapi/pay/vip-notify`,
       amount: { total: totalFee, currency: 'CNY' },
       payer: { openid: req.miniUser.openid },
       attach: String(req.miniUser.id),

@@ -6850,9 +6850,21 @@ function applyPaySettings(row) {
   }
 }
 
+// 先退回环境变量，再叠库里的：老板清空某个字段后能立刻回到服务器配置，不用等重启
+function resetPayRuntimeFromEnv() {
+  WX_MCH_ID = process.env.WX_MCH_ID || ''
+  WX_MCH_CERT_SERIAL = process.env.WX_MCH_CERT_SERIAL || ''
+  WX_API_V3_KEY = process.env.WX_API_V3_KEY || ''
+  WX_MCH_PUBLIC_KEY_ID = process.env.WX_MCH_PUBLIC_KEY_ID || ''
+  WX_MCH_PRIVATE_KEY = (process.env.WX_MCH_PRIVATE_KEY || '').replace(/\\n/g, '\n')
+  WX_PAY_APPID = process.env.WX_PAY_APPID || WX_APPID
+  WX_PLATFORM_PUBLIC_KEY = (process.env.WX_PLATFORM_PUBLIC_KEY || '').replace(/\\n/g, '\n')
+}
+
 async function loadPaySettings() {
   await ensurePaySettingsTable()
   const row = (await pool.query(`SELECT * FROM pay_settings WHERE shop_id=1`)).rows[0]
+  resetPayRuntimeFromEnv()
   applyPaySettings(row)
   return row
 }

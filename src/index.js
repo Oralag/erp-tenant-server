@@ -4452,7 +4452,7 @@ function parseBrandGoods(row) {
   const rawImg = brand.image || (row.images ? row.images.split(',')[0] : '') || ''
   return {
     id: row.id,
-    name: row.goods_name || '',
+    name: (typeof brand.displayName === 'string' && brand.displayName.trim()) || row.goods_name || '',
     image_url: toAbsUrl(rawImg),
     header_images: (brand.headerImages || []).map(toAbsUrl),
     detail_images: (brand.detailImages && brand.detailImages.length

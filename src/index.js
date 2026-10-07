@@ -6866,8 +6866,8 @@ async function isSharedBackend() {
 }
 
 function requireOwner(req, res) {
-  if (!req.admin?.is_owner) { fail(res, '只有老板账号可以查看和修改收款设置', 403); return false }
-  if (Number(req.admin.shop_id || 1) !== 1) { fail(res, '当前账号不能配置收款', 403); return false }
+  if (!req.admin?.is_owner) { fail(res, '只有老板账号可以查看和修改收款设置'); return false }
+  if (Number(req.admin.shop_id || 1) !== 1) { fail(res, '当前账号不能配置收款'); return false }
   return true
 }
 

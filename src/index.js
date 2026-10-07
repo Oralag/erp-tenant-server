@@ -7276,6 +7276,120 @@ app.get('/miniapi/web/order/lookup', async (req, res) => {
   } catch (e) { fail(res, e.message) }
 })
 
+// ─── 官网留言：批发询价 / 采购商申请 / 支持留言 ─────────────────────────────
+// 以前这三个表单直接调要登录的 ERP 接口，顾客点提交永远 401，前端还提示「提交成功」，
+// 留言全部丢失。现在统一存 web_leads，并推送给老板；ERP「小程序订单」页能看到。
+const WEB_LEAD_TYPES = { inquiry: '批发询价', wholesale_apply: '采购商申请', support: '支持留言' }
+const webLeadIpHits = new Map()
+
+;(async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS web_leads (
+        id SERIAL PRIMARY KEY,
+        type VARCHAR(30) NOT NULL,
+        name VARCHAR(60) DEFAULT '',
+        mobile VARCHAR(20) DEFAULT '',
+        company VARCHAR(120) DEFAULT '',
+        email VARCHAR(120) DEFAULT '',
+        content TEXT DEFAULT '',
+        items JSONB DEFAULT '[]',
+        amount NUMERIC(12,2) DEFAULT 0,
+        handled BOOLEAN DEFAULT FALSE,
+        ip VARCHAR(60) DEFAULT '',
+        created_at TIMESTAMP DEFAULT NOW()
+      )`)
+  } catch (e) { console.log('web_leads init:', e.message) }
+})()
+
+app.post('/miniapi/web/lead', async (req, res) => {
+  try {
+    const b = req.body || {}
+    const type = String(b.type || '')
+    if (!WEB_LEAD_TYPES[type]) return fail(res, '留言类型不对')
+    const ip = String(req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for'] || req.ip || '').split(',')[0].trim()
+    const now = Date.now()
+    const hits = (webLeadIpHits.get(ip) || []).filter(t => now - t < 10 * 60 * 1000)
+    if (hits.length >= 10) return fail(res, '提交太频繁，请稍后再试')
+    hits.push(now); webLeadIpHits.set(ip, hits)
+    if (webLeadIpHits.size > 5000) webLeadIpHits.clear()
+
+    const name = String(b.name || '').trim().slice(0, 60)
+    const mobile = String(b.mobile || '').trim()
+    const company = String(b.company || '').trim().slice(0, 120)
+    const email = String(b.email || '').trim().slice(0, 120)
+    const content = String(b.content || '').trim().slice(0, 2000)
+    if (!name) return fail(res, '请填写姓名或联系人')
+    if (mobile && !/^1[3-9]\d{9}$/.test(mobile)) return fail(res, '请输入正确的11位手机号')
+    if (type !== 'support' && !mobile) return fail(res, '请填写手机号')
+    if (type === 'support' && !content) return fail(res, '请填写问题描述')
+    if (type !== 'support' && !company) return fail(res, '请填写公司名称')
+    const items = Array.isArray(b.items)
+      ? b.items.slice(0, 100).map(i => ({
+          goods_id: parseInt(i.goods_id) || 0,
+          goods_name: String(i.goods_name || '').slice(0, 80),
+          qty: Math.max(0, parseInt(i.qty) || 0),
+          price: Math.max(0, parseFloat(i.price) || 0),
+        }))
+      : []
+    const amount = Math.round(items.reduce((n, i) => n + i.price * i.qty, 0) * 100) / 100
+
+    const row = (await pool.query(
+      `INSERT INTO web_leads (type,name,mobile,company,email,content,items,amount,ip)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id, created_at`,
+      [type, name, mobile, company, email, content, JSON.stringify(items), amount, ip.slice(0, 60)]
+    )).rows[0]
+
+    const key = process.env.SERVER_JIANG_KEY
+    if (key) {
+      const lines = [
+        `类型：${WEB_LEAD_TYPES[type]}`,
+        company ? `公司：${company}` : '',
+        `联系人：${name} ${mobile}`.trim(),
+        email ? `邮箱：${email}` : '',
+        items.length ? `商品：${items.map(i => `${i.goods_name}×${i.qty}`).join('、').slice(0, 300)}` : '',
+        amount ? `参考金额：¥${amount.toFixed(2)}` : '',
+        content ? `内容：${content.slice(0, 500)}` : '',
+        '',
+        '请登录 ERP → 小程序 → 小程序订单 →「官网留言」查看。',
+      ].filter(Boolean).join('\n')
+      fetch(`https://sctapi.ftqq.com/${key}.send`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: `📩 官网${WEB_LEAD_TYPES[type]}`, desp: lines }),
+      }).catch(() => {})
+    }
+    return ok(res, { id: row.id, no: `LD${String(row.id).padStart(6, '0')}` })
+  } catch (e) { fail(res, e.message) }
+})
+
+app.get('/adminapi/mini/orders/web-leads', auth, async (req, res) => {
+  try {
+    const page = Math.max(1, parseInt(req.query.page) || 1)
+    const size = Math.min(100, Math.max(1, parseInt(req.query.list_rows) || 20))
+    const conds = [], vals = []
+    if (req.query.type && WEB_LEAD_TYPES[req.query.type]) { vals.push(req.query.type); conds.push(`type=$${vals.length}`) }
+    if (req.query.handled === '0' || req.query.handled === '1') { vals.push(req.query.handled === '1'); conds.push(`handled=$${vals.length}`) }
+    const where = conds.length ? `WHERE ${conds.join(' AND ')}` : ''
+    const total = (await pool.query(`SELECT COUNT(*)::int AS n FROM web_leads ${where}`, vals)).rows[0].n
+    const unhandled = (await pool.query(`SELECT COUNT(*)::int AS n FROM web_leads WHERE handled=false`)).rows[0].n
+    vals.push(size, (page - 1) * size)
+    const rows = (await pool.query(
+      `SELECT * FROM web_leads ${where} ORDER BY id DESC LIMIT $${vals.length - 1} OFFSET $${vals.length}`, vals
+    )).rows
+    return ok(res, { rows: rows.map(r => ({ ...r, type_text: WEB_LEAD_TYPES[r.type] || r.type })), total, unhandled })
+  } catch (e) { fail(res, e.message) }
+})
+
+app.post('/adminapi/mini/orders/web-leads/handle', auth, async (req, res) => {
+  try {
+    const id = parseInt(req.body?.id)
+    if (!id) return fail(res, '参数错误')
+    await pool.query(`UPDATE web_leads SET handled=$2 WHERE id=$1`, [id, req.body?.handled !== false])
+    return ok(res, {}, '已更新')
+  } catch (e) { fail(res, e.message) }
+})
+
 // ─── 会员系统 ─────────────────────────────────────────────────────────────────
 
 const MEMBER_LEVELS = [

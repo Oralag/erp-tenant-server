@@ -211,6 +211,17 @@ async function backfillMiniOrderShippingToWx(limit = 10) {
   }
 }
 
+// 回调没到、靠主动查微信才发现已付款的订单：同样要通知老板和 ERP
+function notifyLatePaidOrder(order) {
+  if (!order) return
+  pool.query(`SELECT goods_name, qty FROM mini_order_items WHERE order_id=$1`, [order.id])
+    .then(r => {
+      notifyAdminNewOrder(order, r.rows).catch(() => {})
+      publishMiniOrderEvent(order, r.rows)
+    })
+    .catch(e => console.log('admin order notify error:', e.message))
+}
+
 async function notifyAdminNewOrder(order, items = []) {
   const key = process.env.SERVER_JIANG_KEY
   if (!key || !order) return
@@ -5007,10 +5018,11 @@ app.post('/miniapi/order/cancel', miniAuth, async (req, res) => {
         const wxQuery = await wxV3QueryOrder(orderPre.order_no)
         if (wxQuery?.status === 200 && wxQuery.body?.trade_state === 'SUCCESS') {
           // 微信确认已支付：把订单更新为已支付，回调进来后变 noop
-          await pool.query(
-            `UPDATE mini_orders SET status=1, paid_at=NOW(), wx_transaction_id=$2 WHERE id=$1 AND status=0`,
+          const paidOrder = (await pool.query(
+            `UPDATE mini_orders SET status=1, paid_at=NOW(), wx_transaction_id=$2 WHERE id=$1 AND status=0 RETURNING *`,
             [order_id, wxQuery.body.transaction_id || '']
-          )
+          )).rows[0]
+          notifyLatePaidOrder(paidOrder)
           return fail(res, '订单已支付成功，不可取消，请刷新查看')
         }
       } catch (e) {
@@ -7665,11 +7677,12 @@ async function expirePendingOrder(orderId) {
   try {
     const wxQuery = await wxV3QueryOrder(preview.order_no)
     if (wxQuery?.status === 200 && wxQuery.body?.trade_state === 'SUCCESS') {
-      await pool.query(
+      const paidOrder = (await pool.query(
         `UPDATE mini_orders SET status=1,paid_at=NOW(),wx_transaction_id=$2
-         WHERE id=$1 AND status=0`,
+         WHERE id=$1 AND status=0 RETURNING *`,
         [orderId, wxQuery.body.transaction_id || '']
-      )
+      )).rows[0]
+      notifyLatePaidOrder(paidOrder)
       return false
     }
   } catch (e) {

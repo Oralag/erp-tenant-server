@@ -7162,6 +7162,54 @@ async function getWebUser(req) {
   )).rows[0]
   return u || null
 }
+// 官网登录开关：小程序里「确认登录」页（pages/weblogin/index）发布之前，扫码登录走不通，
+// 这时官网照旧不用登录就能下单、按手机号查单；页面一上线自动切成「下单要登录」。
+// 用 check_path 生成一次码来探测页面是否已发布（生成小程序码免费）；env WEB_LOGIN_MODE=on/off 可强制。
+let webLoginReady = { value: false, checkedAt: 0 }
+async function webLoginEnabled() {
+  const mode = String(process.env.WEB_LOGIN_MODE || '').toLowerCase()
+  if (mode === 'on') return true
+  if (mode === 'off') return false
+  const ttl = webLoginReady.value ? 6 * 3600 * 1000 : 10 * 60 * 1000
+  if (Date.now() - webLoginReady.checkedAt < ttl) return webLoginReady.value
+  webLoginReady.checkedAt = Date.now()
+  try {
+    const token = await getWxAccessToken()
+    if (!token) return webLoginReady.value
+    const r = await fetch(`https://api.weixin.qq.com/wxa/getwxacodeunlimit?access_token=${token}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ scene: 'probe', page: 'pages/weblogin/index', check_path: true, env_version: 'release', width: 280 }),
+    })
+    const isImage = (r.headers.get('content-type') || '').includes('image')
+    if (isImage) {
+      if (!webLoginReady.value) console.log('[web login] 小程序登录页已发布，官网下单开始要求登录')
+      webLoginReady.value = true
+    } else {
+      const j = await r.json().catch(() => ({}))
+      // 41030 = 线上版本没有这个页面；其他错误（token 失效等）保持上次结论
+      if (j.errcode === 41030) webLoginReady.value = false
+    }
+  } catch (e) { console.log('[web login] probe failed:', e.message) }
+  return webLoginReady.value
+}
+
+// 登录上线前的旧凭证：收货手机号（退款/物流/查单）或下单时发的 web_token（取消）
+async function legacyWebAccess(req) {
+  if (await webLoginEnabled()) return null
+  const mobile = String(req.body?.mobile || req.query?.mobile || '').trim()
+  const token = String(req.body?.token || '')
+  return { mobile: /^1[3-9]\d{9}$/.test(mobile) ? mobile : '', token }
+}
+function legacyOwns(order, legacy) {
+  if (!order || !legacy) return false
+  const addr = typeof order.address === 'string'
+    ? (() => { try { return JSON.parse(order.address || '{}') } catch { return {} } })()
+    : (order.address || {})
+  if (legacy.mobile && addr.phone === legacy.mobile) return true
+  return !!legacy.token && !!order.web_token && order.web_token === legacy.token
+}
+
 function needWebLogin(res) {
   return res.json({ code: -401, message: '请先登录' })
 }
@@ -7269,6 +7317,9 @@ app.post('/miniapi/web/login/cancel', miniAuth, async (req, res) => {
     return ok(res, {})
   } catch (e) { fail(res, e.message) }
 })
+app.get('/miniapi/web/login/status', async (req, res) => {
+  try { return ok(res, { enabled: await webLoginEnabled() }) } catch (e) { fail(res, e.message) }
+})
 app.get('/miniapi/web/me', async (req, res) => {
   try {
     const u = await getWebUser(req)
@@ -7281,7 +7332,7 @@ app.get('/miniapi/web/me', async (req, res) => {
 app.post('/miniapi/web/order/create', async (req, res) => {
   try {
     const webUser = await getWebUser(req)
-    if (!webUser) return needWebLogin(res)
+    if (!webUser && await webLoginEnabled()) return needWebLogin(res)
     if (webOrderIpLimited(req)) return fail(res, '下单太频繁，请稍后再试')
     const { items, contact = {}, remark = '' } = req.body || {}
     if (!Array.isArray(items) || !items.length) return fail(res, '购物车是空的')
@@ -7359,7 +7410,7 @@ app.post('/miniapi/web/order/create', async (req, res) => {
         `INSERT INTO mini_orders (order_no, user_id, total_amount, original_amount, discount, address, remark,
            delivery_type, payment_expires_at, source, web_token, freight_amount, status, created_at)
          VALUES ($1,$9,$2,$3,1,$4,$5,0,$6,'web',$7,$8,0,NOW()) RETURNING *`,
-        [orderNo, total, goodsTotal, JSON.stringify(address), `[官网] ${String(remark).trim().slice(0, 200)}`.trim(), expiresAt, token, freight, webUser.id]
+        [orderNo, total, goodsTotal, JSON.stringify(address), `[官网] ${String(remark).trim().slice(0, 200)}`.trim(), expiresAt, token, freight, webUser ? webUser.id : 0]
       )).rows[0]
       for (const item of validItems) {
         await client.query(
@@ -7464,7 +7515,8 @@ app.post('/miniapi/web/order/refund', async (req, res) => {
   const client = await pool.connect()
   try {
     const webUser = await getWebUser(req)
-    if (!webUser) return needWebLogin(res)
+    const legacy = webUser ? null : await legacyWebAccess(req)
+    if (!webUser && !legacy?.mobile) return needWebLogin(res)
     const no = String(req.body?.no || '').trim()
     const reason = String(req.body?.reason || '').trim().slice(0, 200)
     if (!no) return fail(res, '参数错误')
@@ -7475,8 +7527,8 @@ app.post('/miniapi/web/order/refund', async (req, res) => {
        WHERE order_no=$1 AND deleted_at IS NULL FOR UPDATE`,
       [no]
     )).rows[0]
-    if (!ownsWebOrder(order, webUser)) { await client.query('ROLLBACK'); return fail(res, '订单不存在') }
-    const mobile = (typeof order.address === 'object' && order.address?.phone) || webUser.phone || ''
+    if (!(webUser ? ownsWebOrder(order, webUser) : legacyOwns(order, legacy))) { await client.query('ROLLBACK'); return fail(res, '订单不存在') }
+    const mobile = (typeof order.address === 'object' && order.address?.phone) || webUser?.phone || ''
     const st = Number(order.status)
     if (st === 0) { await client.query('ROLLBACK'); return fail(res, '订单还没付款，直接取消就行') }
     if (st === 4) { await client.query('ROLLBACK'); return fail(res, '订单已取消') }
@@ -7523,14 +7575,16 @@ app.post('/miniapi/web/order/refund', async (req, res) => {
 app.post('/miniapi/web/order/cancel', async (req, res) => {
   try {
     const webUser = await getWebUser(req)
-    if (!webUser) return needWebLogin(res)
+    const legacy = webUser ? null : await legacyWebAccess(req)
+    if (!webUser && !legacy?.token) return needWebLogin(res)
     const no = String(req.body?.no || '')
     if (!no) return fail(res, '参数错误')
     const order = (await pool.query(
-      `SELECT id, order_no, status, user_id, address FROM mini_orders WHERE order_no=$1 AND source='web' LIMIT 1`,
+      `SELECT id, order_no, status, user_id, address, web_token FROM mini_orders WHERE order_no=$1 AND source='web' LIMIT 1`,
       [no]
     )).rows[0]
-    if (!ownsWebOrder(order, webUser)) return fail(res, '订单不存在')
+    // 取消只认登录账号或下单时的 web_token，不认手机号
+    if (!(webUser ? ownsWebOrder(order, webUser) : legacyOwns(order, { mobile: '', token: legacy.token }))) return fail(res, '订单不存在')
     if (Number(order.status) !== 0) return fail(res, '只有待付款的订单可以取消')
     // 取消前先问一下微信，防止顾客刚付完款又点取消
     try {
@@ -7550,14 +7604,21 @@ app.post('/miniapi/web/order/cancel', async (req, res) => {
 app.get('/miniapi/web/order/lookup', async (req, res) => {
   try {
     const webUser = await getWebUser(req)
-    if (!webUser) return needWebLogin(res)
-    // 自己的订单（官网+小程序），加上以前没登录时用这个手机号下的官网单
-    const rows = (await pool.query(
-      `SELECT * FROM mini_orders
-       WHERE deleted_at IS NULL AND (user_id=$1 OR (COALESCE(user_id,0)=0 AND $2 <> '' AND address->>'phone'=$2))
-       ORDER BY id DESC LIMIT 30`,
-      [webUser.id, webUser.phone || '']
-    )).rows
+    const legacy = webUser ? null : await legacyWebAccess(req)
+    if (!webUser && !legacy?.mobile) return needWebLogin(res)
+    // 登录了：自己的订单（官网+小程序），加上以前没登录时用这个手机号下的官网单
+    // 登录上线前：按收货手机号查（旧逻辑）
+    const rows = webUser
+      ? (await pool.query(
+          `SELECT * FROM mini_orders
+           WHERE deleted_at IS NULL AND (user_id=$1 OR (COALESCE(user_id,0)=0 AND $2 <> '' AND address->>'phone'=$2))
+           ORDER BY id DESC LIMIT 30`,
+          [webUser.id, webUser.phone || '']
+        )).rows
+      : (await pool.query(
+          `SELECT * FROM mini_orders WHERE address->>'phone'=$1 AND deleted_at IS NULL ORDER BY id DESC LIMIT 20`,
+          [legacy.mobile]
+        )).rows
     const ids = rows.map(r => r.id)
     const items = ids.length
       ? (await pool.query(`SELECT order_id, goods_name, qty, price FROM mini_order_items WHERE order_id = ANY($1)`, [ids])).rows
@@ -7580,7 +7641,7 @@ app.get('/miniapi/web/order/lookup', async (req, res) => {
         tracking_no: r.tracking_no || '',
         express_company: r.express_company || '',
         // 自己名下的待付款官网单：给付款凭证，换台电脑登录也能继续付款
-        pay_token: r.source === 'web' && Number(r.status) === 0 && Number(r.user_id) === Number(webUser.id) ? (r.web_token || '') : '',
+        pay_token: webUser && r.source === 'web' && Number(r.status) === 0 && Number(r.user_id) === Number(webUser.id) ? (r.web_token || '') : '',
         items: items.filter(i => i.order_id === r.id).map(i => ({ goods_name: i.goods_name, qty: i.qty, price: parseFloat(i.price) })),
         refund: (() => {
           const f = refunds.find(x => x.order_id === r.id)
@@ -7595,14 +7656,15 @@ app.get('/miniapi/web/order/lookup', async (req, res) => {
 app.get('/miniapi/web/order/tracking', async (req, res) => {
   try {
     const webUser = await getWebUser(req)
-    if (!webUser) return needWebLogin(res)
+    const legacy = webUser ? null : await legacyWebAccess(req)
+    if (!webUser && !legacy?.mobile) return needWebLogin(res)
     const no = String(req.query.no || '').trim()
     if (!no) return fail(res, '参数不对')
     const order = (await pool.query(
       `SELECT id, user_id, address, tracking_no, express_company, tracking_registered_at FROM mini_orders
        WHERE order_no=$1 AND deleted_at IS NULL`, [no]
     )).rows[0]
-    if (!ownsWebOrder(order, webUser)) return fail(res, '订单不存在')
+    if (!(webUser ? ownsWebOrder(order, webUser) : legacyOwns(order, legacy))) return fail(res, '订单不存在')
     if (!order.tracking_no) return fail(res, '商家还没填写快递单号')
     const key = process.env.TRACK17_API_KEY || req.get('x-track17-token') || ''
     if (!key) return fail(res, '物流查询服务正在配置，请稍后再试')

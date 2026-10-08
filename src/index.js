@@ -7419,6 +7419,34 @@ app.get('/miniapi/web/order/lookup', async (req, res) => {
   } catch (e) { fail(res, e.message) }
 })
 
+// 官网订单物流轨迹：订单号 + 收货手机号校验（和订单查询同一道门槛）
+app.get('/miniapi/web/order/tracking', async (req, res) => {
+  try {
+    const no = String(req.query.no || '').trim()
+    const mobile = String(req.query.mobile || '').trim()
+    if (!no || !/^1[3-9]\d{9}$/.test(mobile)) return fail(res, '参数不对')
+    const order = (await pool.query(
+      `SELECT id, tracking_no, express_company, tracking_registered_at FROM mini_orders
+       WHERE order_no=$1 AND address->>'phone'=$2 AND deleted_at IS NULL`, [no, mobile]
+    )).rows[0]
+    if (!order) return fail(res, '订单不存在')
+    if (!order.tracking_no) return fail(res, '商家还没填写快递单号')
+    const key = process.env.TRACK17_API_KEY || req.get('x-track17-token') || ''
+    if (!key) return fail(res, '物流查询服务正在配置，请稍后再试')
+    if (!order.tracking_registered_at) {
+      const registered = await track17('/register', [{ number: order.tracking_no }], key)
+      const rejected = registered.rejected?.[0]
+      if (rejected && rejected.error?.code !== -18019904) return fail(res, rejected.error?.message || '运单注册失败')
+      await pool.query(`UPDATE mini_orders SET tracking_registered_at=NOW() WHERE id=$1`, [order.id])
+    }
+    const details = await track17('/gettrackinfo', [{ number: order.tracking_no }], key)
+    const item = details.accepted?.[0]
+    const data = item ? format17Track(item) : { number: order.tracking_no, status: 'NotFound', events: [] }
+    data.carrier = order.express_company || data.carrier || ''
+    return ok(res, data)
+  } catch (e) { fail(res, e.message) }
+})
+
 // ─── 官网留言：批发询价 / 采购商申请 / 支持留言 ─────────────────────────────
 // 以前这三个表单直接调要登录的 ERP 接口，顾客点提交永远 401，前端还提示「提交成功」，
 // 留言全部丢失。现在统一存 web_leads，并推送给老板；ERP「小程序订单」页能看到。

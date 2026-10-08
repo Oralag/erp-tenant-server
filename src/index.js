@@ -239,7 +239,13 @@ async function notifyAdminNewOrder(order, items = []) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ title, desp }),
     })
-    if (!response.ok) console.log('admin order notify failed:', response.status)
+    // Server酱额度用完/密钥失效时 HTTP 仍是 200，要看返回体里的 code
+    const body = await response.json().catch(() => null)
+    if (!response.ok || (body && body.code !== 0)) {
+      console.log('admin order notify failed:', response.status, JSON.stringify(body || {}).slice(0, 200), order.order_no)
+    } else {
+      console.log('admin order notify sent:', order.order_no)
+    }
   } catch (e) {
     console.log('admin order notify error:', e.message)
   }
@@ -7286,6 +7292,91 @@ app.get('/miniapi/web/order/status', async (req, res) => {
   } catch (e) { fail(res, e.message) }
 })
 
+// 官网申请退款/售后：订单号 + 收货手机号对上才行（钱只会原路退回付款人，且要老板在 ERP 审核）
+// 进同一张 mini_refunds 表，ERP「退款管理」统一审核；user_id=0 表示官网顾客
+app.post('/miniapi/web/order/refund', async (req, res) => {
+  const client = await pool.connect()
+  try {
+    const no = String(req.body?.no || '').trim()
+    const mobile = String(req.body?.mobile || '').trim()
+    const reason = String(req.body?.reason || '').trim().slice(0, 200)
+    if (!no || !/^1[3-9]\d{9}$/.test(mobile)) return fail(res, '参数错误')
+    if (!reason) return fail(res, '请填写退款/售后原因')
+    await client.query('BEGIN')
+    const order = (await client.query(
+      `SELECT id, order_no, total_amount, status FROM mini_orders
+       WHERE order_no=$1 AND address->>'phone'=$2 AND deleted_at IS NULL FOR UPDATE`,
+      [no, mobile]
+    )).rows[0]
+    if (!order) { await client.query('ROLLBACK'); return fail(res, '订单不存在') }
+    const st = Number(order.status)
+    if (st === 0) { await client.query('ROLLBACK'); return fail(res, '订单还没付款，直接取消就行') }
+    if (st === 4) { await client.query('ROLLBACK'); return fail(res, '订单已取消') }
+    if (st === 5) { await client.query('ROLLBACK'); return fail(res, '退款申请正在处理中') }
+    const existing = (await client.query(
+      `SELECT id, status FROM mini_refunds WHERE order_id=$1 AND status != 2 LIMIT 1`, [order.id]
+    )).rows[0]
+    if (existing) {
+      await client.query('ROLLBACK')
+      return fail(res, existing.status === 0 ? '退款申请正在处理中' : '这笔订单已经退款')
+    }
+    const refundedSum = parseFloat((await client.query(
+      `SELECT COALESCE(SUM(amount),0) AS s FROM mini_refunds WHERE order_id=$1 AND status=1`, [order.id]
+    )).rows[0].s)
+    const remaining = Math.round((parseFloat(order.total_amount) - refundedSum) * 100) / 100
+    if (remaining <= 0) { await client.query('ROLLBACK'); return fail(res, '该订单已全额退款') }
+    await client.query(
+      `INSERT INTO mini_refunds (order_id, user_id, reason, images, amount, status, original_order_status)
+       VALUES ($1,0,$2,'',$3,0,$4)`,
+      [order.id, `[官网] ${reason}`, remaining, st]
+    )
+    await client.query(`UPDATE mini_orders SET status=5 WHERE id=$1`, [order.id])
+    await client.query('COMMIT')
+    const key = process.env.SERVER_JIANG_KEY
+    if (key) {
+      fetch(`https://sctapi.ftqq.com/${key}.send`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: '🔄 官网退款/售后申请',
+          desp: `订单：${order.order_no}\n手机：${mobile}\n金额：¥${remaining.toFixed(2)}\n原因：${reason}\n\n请登录 ERP → 小程序 → 退款管理 处理。`,
+        }),
+      }).catch(() => {})
+    }
+    return ok(res, { amount: remaining }, '已提交，我们会尽快处理')
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    fail(res, e.message)
+  } finally {
+    client.release()
+  }
+})
+
+// 官网取消待付款订单：需要下单时发的 web_token（只有下单的浏览器有）
+app.post('/miniapi/web/order/cancel', async (req, res) => {
+  try {
+    const no = String(req.body?.no || '')
+    const token = String(req.body?.token || '')
+    if (!no || !token) return fail(res, '参数错误')
+    const order = (await pool.query(
+      `SELECT id, order_no, status FROM mini_orders WHERE order_no=$1 AND source='web' AND web_token=$2 LIMIT 1`,
+      [no, token]
+    )).rows[0]
+    if (!order) return fail(res, '订单不存在')
+    if (Number(order.status) !== 0) return fail(res, '只有待付款的订单可以取消')
+    // 取消前先问一下微信，防止顾客刚付完款又点取消
+    try {
+      const q = await wxV3QueryOrder(order.order_no)
+      if (q?.status === 200 && q.body?.trade_state === 'SUCCESS') {
+        await markWebOrderPaid(order.order_no, q.body.transaction_id)
+        return fail(res, '这笔订单已经付款了，如需退款请点「申请退款」')
+      }
+    } catch { /* 查不到按未付款处理 */ }
+    await wxV3Post(`/v3/pay/transactions/out-trade-no/${order.order_no}/close`, { mchid: WX_MCH_ID }).catch(() => {})
+    await cancelWebOrder(order.id, '顾客在官网取消')
+    return ok(res, {}, '订单已取消')
+  } catch (e) { fail(res, e.message) }
+})
+
 // 官网「订单查询」：按收货手机号查。只回订单号/时间/状态/商品/金额，不回地址和姓名
 app.get('/miniapi/web/order/lookup', async (req, res) => {
   try {
@@ -7301,6 +7392,12 @@ app.get('/miniapi/web/order/lookup', async (req, res) => {
     const items = ids.length
       ? (await pool.query(`SELECT order_id, goods_name, qty, price FROM mini_order_items WHERE order_id = ANY($1)`, [ids])).rows
       : []
+    const refunds = ids.length
+      ? (await pool.query(
+          `SELECT DISTINCT ON (order_id) order_id, status, amount, note, reason, created_at, handled_at
+           FROM mini_refunds WHERE order_id = ANY($1) ORDER BY order_id, id DESC`, [ids]
+        ).catch(() => ({ rows: [] }))).rows
+      : []
     return ok(res, {
       rows: rows.map(r => ({
         order_no: r.order_no,
@@ -7313,6 +7410,10 @@ app.get('/miniapi/web/order/lookup', async (req, res) => {
         tracking_no: r.tracking_no || '',
         express_company: r.express_company || '',
         items: items.filter(i => i.order_id === r.id).map(i => ({ goods_name: i.goods_name, qty: i.qty, price: parseFloat(i.price) })),
+        refund: (() => {
+          const f = refunds.find(x => x.order_id === r.id)
+          return f ? { status: Number(f.status), amount: parseFloat(f.amount || 0), note: f.note || '', reason: f.reason || '', created_at: f.created_at, handled_at: f.handled_at } : null
+        })(),
       })),
     })
   } catch (e) { fail(res, e.message) }
@@ -9969,7 +10070,9 @@ app.get('/adminapi/refund/list', auth, async (req, res) => {
     if (status !== undefined && status !== '') { where = 'WHERE r.status=$1'; params.push(parseInt(status)) }
     const listParams = [...params, 20, offset]
     const rows = (await pool.query(
-      `SELECT r.*, o.order_no, u.name as user_name, u.phone as user_phone
+      `SELECT r.*, o.order_no, o.source AS order_source,
+              COALESCE(NULLIF(u.name,''), o.address->>'name') AS user_name,
+              COALESCE(NULLIF(u.phone,''), o.address->>'phone') AS user_phone
        FROM mini_refunds r
        JOIN mini_orders o ON o.id=r.order_id
        LEFT JOIN mini_users u ON u.id=r.user_id

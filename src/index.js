@@ -6830,6 +6830,17 @@ async function ensurePaySettingsTable() {
       updated_at TIMESTAMP DEFAULT NOW(),
       updated_by VARCHAR(60) DEFAULT ''
     )`)
+  await pool.query(`ALTER TABLE pay_settings ADD COLUMN IF NOT EXISTS ship_fee NUMERIC(10,2) DEFAULT 0`)
+  await pool.query(`ALTER TABLE pay_settings ADD COLUMN IF NOT EXISTS ship_free_threshold NUMERIC(10,2) DEFAULT 0`)
+}
+
+// 官网运费：默认包邮（运费 0）。ship_free_threshold>0 时满额免运费
+let WEB_SHIP_FEE = 0
+let WEB_SHIP_FREE_THRESHOLD = 0
+function calcWebFreight(goodsTotal) {
+  if (!(WEB_SHIP_FEE > 0)) return 0
+  if (WEB_SHIP_FREE_THRESHOLD > 0 && goodsTotal >= WEB_SHIP_FREE_THRESHOLD) return 0
+  return WEB_SHIP_FEE
 }
 
 // 把库里的配置覆盖到运行时变量；没填的字段保留环境变量的值
@@ -6866,6 +6877,8 @@ async function loadPaySettings() {
   const row = (await pool.query(`SELECT * FROM pay_settings WHERE shop_id=1`)).rows[0]
   resetPayRuntimeFromEnv()
   applyPaySettings(row)
+  WEB_SHIP_FEE = Math.max(0, parseFloat(row?.ship_fee) || 0)
+  WEB_SHIP_FREE_THRESHOLD = Math.max(0, parseFloat(row?.ship_free_threshold) || 0)
   return row
 }
 ;(async () => {
@@ -6913,6 +6926,8 @@ app.get('/adminapi/system/PaySettings/index', auth, async (req, res) => {
         cert_serial: mask(WX_MCH_CERT_SERIAL, 6),
         ready: !!(WX_MCH_ID && WX_MCH_PRIVATE_KEY && WX_MCH_CERT_SERIAL && WX_API_V3_KEY && WX_PLATFORM_PUBLIC_KEY),
       },
+      ship_fee: parseFloat(row.ship_fee) || 0,
+      ship_free_threshold: parseFloat(row.ship_free_threshold) || 0,
       updated_at: row.updated_at || null,
       updated_by: row.updated_by || '',
     })
@@ -6955,6 +6970,12 @@ app.post('/adminapi/system/PaySettings/save', auth, async (req, res) => {
       const pem = normPem(b.wx_platform_public_key)
       try { require('crypto').createPublicKey(pem) } catch { return fail(res, '微信支付公钥无法解析，请粘贴 pub_key.pem 的完整内容') }
       put('wx_platform_public_key', pem)
+    }
+    for (const k of ['ship_fee', 'ship_free_threshold']) {
+      if (b[k] === undefined) continue
+      const v = parseFloat(b[k])
+      if (b[k] !== '' && (!Number.isFinite(v) || v < 0 || v > 9999)) return fail(res, '运费金额填写不对')
+      put(k, Math.round((Number.isFinite(v) ? v : 0) * 100) / 100)
     }
     if (!sets.length) return fail(res, '没有要保存的内容')
     put('updated_by', String(req.admin.name || req.admin.account || '').slice(0, 60))
@@ -7014,8 +7035,6 @@ app.post('/adminapi/system/PaySettings/test', auth, async (req, res) => {
 // ERP「小程序订单」里一起处理发货；支付回调复用 /miniapi/pay/notify。
 // 访问凭证是下单时发的 web_token（只有下单的浏览器知道），防止按单号遍历。
 const WEB_ORDER_PAY_MINUTES = 15         // 订单保留时长（页面倒计时 5 分钟，超时后还能在订单查询里继续付）
-const WEB_FREE_SHIPPING_THRESHOLD = 500  // 跟官网结账页显示的规则一致
-const WEB_SHIPPING_FEE = 25
 const WEB_PENDING_LIMIT = 3              // 同一手机号 30 分钟内最多挂 3 张待付款单，防止匿名接口把库存锁光
 
 ;(async () => {
@@ -7130,7 +7149,7 @@ app.post('/miniapi/web/order/create', async (req, res) => {
       validItems.push({ goods_id: id, goods_name: g.name, spec: typeof g.spec === 'string' && !/^[\[{]/.test(g.spec) ? g.spec.slice(0, 60) : '', price, qty })
     }
     goodsTotal = Math.round(goodsTotal * 100) / 100
-    const freight = goodsTotal >= WEB_FREE_SHIPPING_THRESHOLD ? 0 : WEB_SHIPPING_FEE
+    const freight = calcWebFreight(goodsTotal)
     const total = Math.round((goodsTotal + freight) * 100) / 100
 
     const crypto = require('crypto')
@@ -7217,6 +7236,11 @@ app.post('/miniapi/web/order/create', async (req, res) => {
       items: validItems.map(i => ({ goods_name: i.goods_name, qty: i.qty, price: i.price })),
     })
   } catch (e) { fail(res, e.message) }
+})
+
+// 官网结账页显示运费规则（不需要登录）
+app.get('/miniapi/web/shipping', async (req, res) => {
+  return ok(res, { fee: WEB_SHIP_FEE, free_threshold: WEB_SHIP_FREE_THRESHOLD })
 })
 
 // 官网轮询付款状态。check=1 时如果还没收到回调，主动向微信查一次（前端每 ~10 秒带一次）

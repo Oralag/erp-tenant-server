@@ -6885,8 +6885,14 @@ async function loadPaySettings() {
   try { await loadPaySettings() } catch (e) { console.log('pay settings init:', e.message) }
 })()
 
+// 多家共用一台后端（试用版）时不能开在线收款。只看「有商品的店铺」：
+// 主库里有测试时留下的空店铺（如 2026-06 的「测试公司X」），不能因此把正式店拦掉。
+// 也可以用环境变量 SHARED_BACKEND=1 强制按共用处理。
 async function isSharedBackend() {
-  const n = (await pool.query(`SELECT COUNT(*)::int AS n FROM shops`).catch(() => ({ rows: [{ n: 1 }] }))).rows[0].n
+  if (process.env.SHARED_BACKEND === '1') return true
+  const n = (await pool.query(
+    `SELECT COUNT(DISTINCT shop_id)::int AS n FROM goods WHERE deleted_at IS NULL`
+  ).catch(() => ({ rows: [{ n: 1 }] }))).rows[0].n
   return n > 1
 }
 

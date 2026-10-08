@@ -5041,6 +5041,10 @@ app.post('/miniapi/order/cancel', miniAuth, async (req, res) => {
     await releaseOrderBenefits(client, order)
     await client.query(`UPDATE mini_orders SET status=4 WHERE id=$1`, [order.id])
     await client.query('COMMIT')
+    // 官网单在电脑上还开着付款码：关掉，免得取消后又被扫码付款
+    if (order.source === 'web') {
+      wxV3Post(`/v3/pay/transactions/out-trade-no/${order.order_no}/close`, { mchid: WX_MCH_ID }).catch(() => {})
+    }
     return ok(res, { id: order.id, status: 4 })
   } catch (e) {
     await client.query('ROLLBACK')
@@ -6663,6 +6667,7 @@ app.post('/miniapi/pay/unified', miniAuth, async (req, res) => {
     if (!r.rows[0]) return fail(res, '订单不存在')
     const order = r.rows[0]
     if (order.status !== 0) return fail(res, '订单已支付')
+    if (order.source === 'web') return fail(res, '这是官网订单，请回到电脑上扫码付款')
     if (order.payment_expires_at && new Date(order.payment_expires_at).getTime() <= Date.now()) {
       await expirePendingOrder(order.id)
       return fail(res, '订单已超时关闭，请重新下单')
@@ -7125,9 +7130,158 @@ function webOrderIpLimited(req) {
   return false
 }
 
+// ─── 官网登录：电脑上显示小程序码，顾客用微信扫码、在小程序里点「确认登录」──────
+// 账号就是小程序会员（mini_users），官网拿到的 token 和小程序同一套（MINI_JWT_SECRET），
+// 所以官网订单 user_id 就是这个会员，小程序「我的订单」里也看得到。
+const WEB_LOGIN_TTL_MS = 5 * 60 * 1000
+const webLoginIpHits = new Map()
+
+;(async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS web_login_sessions (
+        sid VARCHAR(32) PRIMARY KEY,
+        status SMALLINT DEFAULT 0,          -- 0 等扫码 1 已扫码 2 已确认 3 手机上取消 4 网页已取走登录态
+        user_id INTEGER,
+        ip VARCHAR(60) DEFAULT '',
+        created_at TIMESTAMP DEFAULT NOW(),
+        confirmed_at TIMESTAMP
+      )
+    `)
+  } catch (e) { console.log('web_login_sessions init:', e.message) }
+})()
+
+// 官网请求带的登录态：校验 token 并回查会员（被删的会员不能再用）
+async function getWebUser(req) {
+  const token = req.headers['mini-token']
+  if (!token) return null
+  let decoded
+  try { decoded = jwt.verify(token, MINI_JWT_SECRET) } catch { return null }
+  const u = (await pool.query(
+    `SELECT id, name, phone FROM mini_users WHERE id=$1 AND deleted_at IS NULL`, [decoded.id]
+  )).rows[0]
+  return u || null
+}
+function needWebLogin(res) {
+  return res.json({ code: -401, message: '请先登录' })
+}
+// 这张订单是不是这个会员的：下单人就是他，或者是以前没登录下的单、收货手机号是他的手机号
+function ownsWebOrder(order, user) {
+  if (!order || !user) return false
+  if (Number(order.user_id) === Number(user.id)) return true
+  const addr = typeof order.address === 'string'
+    ? (() => { try { return JSON.parse(order.address || '{}') } catch { return {} } })()
+    : (order.address || {})
+  return Number(order.user_id || 0) === 0 && !!user.phone && addr.phone === user.phone
+}
+
+app.post('/miniapi/web/login/start', async (req, res) => {
+  try {
+    const ip = String(req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for'] || req.ip || '').split(',')[0].trim()
+    const now = Date.now()
+    const hits = (webLoginIpHits.get(ip) || []).filter(t => now - t < 10 * 60 * 1000)
+    if (hits.length >= 30) return fail(res, '操作太频繁，请稍后再试')
+    hits.push(now); webLoginIpHits.set(ip, hits)
+    if (webLoginIpHits.size > 5000) webLoginIpHits.clear()
+
+    const sid = require('crypto').randomBytes(12).toString('hex') // 24 位，小程序码 scene 上限 32
+    const token = await getWxAccessToken()
+    if (!token) return fail(res, '登录码生成失败，请稍后再试')
+    const wxRes = await fetch(`https://api.weixin.qq.com/wxa/getwxacodeunlimit?access_token=${token}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        scene: sid,
+        page: 'pages/weblogin/index',
+        width: 280,
+        check_path: false,
+        env_version: process.env.WEB_LOGIN_ENV_VERSION || 'release',
+      }),
+    })
+    if (!(wxRes.headers.get('content-type') || '').includes('image')) {
+      const j = await wxRes.json().catch(() => ({}))
+      console.log('[web login] wxacode failed:', JSON.stringify(j).slice(0, 200))
+      return fail(res, `登录码生成失败：${j.errmsg || '微信接口异常'}`)
+    }
+    const b64 = Buffer.from(await wxRes.arrayBuffer()).toString('base64')
+    await pool.query(`INSERT INTO web_login_sessions (sid, ip) VALUES ($1,$2)`, [sid, ip.slice(0, 60)])
+    // 顺手清掉一天前的记录
+    pool.query(`DELETE FROM web_login_sessions WHERE created_at < NOW() - INTERVAL '1 day'`).catch(() => {})
+    return ok(res, { sid, qr: `data:image/png;base64,${b64}`, expires_in: WEB_LOGIN_TTL_MS / 1000 })
+  } catch (e) { fail(res, e.message) }
+})
+
+// 网页轮询：确认后只发一次登录态
+app.get('/miniapi/web/login/poll', async (req, res) => {
+  try {
+    const sid = String(req.query.sid || '')
+    const row = (await pool.query(`SELECT * FROM web_login_sessions WHERE sid=$1`, [sid])).rows[0]
+    if (!row) return ok(res, { status: 'expired' })
+    const expired = Date.now() - new Date(row.created_at).getTime() > WEB_LOGIN_TTL_MS
+    const st = Number(row.status)
+    if (st === 3) return ok(res, { status: 'cancelled' })
+    if (st === 4) return ok(res, { status: 'expired' })
+    if (st === 2) {
+      const taken = (await pool.query(
+        `UPDATE web_login_sessions SET status=4 WHERE sid=$1 AND status=2 RETURNING user_id`, [sid]
+      )).rows[0]
+      if (!taken) return ok(res, { status: 'expired' })
+      const u = (await pool.query(`SELECT id, name, phone FROM mini_users WHERE id=$1 AND deleted_at IS NULL`, [taken.user_id])).rows[0]
+      if (!u) return ok(res, { status: 'expired' })
+      const token = jwt.sign({ id: u.id, phone: u.phone, via: 'web' }, MINI_JWT_SECRET, { expiresIn: '30d' })
+      return ok(res, { status: 'confirmed', token, user: { id: u.id, name: u.name || '', phone: u.phone || '' } })
+    }
+    if (expired) return ok(res, { status: 'expired' })
+    return ok(res, { status: st === 1 ? 'scanned' : 'waiting' })
+  } catch (e) { fail(res, e.message) }
+})
+
+// 小程序：扫到码（页面打开时调），确认，取消
+app.post('/miniapi/web/login/scan', miniAuth, async (req, res) => {
+  try {
+    const sid = String(req.body?.sid || '')
+    const row = (await pool.query(
+      `UPDATE web_login_sessions SET status=1 WHERE sid=$1 AND status IN (0,1)
+         AND created_at > NOW() - INTERVAL '5 minutes' RETURNING sid`, [sid]
+    )).rows[0]
+    if (!row) return fail(res, '登录码已过期，请在电脑上刷新二维码后重新扫')
+    return ok(res, {})
+  } catch (e) { fail(res, e.message) }
+})
+app.post('/miniapi/web/login/confirm', miniAuth, async (req, res) => {
+  try {
+    const sid = String(req.body?.sid || '')
+    const u = (await pool.query(`SELECT id, phone FROM mini_users WHERE id=$1 AND deleted_at IS NULL`, [req.miniUser.id])).rows[0]
+    if (!u) return fail(res, '账号不存在，请重新登录小程序')
+    if (!u.phone) return fail(res, '请先在小程序里绑定手机号')
+    const row = (await pool.query(
+      `UPDATE web_login_sessions SET status=2, user_id=$2, confirmed_at=NOW()
+       WHERE sid=$1 AND status IN (0,1) AND created_at > NOW() - INTERVAL '5 minutes' RETURNING sid`,
+      [sid, u.id]
+    )).rows[0]
+    if (!row) return fail(res, '登录码已过期，请在电脑上刷新二维码后重新扫')
+    return ok(res, {}, '已登录')
+  } catch (e) { fail(res, e.message) }
+})
+app.post('/miniapi/web/login/cancel', miniAuth, async (req, res) => {
+  try {
+    await pool.query(`UPDATE web_login_sessions SET status=3 WHERE sid=$1 AND status IN (0,1)`, [String(req.body?.sid || '')])
+    return ok(res, {})
+  } catch (e) { fail(res, e.message) }
+})
+app.get('/miniapi/web/me', async (req, res) => {
+  try {
+    const u = await getWebUser(req)
+    if (!u) return needWebLogin(res)
+    return ok(res, { id: u.id, name: u.name || '', phone: u.phone || '' })
+  } catch (e) { fail(res, e.message) }
+})
+
 // 官网下单：服务端按商品现价重算，扣库存，向微信要 Native 支付码
 app.post('/miniapi/web/order/create', async (req, res) => {
   try {
+    const webUser = await getWebUser(req)
+    if (!webUser) return needWebLogin(res)
     if (webOrderIpLimited(req)) return fail(res, '下单太频繁，请稍后再试')
     const { items, contact = {}, remark = '' } = req.body || {}
     if (!Array.isArray(items) || !items.length) return fail(res, '购物车是空的')
@@ -7204,8 +7358,8 @@ app.post('/miniapi/web/order/create', async (req, res) => {
       order = (await client.query(
         `INSERT INTO mini_orders (order_no, user_id, total_amount, original_amount, discount, address, remark,
            delivery_type, payment_expires_at, source, web_token, freight_amount, status, created_at)
-         VALUES ($1,0,$2,$3,1,$4,$5,0,$6,'web',$7,$8,0,NOW()) RETURNING *`,
-        [orderNo, total, goodsTotal, JSON.stringify(address), `[官网] ${String(remark).trim().slice(0, 200)}`.trim(), expiresAt, token, freight]
+         VALUES ($1,$9,$2,$3,1,$4,$5,0,$6,'web',$7,$8,0,NOW()) RETURNING *`,
+        [orderNo, total, goodsTotal, JSON.stringify(address), `[官网] ${String(remark).trim().slice(0, 200)}`.trim(), expiresAt, token, freight, webUser.id]
       )).rows[0]
       for (const item of validItems) {
         await client.query(
@@ -7309,18 +7463,20 @@ app.get('/miniapi/web/order/status', async (req, res) => {
 app.post('/miniapi/web/order/refund', async (req, res) => {
   const client = await pool.connect()
   try {
+    const webUser = await getWebUser(req)
+    if (!webUser) return needWebLogin(res)
     const no = String(req.body?.no || '').trim()
-    const mobile = String(req.body?.mobile || '').trim()
     const reason = String(req.body?.reason || '').trim().slice(0, 200)
-    if (!no || !/^1[3-9]\d{9}$/.test(mobile)) return fail(res, '参数错误')
+    if (!no) return fail(res, '参数错误')
     if (!reason) return fail(res, '请填写退款/售后原因')
     await client.query('BEGIN')
     const order = (await client.query(
-      `SELECT id, order_no, total_amount, status FROM mini_orders
-       WHERE order_no=$1 AND address->>'phone'=$2 AND deleted_at IS NULL FOR UPDATE`,
-      [no, mobile]
+      `SELECT id, order_no, total_amount, status, user_id, address FROM mini_orders
+       WHERE order_no=$1 AND deleted_at IS NULL FOR UPDATE`,
+      [no]
     )).rows[0]
-    if (!order) { await client.query('ROLLBACK'); return fail(res, '订单不存在') }
+    if (!ownsWebOrder(order, webUser)) { await client.query('ROLLBACK'); return fail(res, '订单不存在') }
+    const mobile = (typeof order.address === 'object' && order.address?.phone) || webUser.phone || ''
     const st = Number(order.status)
     if (st === 0) { await client.query('ROLLBACK'); return fail(res, '订单还没付款，直接取消就行') }
     if (st === 4) { await client.query('ROLLBACK'); return fail(res, '订单已取消') }
@@ -7339,8 +7495,8 @@ app.post('/miniapi/web/order/refund', async (req, res) => {
     if (remaining <= 0) { await client.query('ROLLBACK'); return fail(res, '该订单已全额退款') }
     await client.query(
       `INSERT INTO mini_refunds (order_id, user_id, reason, images, amount, status, original_order_status)
-       VALUES ($1,0,$2,'',$3,0,$4)`,
-      [order.id, `[官网] ${reason}`, remaining, st]
+       VALUES ($1,$5,$2,'',$3,0,$4)`,
+      [order.id, `[官网] ${reason}`, remaining, st, Number(order.user_id) || 0]
     )
     await client.query(`UPDATE mini_orders SET status=5 WHERE id=$1`, [order.id])
     await client.query('COMMIT')
@@ -7366,14 +7522,15 @@ app.post('/miniapi/web/order/refund', async (req, res) => {
 // 官网取消待付款订单：需要下单时发的 web_token（只有下单的浏览器有）
 app.post('/miniapi/web/order/cancel', async (req, res) => {
   try {
+    const webUser = await getWebUser(req)
+    if (!webUser) return needWebLogin(res)
     const no = String(req.body?.no || '')
-    const token = String(req.body?.token || '')
-    if (!no || !token) return fail(res, '参数错误')
+    if (!no) return fail(res, '参数错误')
     const order = (await pool.query(
-      `SELECT id, order_no, status FROM mini_orders WHERE order_no=$1 AND source='web' AND web_token=$2 LIMIT 1`,
-      [no, token]
+      `SELECT id, order_no, status, user_id, address FROM mini_orders WHERE order_no=$1 AND source='web' LIMIT 1`,
+      [no]
     )).rows[0]
-    if (!order) return fail(res, '订单不存在')
+    if (!ownsWebOrder(order, webUser)) return fail(res, '订单不存在')
     if (Number(order.status) !== 0) return fail(res, '只有待付款的订单可以取消')
     // 取消前先问一下微信，防止顾客刚付完款又点取消
     try {
@@ -7389,16 +7546,17 @@ app.post('/miniapi/web/order/cancel', async (req, res) => {
   } catch (e) { fail(res, e.message) }
 })
 
-// 官网「订单查询」：按收货手机号查。只回订单号/时间/状态/商品/金额，不回地址和姓名
+// 官网「我的订单」：要登录。只回订单号/时间/状态/商品/金额，不回地址和姓名
 app.get('/miniapi/web/order/lookup', async (req, res) => {
   try {
-    const mobile = String(req.query.mobile || '').trim()
-    if (!/^1[3-9]\d{9}$/.test(mobile)) return fail(res, '请输入正确的11位手机号')
+    const webUser = await getWebUser(req)
+    if (!webUser) return needWebLogin(res)
+    // 自己的订单（官网+小程序），加上以前没登录时用这个手机号下的官网单
     const rows = (await pool.query(
       `SELECT * FROM mini_orders
-       WHERE address->>'phone'=$1 AND deleted_at IS NULL
-       ORDER BY id DESC LIMIT 20`,
-      [mobile]
+       WHERE deleted_at IS NULL AND (user_id=$1 OR (COALESCE(user_id,0)=0 AND $2 <> '' AND address->>'phone'=$2))
+       ORDER BY id DESC LIMIT 30`,
+      [webUser.id, webUser.phone || '']
     )).rows
     const ids = rows.map(r => r.id)
     const items = ids.length
@@ -7421,6 +7579,8 @@ app.get('/miniapi/web/order/lookup', async (req, res) => {
         paid_at: r.paid_at,
         tracking_no: r.tracking_no || '',
         express_company: r.express_company || '',
+        // 自己名下的待付款官网单：给付款凭证，换台电脑登录也能继续付款
+        pay_token: r.source === 'web' && Number(r.status) === 0 && Number(r.user_id) === Number(webUser.id) ? (r.web_token || '') : '',
         items: items.filter(i => i.order_id === r.id).map(i => ({ goods_name: i.goods_name, qty: i.qty, price: parseFloat(i.price) })),
         refund: (() => {
           const f = refunds.find(x => x.order_id === r.id)
@@ -7431,17 +7591,18 @@ app.get('/miniapi/web/order/lookup', async (req, res) => {
   } catch (e) { fail(res, e.message) }
 })
 
-// 官网订单物流轨迹：订单号 + 收货手机号校验（和订单查询同一道门槛）
+// 官网订单物流轨迹：要登录，只能查自己的订单
 app.get('/miniapi/web/order/tracking', async (req, res) => {
   try {
+    const webUser = await getWebUser(req)
+    if (!webUser) return needWebLogin(res)
     const no = String(req.query.no || '').trim()
-    const mobile = String(req.query.mobile || '').trim()
-    if (!no || !/^1[3-9]\d{9}$/.test(mobile)) return fail(res, '参数不对')
+    if (!no) return fail(res, '参数不对')
     const order = (await pool.query(
-      `SELECT id, tracking_no, express_company, tracking_registered_at FROM mini_orders
-       WHERE order_no=$1 AND address->>'phone'=$2 AND deleted_at IS NULL`, [no, mobile]
+      `SELECT id, user_id, address, tracking_no, express_company, tracking_registered_at FROM mini_orders
+       WHERE order_no=$1 AND deleted_at IS NULL`, [no]
     )).rows[0]
-    if (!order) return fail(res, '订单不存在')
+    if (!ownsWebOrder(order, webUser)) return fail(res, '订单不存在')
     if (!order.tracking_no) return fail(res, '商家还没填写快递单号')
     const key = process.env.TRACK17_API_KEY || req.get('x-track17-token') || ''
     if (!key) return fail(res, '物流查询服务正在配置，请稍后再试')

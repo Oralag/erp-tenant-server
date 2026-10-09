@@ -4150,6 +4150,27 @@ router.post('/goods/BomGoods/del', async (req, res) => {
 
 // ─── 小程序 miniapi ───────────────────────────────────────────────────────────
 
+// 小程序/官网下单扣哪条库存：优先「默认仓库」设置（sys_params.default_warehouse_id）里的那条，
+// 其次未停用仓库里库存最多的；以前按 warehouse_id 最小挑，会扣到「默认仓库」或没填仓库的旧记录
+async function pickOrderStockRow(client, goodsId) {
+  const def = (await client.query(`SELECT value FROM sys_params WHERE key='default_warehouse_id' ORDER BY id LIMIT 1`)).rows[0]
+  const defId = Number(def?.value || 0)
+  if (defId > 0) {
+    const row = (await client.query(
+      `SELECT qty, warehouse_id, warehouse_name FROM stock_inventory WHERE goods_id=$1 AND warehouse_id=$2 LIMIT 1 FOR UPDATE`,
+      [goodsId, defId]
+    )).rows[0]
+    if (row) return row
+  }
+  return (await client.query(
+    `SELECT si.qty, si.warehouse_id, si.warehouse_name FROM stock_inventory si
+       LEFT JOIN warehouses w ON w.id = si.warehouse_id
+     WHERE si.goods_id=$1 AND COALESCE(w.status,1)<>0
+     ORDER BY si.qty DESC, si.warehouse_id DESC LIMIT 1 FOR UPDATE OF si`,
+    [goodsId]
+  )).rows[0]
+}
+
 const MINI_JWT_SECRET = process.env.MINI_JWT_SECRET || 'mini_secret_2024'
 const WX_SECRET = process.env.WX_SECRET || ''
 // 商户配置：先取环境变量，ERP「收款设置」里填过的会在启动/保存时覆盖（见 applyPaySettings）。
@@ -4883,11 +4904,7 @@ app.post('/miniapi/order/create', miniAuth, async (req, res) => {
       // 锁库存 + 校验 + 扣减（防超卖）
       const stockSnapshot = []
       for (const item of validItems) {
-        const inv = (await client.query(
-          `SELECT qty, warehouse_id, warehouse_name FROM stock_inventory
-           WHERE goods_id=$1 ORDER BY warehouse_id ASC LIMIT 1 FOR UPDATE`,
-          [item.goods_id]
-        )).rows[0]
+        const inv = await pickOrderStockRow(client, item.goods_id)
         if (!inv) {
           const err = new Error(`商品「${item.goods_name}」库存未维护，请联系商家`)
           err.userMessage = err.message
@@ -7408,11 +7425,7 @@ app.post('/miniapi/web/order/create', async (req, res) => {
       await client.query('BEGIN')
       const stockSnapshot = []
       for (const item of validItems) {
-        const inv = (await client.query(
-          `SELECT qty, warehouse_id, warehouse_name FROM stock_inventory
-           WHERE goods_id=$1 ORDER BY warehouse_id ASC LIMIT 1 FOR UPDATE`,
-          [item.goods_id]
-        )).rows[0]
+        const inv = await pickOrderStockRow(client, item.goods_id)
         const before = inv ? parseFloat(inv.qty) : 0
         if (!inv || before < item.qty) {
           const err = new Error(`商品「${item.goods_name}」库存不足${inv ? `，剩余 ${before}` : ''}`)
@@ -7883,10 +7896,15 @@ async function releaseOrderBenefits(client, order, remark = '订单取消退回'
       const items = (await client.query(`SELECT goods_id, goods_name, qty FROM mini_order_items WHERE order_id=$1`, [order.id])).rows
       for (const it of items) {
         if (!it.goods_id || !it.qty) continue
-        const inv = (await client.query(
-          `SELECT qty, warehouse_id, warehouse_name FROM stock_inventory WHERE goods_id=$1 ORDER BY warehouse_id ASC LIMIT 1 FOR UPDATE`,
-          [it.goods_id]
+        // 退回下单时扣的那个仓库；找不到下单流水再按默认仓库
+        const flowWh = (await client.query(
+          `SELECT warehouse_id FROM stock_flow WHERE order_no=$1 AND goods_id=$2 AND type='mini_order' ORDER BY id DESC LIMIT 1`,
+          [orderNo, it.goods_id]
         )).rows[0]
+        const inv = flowWh
+          ? ((await client.query(`SELECT qty, warehouse_id, warehouse_name FROM stock_inventory WHERE goods_id=$1 AND warehouse_id=$2 LIMIT 1 FOR UPDATE`, [it.goods_id, flowWh.warehouse_id])).rows[0]
+            || await pickOrderStockRow(client, it.goods_id))
+          : await pickOrderStockRow(client, it.goods_id)
         if (!inv) continue
         const before = parseFloat(inv.qty)
         const after = before + parseFloat(it.qty)

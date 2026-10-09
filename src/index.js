@@ -4200,14 +4200,16 @@ async function wxV3QueryOrder(outTradeNo) {
 }
 
 // 微信退款（V3）
-async function wxV3Refund(orderNo, transactionId, refundNo, amountYuan, reason) {
+// totalYuan = 原订单实付总额（微信要求 total 等于下单金额；部分退款时 refund < total）
+async function wxV3Refund(orderNo, transactionId, refundNo, amountYuan, reason, totalYuan = amountYuan) {
   if (!WX_MCH_PRIVATE_KEY || !WX_MCH_CERT_SERIAL) return { skipped: true, reason: 'not configured' }
   const amountFen = Math.round(amountYuan * 100)
   if (amountFen < 1) return { skipped: true, reason: 'amount < 1 fen' }
+  const totalFen = Math.max(amountFen, Math.round(Number(totalYuan || 0) * 100))
   const payload = {
     out_refund_no: refundNo,
     reason: reason || '用户申请退款',
-    amount: { refund: amountFen, total: amountFen, currency: 'CNY' },
+    amount: { refund: amountFen, total: totalFen, currency: 'CNY' },
   }
   if (transactionId) payload.transaction_id = transactionId
   else payload.out_trade_no = orderNo
@@ -6222,7 +6224,9 @@ app.get('/adminapi/mini/orders', auth, async (req, res) => {
     }
     params.push(parseInt(list_rows)); params.push(offset)
     const rows = (await pool.query(
-      `SELECT o.*, u.phone as user_phone FROM mini_orders o LEFT JOIN mini_users u ON u.id=o.user_id WHERE ${where} ORDER BY o.id DESC LIMIT $${params.length-1} OFFSET $${params.length}`,
+      `SELECT o.*, u.phone as user_phone,
+              (SELECT COALESCE(SUM(r.amount),0) FROM mini_refunds r WHERE r.order_id=o.id AND r.status=1) AS refunded_amount
+       FROM mini_orders o LEFT JOIN mini_users u ON u.id=o.user_id WHERE ${where} ORDER BY o.id DESC LIMIT $${params.length-1} OFFSET $${params.length}`,
       params
     )).rows
     for (const o of rows) {
@@ -7796,7 +7800,7 @@ function calcLevel(user) {
   return 0
 }
 
-async function releaseOrderBenefits(client, order, remark = '订单取消退回') {
+async function releaseOrderBenefits(client, order, remark = '订单取消退回', { restock = true } = {}) {
   const pointsUsed = parseInt(order.points_used || 0)
   if (pointsUsed > 0) {
     // 防重：已经返过积分就不再返
@@ -7823,9 +7827,9 @@ async function releaseOrderBenefits(client, order, remark = '订单取消退回'
   }
   // 阻止后续佣金结算（即使冷静期已过，cron 不应再发放）
   await client.query(`UPDATE mini_orders SET commission_settled=true WHERE id=$1 AND commission_settled=false`, [order.id])
-  // 回滚库存（防重：检查 stock_flow 是否已存在该订单的回滚记录）
+  // 回滚库存（防重：检查 stock_flow 是否已存在该订单的回滚记录）；已发货且货没退回时不加回
   const orderNo = order.order_no || ''
-  if (orderNo) {
+  if (orderNo && restock) {
     const restored = (await client.query(
       `SELECT id FROM stock_flow WHERE order_no=$1 AND type='mini_refund' LIMIT 1`, [orderNo]
     )).rows[0]
@@ -10321,6 +10325,108 @@ app.get('/adminapi/refund/list', auth, async (req, res) => {
   } catch(e) { fail(res, e.message) }
 })
 
+// 执行一笔已存在的退款申请（客户申请后同意、商家主动退款共用）
+// 全额（含之前已退）→ 订单改已退款，退回积分/券，按 restock 决定是否加回库存；部分退款 → 只退钱，订单回到原状态
+// restock 未指定时：没发货（原状态 0/1）加回，已发货（2/3）不加
+async function executeRefund(refund, note = '', { restock } = {}) {
+  const order = (await pool.query(`SELECT * FROM mini_orders WHERE id=$1`, [refund.order_id])).rows[0]
+  if (!order) return { ok: false, message: '订单不存在' }
+  const orderTotal = Math.round(parseFloat(order.total_amount || 0) * 100) / 100
+  const amount = Math.round(parseFloat(refund.amount || 0) * 100) / 100
+  // 同一条退款申请固定用一个商户退款单号：并发/重试时微信只会退一次
+  const refundNo = `RF${refund.id}`
+  const wxResult = await wxV3Refund(order.order_no, order.wx_transaction_id || '', refundNo, amount, refund.reason, orderTotal)
+  if (wxResult.skipped && wxResult.reason === 'not configured') return { ok: false, message: '微信商户号未配置，无法退款（请在 收款设置 填写）' }
+  if (!wxResult.skipped && !wxResult.refund_id) return { ok: false, message: `微信退款失败：${wxResult.message || wxResult.code || '未知错误'}` }
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    const claimed = await client.query(
+      `UPDATE mini_refunds SET status=1, note=$1, handled_at=NOW(), wx_refund_no=$2 WHERE id=$3 AND status=0 RETURNING id`,
+      [note, wxResult.refund_id || refundNo, refund.id]
+    )
+    if (!claimed.rows.length) { await client.query('ROLLBACK'); return { ok: true, already: true } }
+    const fullOrder = (await client.query(`SELECT * FROM mini_orders WHERE id=$1 FOR UPDATE`, [refund.order_id])).rows[0]
+    const refundedSum = parseFloat((await client.query(
+      `SELECT COALESCE(SUM(amount),0) AS s FROM mini_refunds WHERE order_id=$1 AND status=1`, [refund.order_id]
+    )).rows[0].s)
+    const origStatus = Number(refund.original_order_status ?? fullOrder?.status ?? 1)
+    if (refundedSum >= orderTotal - 0.005) {
+      const doRestock = restock === undefined || restock === null ? origStatus <= 1 : !!restock
+      if (fullOrder) await releaseOrderBenefits(client, fullOrder, '退款回滚', { restock: doRestock })
+      await client.query(`UPDATE mini_orders SET status=4 WHERE id=$1`, [refund.order_id])
+    } else if (Number(fullOrder?.status) === 5) {
+      // 部分退款：订单回到申请前的状态，照常发货/完成
+      await client.query(`UPDATE mini_orders SET status=$1 WHERE id=$2`, [origStatus, refund.order_id])
+    }
+    await client.query('COMMIT')
+    return { ok: true, full: refundedSum >= orderTotal - 0.005, refundedSum }
+  } catch (e) {
+    await client.query('ROLLBACK')
+    // 微信钱已退但DB回滚失败：记日志后人工处理
+    console.error('[executeRefund] DB rollback after wx refund success', e.message, { refund_id: refund.id })
+    return { ok: false, message: '退款已发起但本地回滚失败，请联系管理员' }
+  } finally {
+    client.release()
+  }
+}
+
+// 管理端：商家主动退款（全额/部分）。先建一条退款记录（退款管理里可见），再立即执行
+app.post('/adminapi/mini/order/refund', auth, async (req, res) => {
+  try {
+    const orderId = parseInt(req.body.order_id)
+    const reason = String(req.body.reason || '').trim().slice(0, 200)
+    const amountIn = Math.round(parseFloat(req.body.amount) * 100) / 100
+    if (!orderId) return fail(res, '订单ID缺失')
+    if (!reason) return fail(res, '请填写退款原因')
+    if (!(amountIn > 0)) return fail(res, '退款金额必须大于 0')
+    let refund
+    const client = await pool.connect()
+    try {
+      await client.query('BEGIN')
+      const order = (await client.query(`SELECT * FROM mini_orders WHERE id=$1 FOR UPDATE`, [orderId])).rows[0]
+      if (!order) throw new Error('订单不存在')
+      const st = Number(order.status)
+      if (st === 5) throw new Error('该订单已有退款申请在处理，请到「退款管理」处理')
+      if (![1, 2, 3].includes(st)) throw new Error('只有已付款的订单（待发货/已发货/已完成）可以退款')
+      const pending = (await client.query(`SELECT id FROM mini_refunds WHERE order_id=$1 AND status=0 LIMIT 1`, [orderId])).rows[0]
+      if (pending) throw new Error('该订单已有退款申请在处理，请到「退款管理」处理')
+      const refundedSum = parseFloat((await client.query(
+        `SELECT COALESCE(SUM(amount),0) AS s FROM mini_refunds WHERE order_id=$1 AND status=1`, [orderId]
+      )).rows[0].s)
+      const remaining = Math.round((parseFloat(order.total_amount || 0) - refundedSum) * 100) / 100
+      if (amountIn > remaining + 0.001) throw new Error(`最多还能退 ¥${remaining.toFixed(2)}`)
+      refund = (await client.query(
+        `INSERT INTO mini_refunds (order_id, user_id, reason, images, amount, status, original_order_status)
+         VALUES ($1,$2,$3,'',$4,0,$5) RETURNING *`,
+        [orderId, order.user_id || 0, `[商家主动退款] ${reason}`, amountIn, st]
+      )).rows[0]
+      await client.query('COMMIT')
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {})
+      client.release()
+      return fail(res, e.message)
+    }
+    client.release()
+    const r = await executeRefund(refund, String(req.body.note || '').trim(), { restock: req.body.restock })
+    if (!r.ok) {
+      // 微信没退成功：撤掉这条记录，订单保持原样
+      if (!/本地回滚失败/.test(r.message)) await pool.query(`DELETE FROM mini_refunds WHERE id=$1 AND status=0`, [refund.id]).catch(() => {})
+      return fail(res, r.message)
+    }
+    const openid = (await pool.query(`SELECT openid FROM mini_users WHERE id=$1`, [refund.user_id || 0]).catch(() => ({ rows: [] }))).rows[0]?.openid
+    if (openid && TMPL_REFUND) {
+      sendSubscribeMsg(openid, TMPL_REFUND, `pages/order/detail?id=${orderId}`, {
+        thing1: { value: `订单退款` },
+        phrase2: { value: '退款已同意' },
+        amount3: { value: `¥${amountIn.toFixed(2)}` },
+        thing4: { value: '将原路退回' },
+      }).catch(() => {})
+    }
+    ok(res, { message: r.full ? '已全额退款' : '已部分退款', full: r.full, refunded: r.refundedSum })
+  } catch (e) { fail(res, e.message) }
+})
+
 // 管理端：处理退款（同意/拒绝）
 app.post('/adminapi/refund/handle', auth, async (req, res) => {
   try {
@@ -10337,42 +10443,8 @@ app.post('/adminapi/refund/handle', auth, async (req, res) => {
     if (refund.status !== 0) return fail(res, '该申请已处理')
 
     if (action === 'approve') {
-      // 调用微信退款接口
-      const refundNo = `RF${refund.id}T${Date.now()}`
-      const wxResult = await wxV3Refund(
-        refund.order_no,
-        refund.wx_transaction_id || '',
-        refundNo,
-        parseFloat(refund.amount),
-        refund.reason
-      )
-      if (wxResult.code && wxResult.code !== 'SUCCESS' && !wxResult.skipped) {
-        return fail(res, `微信退款失败：${wxResult.message || wxResult.code}`)
-      }
-      // 同事务：标退款单、改订单状态、回滚积分/券/库存
-      const client = await pool.connect()
-      try {
-        await client.query('BEGIN')
-        await client.query(
-          `UPDATE mini_refunds SET status=1, note=$1, handled_at=NOW(), wx_refund_no=$2 WHERE id=$3`,
-          [note, wxResult.refund_id || refundNo, id]
-        )
-        const fullOrder = (await client.query(
-          `SELECT * FROM mini_orders WHERE id=$1 FOR UPDATE`, [refund.order_id]
-        )).rows[0]
-        if (fullOrder) {
-          await releaseOrderBenefits(client, fullOrder, '退款回滚')
-        }
-        await client.query(`UPDATE mini_orders SET status=4 WHERE id=$1`, [refund.order_id])
-        await client.query('COMMIT')
-      } catch (e) {
-        await client.query('ROLLBACK')
-        // 微信钱已退但DB回滚失败：记日志后人工处理
-        console.error('[refund/handle] DB rollback after wx refund success', e.message, { refund_id: id })
-        return fail(res, '退款已发起但本地回滚失败，请联系管理员')
-      } finally {
-        client.release()
-      }
+      const r = await executeRefund(refund, note, { restock: req.body.restock })
+      if (!r.ok) return fail(res, r.message)
     } else if (action === 'negotiate') {
       // 协商方案不直接退款，也不关闭申请；保留待处理状态，方便客服继续沟通。
       const labels = { refund: '协商退款', exchange: '换货', resend: '补发', compensate: '部分退款/补偿' }

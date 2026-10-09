@@ -1831,6 +1831,15 @@ router.get('/stock/StockAll/index', async (req, res) => {
       params.push(`%${keyword}%`)
       where += ` AND (goods_name ILIKE $1 OR goods_code ILIKE $1)`
     }
+    // 按仓库筛（盘点单读某个仓库的账面数要用）
+    const whId = Number(req.query.warehouse_id || 0)
+    if (Number.isSafeInteger(whId) && whId > 0) {
+      params.push(whId)
+      where += ` AND warehouse_id=$${params.length}`
+    } else if (req.query.warehouse_name) {
+      params.push(String(req.query.warehouse_name))
+      where += ` AND warehouse_name=$${params.length}`
+    }
     const countR = await pool.query(`SELECT COUNT(*) FROM stock_inventory ${where}`, params)
     const rowsR = await pool.query(`SELECT * FROM stock_inventory ${where} ORDER BY id DESC LIMIT $${params.length+1} OFFSET $${params.length+2}`, [...params, list_rows, offset])
     return ok(res, { rows: rowsR.rows, total: parseInt(countR.rows[0].count), page, list_rows })
@@ -2137,11 +2146,38 @@ router.get('/stock/StockCheck/index', async (req, res) => {
 })
 router.post('/stock/StockCheck/add', async (req, res) => {
   try {
-    const b = filterBodyCols('stock_checks', { order_no: genOrderNo('PD'), ...req.body, shop_id: parseInt(req.admin?.shop_id) || 1 })
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    const no = genOrderNo('PD')
+    // 新建一律是草稿（status=0），要动库存走 /audit
+    const b = filterBodyCols('stock_checks', { ...req.body, order_no: no, order_sn: req.body.order_sn || no, status: 0, shop_id: shopId })
+    if (b.goods_info && typeof b.goods_info !== 'string') b.goods_info = JSON.stringify(b.goods_info)
     const cols = Object.keys(b).filter(k => b[k] !== undefined)
-    const vals = cols.map(k => typeof b[k] === 'object' ? JSON.stringify(b[k]) : b[k])
+    const vals = cols.map(k => b[k])
     const r = await pool.query(`INSERT INTO stock_checks (${cols.join(',')}) VALUES (${cols.map((_,i)=>`$${i+1}`)}) RETURNING *`, vals)
     return ok(res, r.rows[0])
+  } catch (e) { fail(res, e.message) }
+})
+router.post('/stock/StockCheck/edit', async (req, res) => {
+  try {
+    const { id, ...rest } = req.body
+    if (!id) return fail(res, 'id不能为空')
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    const cur = (await pool.query('SELECT status FROM stock_checks WHERE id=$1 AND shop_id=$2', [id, shopId])).rows[0]
+    if (!cur) return fail(res, '盘点单不存在')
+    if (Number(cur.status) === 1) return fail(res, '盘点单已审核，先反审核再改')
+    const { status: _s, order_no: _n, shop_id: _sh, ...editable } = rest
+    const b = filterBodyCols('stock_checks', editable)
+    if (b.goods_info && typeof b.goods_info !== 'string') b.goods_info = JSON.stringify(b.goods_info)
+    const cols = Object.keys(b).filter(k => b[k] !== undefined && k !== 'id')
+    if (cols.length) await pool.query(`UPDATE stock_checks SET ${cols.map((c,i)=>`${c}=$${i+1}`)} WHERE id=$${cols.length+1} AND shop_id=$${cols.length+2}`, [...cols.map(k => b[k]), id, shopId])
+    return ok(res)
+  } catch (e) { fail(res, e.message) }
+})
+router.post('/stock/StockCheck/audit', async (req, res) => {
+  try {
+    const { id, status } = req.body
+    if (!id) return fail(res, 'id不能为空')
+    return ok(res, await audits.auditCheck(id, status ?? 1, Number(req.admin.shop_id)))
   } catch (e) { fail(res, e.message) }
 })
 router.post('/stock/StockCheck/del', async (req, res) => {
@@ -2149,6 +2185,8 @@ router.post('/stock/StockCheck/del', async (req, res) => {
     const { id } = req.body
     if (!id) return fail(res, 'id不能为空')
     const shopId = parseInt(req.admin?.shop_id) || 1
+    const cur = (await pool.query('SELECT status FROM stock_checks WHERE id=$1 AND shop_id=$2', [id, shopId])).rows[0]
+    if (cur && Number(cur.status) === 1) return fail(res, '盘点单已审核，先反审核再删除')
     await pool.query('DELETE FROM stock_checks WHERE id=$1 AND shop_id=$2', [id, shopId])
     return ok(res)
   } catch (e) { fail(res, e.message) }

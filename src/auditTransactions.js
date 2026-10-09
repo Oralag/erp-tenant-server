@@ -218,6 +218,47 @@ function createAuditService(pool) {
     status = statusValue(status)
     return transaction(async client => retailInTransaction(client, await lockOrder(client,'retail_orders',id,shopId),status,shopId))
   }
-  return { transaction, auditPurchase, auditOutbound, annulOutbound, auditRetail, retailInTransaction }
+  // 盘点单：审核时按「审核那一刻」的账面数算差额（实盘 - 账面），差多少调多少，每个商品写一条 stock_check 流水；
+  // 反审核按流水把调整原样撤回并删掉流水。账面数不用单据里存的 system_qty（开单后可能又卖了货）
+  async function auditCheck(id, status, shopId) {
+    status = statusValue(status)
+    return transaction(async client => {
+      const order = await lockOrder(client, 'stock_checks', id, shopId)
+      if (Number(order.status) === status) return { changed: false }
+      const orderNo = order.order_no || `PD${order.id}`
+      if (status === 1) {
+        const whId = Number(order.warehouse_id) || 0
+        if (!whId) throw new Error('盘点单没有选仓库')
+        const raw = typeof order.goods_info === 'string' ? JSON.parse(order.goods_info || '[]') : (order.goods_info || [])
+        const items = (Array.isArray(raw) ? raw : []).filter(i => Number(i?.goods_id) > 0 && i?.check_qty !== '' && i?.check_qty != null)
+        if (!items.length) throw new Error('盘点单里没有填实盘数量的商品')
+        const seen = new Set()
+        for (const it of items.sort((a, b) => Number(a.goods_id) - Number(b.goods_id))) {
+          const gid = positiveInteger(it.goods_id)
+          if (seen.has(gid)) throw new Error(`盘点单里「${it.goods_name || gid}」重复了，请合并成一行`)
+          seen.add(gid)
+          const actual = Number(it.check_qty)
+          if (!Number.isFinite(actual) || actual < 0) throw new Error(`「${it.goods_name || gid}」实盘数量无效`)
+          const cur = (await client.query('SELECT qty FROM stock_inventory WHERE goods_id=$1 AND warehouse_id=$2 AND shop_id=$3', [gid, whId, shopId])).rows[0]
+          const delta = Math.round((actual - Number(cur?.qty || 0)) * 10000) / 10000
+          if (delta === 0) continue
+          const item = { goods_id: gid, goods_name: it.goods_name || '', unit_name: it.unit_name || '' }
+          const { before, after } = await stockDelta(client, shopId, whId, order.warehouse_name || '', item, delta)
+          await client.query(`INSERT INTO stock_flow (goods_id,goods_name,warehouse_id,warehouse_name,type,qty,before_qty,after_qty,order_no,remark,shop_id)
+            VALUES ($1,$2,$3,$4,'stock_check',$5,$6,$7,$8,$9,$10)`,
+          [gid, item.goods_name, whId, order.warehouse_name || '', delta, before, after, orderNo, `stock_check#${order.id}`, shopId])
+        }
+      } else {
+        const { rows } = await client.query(`SELECT * FROM stock_flow WHERE shop_id=$1 AND type='stock_check' AND remark=$2 ORDER BY goods_id,id FOR UPDATE`, [shopId, `stock_check#${order.id}`])
+        for (const flow of rows) {
+          await stockDelta(client, shopId, flow.warehouse_id, flow.warehouse_name || '', flow, -(Number(flow.after_qty) - Number(flow.before_qty)))
+        }
+        if (rows.length) await client.query('DELETE FROM stock_flow WHERE id=ANY($1::int[]) AND shop_id=$2', [rows.map(r => r.id), shopId])
+      }
+      await client.query('UPDATE stock_checks SET status=$1 WHERE id=$2 AND shop_id=$3', [status, order.id, shopId])
+      return { changed: true }
+    })
+  }
+  return { transaction, auditPurchase, auditOutbound, annulOutbound, auditRetail, retailInTransaction, auditCheck }
 }
 module.exports = { createAuditService }

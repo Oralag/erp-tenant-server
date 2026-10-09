@@ -179,6 +179,16 @@ async function initDb() {
       CREATE TABLE IF NOT EXISTS warehouses (id SERIAL PRIMARY KEY, name VARCHAR(100) NOT NULL UNIQUE, address TEXT DEFAULT '', remark TEXT DEFAULT '', status INT DEFAULT 1, create_time TIMESTAMP DEFAULT NOW());
       CREATE TABLE IF NOT EXISTS stock_flow (id SERIAL PRIMARY KEY, goods_id INT DEFAULT 0, goods_name VARCHAR(200) DEFAULT '', warehouse_id INT DEFAULT 0, warehouse_name VARCHAR(100) DEFAULT '', type VARCHAR(50) DEFAULT '', qty INT DEFAULT 0, before_qty INT DEFAULT 0, after_qty INT DEFAULT 0, order_no VARCHAR(100) DEFAULT '', remark TEXT DEFAULT '', created_at TIMESTAMP DEFAULT NOW());
       CREATE TABLE IF NOT EXISTS stock_checks (id SERIAL PRIMARY KEY, order_no VARCHAR(100) DEFAULT '', warehouse_id INT DEFAULT 0, warehouse_name VARCHAR(100) DEFAULT '', goods_info JSONB DEFAULT '[]', remark TEXT DEFAULT '', status INT DEFAULT 0, admin_name VARCHAR(100) DEFAULT '', created_at TIMESTAMP DEFAULT NOW());
+      -- 线上盘点表可能是旧结构，补齐盘点单要用的列
+      ALTER TABLE stock_checks ADD COLUMN IF NOT EXISTS order_no VARCHAR(100) DEFAULT '';
+      ALTER TABLE stock_checks ADD COLUMN IF NOT EXISTS order_sn VARCHAR(100) DEFAULT '';
+      ALTER TABLE stock_checks ADD COLUMN IF NOT EXISTS check_date DATE;
+      ALTER TABLE stock_checks ADD COLUMN IF NOT EXISTS warehouse_id INT DEFAULT 0;
+      ALTER TABLE stock_checks ADD COLUMN IF NOT EXISTS warehouse_name VARCHAR(100) DEFAULT '';
+      ALTER TABLE stock_checks ADD COLUMN IF NOT EXISTS goods_info JSONB DEFAULT '[]';
+      ALTER TABLE stock_checks ADD COLUMN IF NOT EXISTS remark TEXT DEFAULT '';
+      ALTER TABLE stock_checks ADD COLUMN IF NOT EXISTS status INT DEFAULT 0;
+      ALTER TABLE stock_checks ADD COLUMN IF NOT EXISTS admin_name VARCHAR(100) DEFAULT '';
       CREATE TABLE IF NOT EXISTS stock_other_in (id SERIAL PRIMARY KEY, order_no VARCHAR(100) DEFAULT '', warehouse_id INT DEFAULT 0, warehouse_name VARCHAR(100) DEFAULT '', goods_info JSONB DEFAULT '[]', remark TEXT DEFAULT '', status INT DEFAULT 0, created_at TIMESTAMP DEFAULT NOW());
       CREATE TABLE IF NOT EXISTS stock_other_out (id SERIAL PRIMARY KEY, order_no VARCHAR(100) DEFAULT '', warehouse_id INT DEFAULT 0, warehouse_name VARCHAR(100) DEFAULT '', goods_info JSONB DEFAULT '[]', remark TEXT DEFAULT '', status INT DEFAULT 0, created_at TIMESTAMP DEFAULT NOW());
       CREATE TABLE IF NOT EXISTS stock_allocation (id SERIAL PRIMARY KEY, transfer_no VARCHAR(100) DEFAULT '', allot_date DATE, from_warehouse_id INT DEFAULT 0, from_warehouse VARCHAR(100) DEFAULT '', to_warehouse_id INT DEFAULT 0, to_warehouse VARCHAR(100) DEFAULT '', goods_info JSONB DEFAULT '[]', total_amount DECIMAL(10,2) DEFAULT 0, remark TEXT DEFAULT '', status INT DEFAULT 0, admin_name VARCHAR(100) DEFAULT '', created_at TIMESTAMP DEFAULT NOW());

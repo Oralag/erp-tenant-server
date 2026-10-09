@@ -624,7 +624,7 @@ const GOODS_ALLOWED_COLS = new Set([
   'spec','sell_price','cost_price','barcode',
   'safe_min','safe_max','sort','make_time',
   'can_sale','can_buy','can_make','can_outsource',
-  'multi_unit','multi_spec',
+  'multi_unit','multi_spec','last_purchase_price',
   'stock','min_stock','max_stock',
   'remark','status','images',
 ])
@@ -2318,7 +2318,7 @@ router.post('/procure/ProcureInhouse/del', async (req, res) => {
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
-// 采购入库的移动加权平均成本（基础单位）：
+// 采购入库的移动加权平均成本（基础单位），同时记下最后一次进货价（goods.last_purchase_price + 该单位的 goods_unit_convert.cost_price）：
 //   新成本 = (入库前总库存 × 原成本 + 本次入库基础数量 × 本次基础单价) / (入库前总库存 + 本次入库数量)
 // 入库前库存为负或 0 时只按本次算。入库行选了规格（item.spec 对上 goods.spec 的 skus）且该规格挂的就是本商品时，
 // 同时累计这个规格自己的进货金额/数量（cost_amount/cost_qty），规格成本 = 累计金额 / 累计数量（如不同口味混在一个库存里）
@@ -2350,7 +2350,12 @@ async function updateMovingAvgCost(db, goodsId, item, baseQty) {
       }
     } catch {}
   }
-  await db.query('UPDATE goods SET cost_price=$1, spec=$2 WHERE id=$3', [Math.round(avg * 10000) / 10000, spec, goodsId])
+  await db.query('UPDATE goods SET cost_price=$1, spec=$2, last_purchase_price=$4 WHERE id=$3', [Math.round(avg * 10000) / 10000, spec, goodsId, Math.round(baseCost * 10000) / 10000])
+  // 这次按什么单位进的（如麻袋），就把这个单位的采购价更新成这次的进价，下次采购单选这个单位直接带出
+  const unitName = String(item?.unit_name || '').trim()
+  if (unitName) {
+    await db.query('UPDATE goods_unit_convert SET cost_price=$1 WHERE goods_id=$2 AND unit_name=$3', [Math.round(unitCost * 10000) / 10000, goodsId, unitName])
+  }
 }
 
 router.post('/procure/ProcureInhouse/audit', async (req, res) => {

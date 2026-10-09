@@ -302,6 +302,8 @@ async function initDb() {
       "ALTER TABLE goods ADD COLUMN IF NOT EXISTS goods_sn VARCHAR(100) DEFAULT ''",
       "ALTER TABLE goods ADD COLUMN IF NOT EXISTS en_name VARCHAR(200) DEFAULT ''",
       "ALTER TABLE goods ADD COLUMN IF NOT EXISTS goods_memo VARCHAR(200) DEFAULT ''",
+      // 最后一次进货价（基础单位），采购单默认带这个；cost_price 是移动加权平均（库存均价）
+      "ALTER TABLE goods ADD COLUMN IF NOT EXISTS last_purchase_price DECIMAL(12,4)",
       "ALTER TABLE goods ADD COLUMN IF NOT EXISTS goods_type INT DEFAULT 1",
       "ALTER TABLE goods ADD COLUMN IF NOT EXISTS sell_price DECIMAL(10,2) DEFAULT 0",
       "ALTER TABLE goods ADD COLUMN IF NOT EXISTS cost_price DECIMAL(10,2) DEFAULT 0",

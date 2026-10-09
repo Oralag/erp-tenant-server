@@ -791,21 +791,24 @@ router.get('/goods/GoodsUnitConvert/index', async (req, res) => {
 })
 router.post('/goods/GoodsUnitConvert/save', async (req, res) => {
   // 传入 goods_id + units 数组 [{unit_name, ratio, cost_price?}]，整体覆盖保存
-  // cost_price = 该单位的采购价；没传的单位沿用原来存的价，免得只改换算比的地方把价冲掉
+  // cost_price = 该单位的采购价；没传的单位沿用原来存的价，免得只改换算比的地方把价冲掉（purchase_only 同理）
   try {
     const { goods_id, units } = req.body
     if (!goods_id) return fail(res, 'goods_id不能为空')
     const goodsId = Number(goods_id)
     if (!Number.isSafeInteger(goodsId) || goodsId <= 0) return fail(res, '商品ID无效，请刷新商品列表后重试')
-    const prev = await pool.query('SELECT unit_name, cost_price FROM goods_unit_convert WHERE goods_id=$1', [goodsId])
+    const prev = await pool.query('SELECT unit_name, cost_price, purchase_only FROM goods_unit_convert WHERE goods_id=$1', [goodsId])
     const prevPrice = new Map(prev.rows.map(r => [r.unit_name, r.cost_price]))
+    const prevPurchaseOnly = new Map(prev.rows.map(r => [r.unit_name, !!r.purchase_only]))
     await pool.query('DELETE FROM goods_unit_convert WHERE goods_id=$1', [goodsId])
     if (Array.isArray(units) && units.length) {
       for (const u of units) {
         if (u.unit_name && u.ratio > 0) {
           const hasPrice = u.cost_price !== undefined && u.cost_price !== null && u.cost_price !== ''
           const cost = hasPrice ? (Number(u.cost_price) >= 0 ? Number(u.cost_price) : null) : (prevPrice.get(u.unit_name) ?? null)
-          await pool.query('INSERT INTO goods_unit_convert (goods_id,unit_name,ratio,cost_price) VALUES ($1,$2,$3,$4)', [goodsId, u.unit_name, u.ratio, cost])
+          // purchase_only = 只用于采购（如按麻袋进货），收银台不出这个单位；没传沿用原值
+          const purchaseOnly = typeof u.purchase_only === 'boolean' ? u.purchase_only : (prevPurchaseOnly.get(u.unit_name) ?? false)
+          await pool.query('INSERT INTO goods_unit_convert (goods_id,unit_name,ratio,cost_price,purchase_only) VALUES ($1,$2,$3,$4,$5)', [goodsId, u.unit_name, u.ratio, cost, purchaseOnly])
         }
       }
     }

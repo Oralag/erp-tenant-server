@@ -106,6 +106,7 @@ async function initDb() {
         created_at TIMESTAMP DEFAULT NOW(), deleted_at TIMESTAMP
       );
       -- 补已有数据库缺少的列（幂等）
+      ALTER TABLE goods_unit_convert ADD COLUMN IF NOT EXISTS cost_price DECIMAL(12,4);
       ALTER TABLE procure_return ADD COLUMN IF NOT EXISTS order_sn VARCHAR(100) DEFAULT '';
       ALTER TABLE procure_return ADD COLUMN IF NOT EXISTS order_id INT DEFAULT 0;
       ALTER TABLE procure_return ADD COLUMN IF NOT EXISTS admin_name VARCHAR(100) DEFAULT '';

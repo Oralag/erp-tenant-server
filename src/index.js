@@ -2318,6 +2318,41 @@ router.post('/procure/ProcureInhouse/del', async (req, res) => {
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
+// 采购入库的移动加权平均成本（基础单位）：
+//   新成本 = (入库前总库存 × 原成本 + 本次入库基础数量 × 本次基础单价) / (入库前总库存 + 本次入库数量)
+// 入库前库存为负或 0 时只按本次算。入库行选了规格（item.spec 对上 goods.spec 的 skus）且该规格挂的就是本商品时，
+// 同时累计这个规格自己的进货金额/数量（cost_amount/cost_qty），规格成本 = 累计金额 / 累计数量（如不同口味混在一个库存里）
+async function updateMovingAvgCost(db, goodsId, item, baseQty) {
+  const ratio = Number(item?.unit_ratio) > 0 ? Number(item.unit_ratio) : 1
+  const taxRate = Math.max(0, Number(item?.tax_rate || 0))
+  const priceNoTax = Number(item?.price_no_tax || 0)
+  const price = Number(item?.price || item?.in_price || 0)
+  const unitCost = priceNoTax > 0 ? priceNoTax : (taxRate > 0 ? price / (1 + taxRate / 100) : price)
+  const baseCost = unitCost / ratio
+  if (!(baseCost > 0) || !(baseQty > 0)) return
+  const g = (await db.query('SELECT cost_price, spec FROM goods WHERE id=$1', [goodsId])).rows[0]
+  if (!g) return
+  const before = Number((await db.query('SELECT COALESCE(SUM(qty),0) AS q FROM stock_inventory WHERE goods_id=$1', [goodsId])).rows[0].q) || 0
+  const oldCost = Number(g.cost_price || 0)
+  const w = before > 0 && oldCost > 0 ? before : 0
+  const avg = (w * oldCost + baseQty * baseCost) / (w + baseQty)
+  let spec = g.spec
+  const label = String(item?.spec || '').trim()
+  if (label && typeof spec === 'string' && spec.trim().startsWith('{')) {
+    try {
+      const obj = JSON.parse(spec)
+      const sku = obj?.skus?.[label]
+      if (sku && (!sku.goods_id || Number(sku.goods_id) === Number(goodsId))) {
+        sku.cost_qty = Math.round(((Number(sku.cost_qty) || 0) + baseQty) * 10000) / 10000
+        sku.cost_amount = Math.round(((Number(sku.cost_amount) || 0) + baseQty * baseCost) * 100) / 100
+        sku.cost_price = Math.round(sku.cost_amount / sku.cost_qty * 100) / 100
+        spec = JSON.stringify(obj)
+      }
+    } catch {}
+  }
+  await db.query('UPDATE goods SET cost_price=$1, spec=$2 WHERE id=$3', [Math.round(avg * 10000) / 10000, spec, goodsId])
+}
+
 router.post('/procure/ProcureInhouse/audit', async (req, res) => {
   try {
     const { id, status } = req.body
@@ -2356,6 +2391,9 @@ router.post('/procure/ProcureInhouse/audit', async (req, res) => {
         if (lastIn.rows[0]) num = Math.abs(parseFloat(lastIn.rows[0].qty) || 0)
       }
       const change = Math.round(num * delta * 10000) / 10000
+
+      // 入库审核：按移动加权平均更新成本价（以前前端直接用这张单的进价覆盖，成本价=最近一次进价）
+      if (isAudit) await updateMovingAvgCost(pool, goodsId, item, num).catch(e => console.warn('[moving avg cost]', goodsId, e.message))
 
       // upsert stock_inventory
       const existing = await pool.query('SELECT * FROM stock_inventory WHERE goods_id=$1 AND warehouse_id=$2', [goodsId, warehouseId])

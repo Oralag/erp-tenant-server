@@ -3470,7 +3470,8 @@ router.get('/setting/params/index', async (req, res) => {
     await listQuery(res, 'sys_params', { keyword: req.query.keyword, keywordCols: ['key','value'], baseWhere: shopBase(req, '1=1'), orderBy: 'id ASC', page, list_rows, offset })
   } catch (e) { fail(res, e.message) }
 })
-router.post('/setting/params/edit', async (req, res) => {
+// 前端「新建参数」走 add、「改参数」走 edit，两个都按 key 存（有就改、没有就加）
+const saveSysParam = async (req, res) => {
   try {
     const { key, value } = req.body
     if (!key) return fail(res, 'key不能为空')
@@ -3484,7 +3485,9 @@ router.post('/setting/params/edit', async (req, res) => {
     }
     return ok(res)
   } catch (e) { fail(res, e.message) }
-})
+}
+router.post('/setting/params/add', saveSysParam)
+router.post('/setting/params/edit', saveSysParam)
 
 // ─── video/render ───────────────────────────────────────────────────────────
 

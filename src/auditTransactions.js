@@ -177,7 +177,11 @@ function createAuditService(pool) {
       const items = itemsOf(order.goods_info).map(i => ({...i,num:Math.round(Number(i.num)*(Number(i.unit_ratio)||1)*10000)/10000,unit_ratio:1}))
       let outId = 0
       if (items.length) {
-        const wh = (await client.query('SELECT * FROM warehouses WHERE shop_id=$1 ORDER BY id LIMIT 1', [shopId])).rows[0]
+        // 零售出库扣「仓库设置」里的默认仓库；没设或那个仓库已删，才退回第一个仓库
+        const defParam = (await client.query(`SELECT value FROM sys_params WHERE key='default_warehouse_id' AND shop_id=$1 LIMIT 1`, [shopId])).rows[0]
+        const defWhId = Number(defParam?.value || 0)
+        const wh = (defWhId > 0 ? (await client.query('SELECT * FROM warehouses WHERE id=$1 AND shop_id=$2', [defWhId, shopId])).rows[0] : null)
+          || (await client.query('SELECT * FROM warehouses WHERE shop_id=$1 ORDER BY id LIMIT 1', [shopId])).rows[0]
         if (!wh) throw new Error('找不到仓库')
         const out = (await client.query(`INSERT INTO stock_other_out (order_no,warehouse_id,warehouse_name,goods_info,remark,status,shop_id)
           VALUES ($1,$2,$3,$4,$5,1,$6) RETURNING *`, [`LSCK${order.id}`,wh.id,wh.name,JSON.stringify(items),`零售出库#${order.id}`,shopId])).rows[0]

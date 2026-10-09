@@ -24,6 +24,12 @@ function createAuditService(pool) {
         fund_id INTEGER NOT NULL, amount NUMERIC(18,2) NOT NULL,
         other_out_id INTEGER NOT NULL DEFAULT 0
       )`)
+      // 采购退货审核时实际退了多少、改了采购单多少，反审核/删除按这里原样撤回
+      await pool.query(`CREATE TABLE IF NOT EXISTS procure_return_effects (
+        return_id INTEGER PRIMARY KEY, shop_id INTEGER NOT NULL,
+        order_id INTEGER NOT NULL DEFAULT 0, fund_id INTEGER NOT NULL DEFAULT 0,
+        return_amount NUMERIC(18,2) NOT NULL DEFAULT 0, refund NUMERIC(18,2) NOT NULL DEFAULT 0
+      )`)
     })().catch(e => { schemaReady = null; throw e })
     return schemaReady
   }
@@ -134,6 +140,20 @@ function createAuditService(pool) {
       return { changed: true }
     })
   }
+  // 采购单名下的付款单：单号精确匹配，或备注「采购单付款 #id」等精确到编号（#12 不会匹配到 #120）
+  async function purchaseReceipts(client, po, shopId) {
+    const marker = `(采购单(自动)?付款|Purchase Order Payment|采购单据支出|Purchase Document Expense|采购运费|Purchase Freight|采购附加费用|Purchase Addon Fee)[[:space:]]*#${Number(po.id)}([^0-9]|$)`
+    return client.query(`SELECT * FROM pay_receipt WHERE shop_id=$1 AND deleted_at IS NULL
+      AND ((order_sn<>'' AND order_sn=ANY($2::text[])) OR remark ~ $3) ORDER BY id FOR UPDATE`,
+    [shopId,[po.order_no,po.order_sn].filter(Boolean),marker])
+  }
+  // 逐张退回各自的资金账户并软删（不按 po.pay_amount 整笔退，避免和手动付款单重复退）
+  async function reversePurchaseReceipts(client, receipts, shopId) {
+    for (const receipt of receipts.rows) {
+      if (receipt.fund_id && Number(receipt.status) === 1) await fundDelta(client, receipt.fund_id, Number(receipt.amount), shopId)
+      await client.query('UPDATE pay_receipt SET deleted_at=NOW() WHERE id=$1 AND shop_id=$2', [receipt.id,shopId])
+    }
+  }
   async function auditPurchase(id, status, shopId) {
     status = statusValue(status)
     return transaction(async client => {
@@ -141,10 +161,7 @@ function createAuditService(pool) {
       if (Number(po.status) === status) return { changed: false }
       const orderNo = po.order_no || po.order_sn || ''
       const amount = Number(po.pay_amount || 0)
-      const marker = `(采购单(自动)?付款|Purchase Order Payment|采购单据支出|Purchase Document Expense|采购运费|Purchase Freight|采购附加费用|Purchase Addon Fee)[[:space:]]*#${Number(id)}([^0-9]|$)`
-      const receipts = await client.query(`SELECT * FROM pay_receipt WHERE shop_id=$1 AND deleted_at IS NULL
-        AND ((order_sn<>'' AND order_sn=ANY($2::text[])) OR remark ~ $3) ORDER BY id FOR UPDATE`,
-      [shopId,[po.order_no,po.order_sn].filter(Boolean),marker])
+      const receipts = await purchaseReceipts(client, po, shopId)
       if (status === 1 && amount > 0) {
         if (!po.fund_id) throw new Error('请先在采购单中选择资金账户再审核')
         const main = receipts.rows.filter(r => !/(附加费用|Addon Fee|运费|Freight|单据支出|Document Expense)/.test(r.remark || ''))
@@ -157,12 +174,98 @@ function createAuditService(pool) {
       } else if (status === 0) {
         // Refund the surviving receipts only. A receipt already reversed by
         // an older client must never cause a second refund from po.pay_amount.
-        for (const receipt of receipts.rows) {
-          if (receipt.fund_id && Number(receipt.status) === 1) await fundDelta(client, receipt.fund_id, Number(receipt.amount), shopId)
-          await client.query('UPDATE pay_receipt SET deleted_at=NOW() WHERE id=$1 AND shop_id=$2', [receipt.id,shopId])
-        }
+        await reversePurchaseReceipts(client, receipts, shopId)
       }
       await client.query('UPDATE purchase_order SET status=$1 WHERE id=$2 AND shop_id=$3', [status,id,shopId])
+      return { changed: true }
+    })
+  }
+  // 删除采购单：已审核的先按反审核口径逐张退回付款单，再软删（一个事务，批量删除也一样）
+  async function deletePurchases(ids, shopId) {
+    const idList = [...new Set((ids || []).map(Number).filter(n => Number.isSafeInteger(n) && n > 0))].sort((a,b) => a-b)
+    if (!idList.length) throw new Error('ids不能为空')
+    return transaction(async client => {
+      for (const id of idList) {
+        const { rows } = await client.query('SELECT * FROM purchase_order WHERE id=$1 AND shop_id=$2 AND deleted_at IS NULL FOR UPDATE', [id, shopId])
+        const po = rows[0]
+        if (!po) continue
+        if (Number(po.status) === 1) await reversePurchaseReceipts(client, await purchaseReceipts(client, po, shopId), shopId)
+        await client.query('UPDATE purchase_order SET deleted_at=NOW() WHERE id=$1 AND shop_id=$2', [id, shopId])
+      }
+      return { changed: true }
+    })
+  }
+  function roundMoney(n) { return Math.round(Number(n || 0) * 100) / 100 }
+  function procureReturnParts(ret) {
+    const raw = typeof ret.goods_info === 'string' ? JSON.parse(ret.goods_info || '[]') : (ret.goods_info || [])
+    if (!Array.isArray(raw)) throw new Error('商品明细格式错误')
+    const meta = raw.find(i => i && i._meta) || {}
+    const items = raw.filter(i => i && !i._meta)
+    const warehouseId = Number(meta.warehouse_id || ret.warehouse_id || 0)
+    return {
+      meta, items,
+      order: { id: ret.id, order_no: ret.order_no || `procure_return#${ret.id}`, warehouse_id: warehouseId, warehouse_name: meta.warehouse_name || ret.warehouse_name || '', goods_info: items },
+      orderId: Number(meta.order_id || ret.order_id || 0),
+      // 与前端 calcItemsAmount 同口径：所选单位数量 × 所选单位单价
+      returnAmount: roundMoney(items.reduce((sum, i) => sum + Number(i.num || 0) * Number(i.price || 0), 0)),
+    }
+  }
+  // 采购退货审核：按退货单仓库扣库存、退款到资金账户、冲减原采购单金额/已付，全部在一个事务里，并记下实际影响
+  async function applyProcureReturn(client, ret, shopId) {
+    const { meta, order, orderId, returnAmount } = procureReturnParts(ret)
+    if (!order.warehouse_id) throw new Error('退货单没有仓库，无法审核')
+    if (!orderId) throw new Error('退货单没有关联采购单，无法审核')
+    const { rows } = await client.query('SELECT * FROM purchase_order WHERE id=$1 AND shop_id=$2 AND deleted_at IS NULL FOR UPDATE', [orderId, shopId])
+    const po = rows[0]
+    if (!po) throw new Error('关联的采购单不存在')
+    await applyOutbound(client, order, shopId, 'procure_return')
+    const hasAfter = po.after_discount !== null && po.after_discount !== undefined && po.after_discount !== ''
+    const orderTotal = roundMoney(hasAfter ? po.after_discount : po.total_amount)
+    const paid = roundMoney(po.pay_amount)
+    const unpaid = Math.max(0, roundMoney(orderTotal - paid))
+    const refund = Math.min(paid, Math.max(0, roundMoney(returnAmount - unpaid)))
+    const fundId = Number(meta.fund_id || po.fund_id || ret.fund_id || 0)
+    if (refund > 0) {
+      if (!fundId) throw new Error('请先选择退款资金账户')
+      await fundDelta(client, fundId, refund, shopId)
+    }
+    await client.query(`UPDATE purchase_order SET total_amount=GREATEST(0, COALESCE(total_amount,0)-$1),
+      after_discount=CASE WHEN after_discount IS NULL THEN NULL ELSE GREATEST(0, after_discount-$1) END,
+      pay_amount=GREATEST(0, COALESCE(pay_amount,0)-$2) WHERE id=$3 AND shop_id=$4`, [returnAmount, refund, orderId, shopId])
+    await client.query(`INSERT INTO procure_return_effects (return_id,shop_id,order_id,fund_id,return_amount,refund) VALUES ($1,$2,$3,$4,$5,$6)
+      ON CONFLICT (return_id) DO UPDATE SET shop_id=$2, order_id=$3, fund_id=$4, return_amount=$5, refund=$6`,
+    [ret.id, shopId, orderId, refund > 0 ? fundId : 0, returnAmount, refund])
+  }
+  async function reverseProcureReturn(client, ret, shopId) {
+    const { order } = procureReturnParts(ret)
+    const { rows } = await client.query('SELECT * FROM procure_return_effects WHERE return_id=$1 AND shop_id=$2 FOR UPDATE', [ret.id, shopId])
+    const eff = rows[0]
+    if (!eff) throw new Error('历史退货单缺少审核记录，无法安全反审核，请先核对')
+    await reverseOutbound(client, order, shopId, 'procure_return')
+    if (Number(eff.refund) > 0 && eff.fund_id) await fundDelta(client, eff.fund_id, -Number(eff.refund), shopId)
+    if (eff.order_id) {
+      await client.query(`UPDATE purchase_order SET total_amount=COALESCE(total_amount,0)+$1,
+        after_discount=CASE WHEN after_discount IS NULL THEN NULL ELSE after_discount+$1 END,
+        pay_amount=COALESCE(pay_amount,0)+$2 WHERE id=$3 AND shop_id=$4`, [Number(eff.return_amount), Number(eff.refund), eff.order_id, shopId])
+    }
+    await client.query('DELETE FROM procure_return_effects WHERE return_id=$1 AND shop_id=$2', [ret.id, shopId])
+  }
+  async function auditProcureReturn(id, status, shopId) {
+    status = statusValue(status)
+    return transaction(async client => {
+      const ret = await lockOrder(client, 'procure_return', id, shopId)
+      if (Number(ret.status) === status) return { changed: false }
+      if (status === 1) await applyProcureReturn(client, ret, shopId)
+      else await reverseProcureReturn(client, ret, shopId)
+      await client.query('UPDATE procure_return SET status=$1 WHERE id=$2 AND shop_id=$3', [status, id, shopId])
+      return { changed: true }
+    })
+  }
+  async function deleteProcureReturn(id, shopId) {
+    return transaction(async client => {
+      const ret = await lockOrder(client, 'procure_return', id, shopId)
+      if (Number(ret.status) === 1) await reverseProcureReturn(client, ret, shopId)
+      await client.query('DELETE FROM procure_return WHERE id=$1 AND shop_id=$2', [id, shopId])
       return { changed: true }
     })
   }
@@ -259,6 +362,6 @@ function createAuditService(pool) {
       return { changed: true }
     })
   }
-  return { transaction, auditPurchase, auditOutbound, annulOutbound, auditRetail, retailInTransaction, auditCheck }
+  return { transaction, auditPurchase, deletePurchases, auditProcureReturn, deleteProcureReturn, auditOutbound, annulOutbound, auditRetail, retailInTransaction, auditCheck }
 }
 module.exports = { createAuditService }

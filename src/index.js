@@ -1864,7 +1864,9 @@ router.get('/stock/StockWarning/index', async (req, res) => {
 router.get('/stock/WarehouseName/index', async (req, res) => {
   try {
     const { page, list_rows, offset } = pageParams(req.query)
-    await listQuery(res, 'warehouses', { keyword: req.query.keyword, keywordCols: ['name'], baseWhere: shopBase(req), orderBy: 'id ASC', page, list_rows, offset })
+    // 停用的仓库（status=0）默认不返回，开单下拉和「取第一个仓库」都不会再落到它；仓库管理页传 all=1 看全部
+    const base = String(req.query.all || '') === '1' ? shopBase(req) : `${shopBase(req)} AND COALESCE(status,1)<>0`
+    await listQuery(res, 'warehouses', { keyword: req.query.keyword, keywordCols: ['name'], baseWhere: base, orderBy: 'id ASC', page, list_rows, offset })
   } catch (e) { fail(res, e.message) }
 })
 router.post('/stock/WarehouseName/add', async (req, res) => {

@@ -2052,6 +2052,8 @@ router.post('/stock/Allocation/audit', async (req, res) => {
     let goodsInfo = []
     try { goodsInfo = typeof order.goods_info === 'string' ? JSON.parse(order.goods_info) : (order.goods_info || []) } catch {}
 
+    if (newStatus === 1 && !goodsInfo.some(i => Number(i?.goods_id) > 0)) return fail(res, '调拨单里没有商品，不能审核')
+    if (newStatus === 1 && (!order.from_warehouse_id || !order.to_warehouse_id)) return fail(res, '调拨单缺少调出或调入仓库，不能审核')
     const fromId = order.from_warehouse_id || 0
     const fromName = order.from_warehouse || ''
     const toId = order.to_warehouse_id || 0

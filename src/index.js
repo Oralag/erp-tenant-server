@@ -292,6 +292,40 @@ function filterBodyCols(table, body) {
   return Object.fromEntries(Object.entries(body).filter(([k]) => allowed.has(k)))
 }
 
+// 所有业务记录统一按录入账号隔离。超级管理员仍可查看本店全部记录。
+const ADMIN_SCOPED_TABLES = new Set([
+  'goods','goods_cate','goods_unit','goods_brand','goods_spec',
+  'sale_customers','sale_contracts','sale_out_order','sale_return_order','sale_offers','sale_samples',
+  'purchase_order','procure_inhouse','procure_return','procure_plan',
+  'stock_flow','stock_inventory','warehouses','stock_other_in','stock_other_out','stock_allocation','stock_checks',
+  'sale_exchange_order','bom_order','bom_items',
+  'supplier','finance_receivable','finance_payable','collect_receipt','pay_receipt',
+  'finance_invoices','finance_statements','finance_expenses','finance_funds','finance_costs','prepay_record',
+  'retail_orders','retail_members','retail_recharge','retail_stores',
+])
+
+const ADMIN_SCOPE_RESOURCES = [
+  ['/goods/ShopGoodsCate','goods_cate'], ['/goods/GoodsUnitConvert','goods'], ['/goods/ShopUnit','goods_unit'],
+  ['/goods/ShopBrand','goods_brand'], ['/goods/ShopSpec','goods_spec'], ['/goods/ShopGoods','goods'],
+  ['/shop/ShopCustomer','sale_customers'], ['/shop/ContractOrder','sale_contracts'], ['/shop/offerOrder','sale_offers'], ['/shop/SampleOrder','sale_samples'],
+  ['/stock/PurchaseOrder','purchase_order'], ['/stock/SaleOutOrder','sale_out_order'], ['/stock/SaleReturnOrder','sale_return_order'],
+  ['/stock/SaleExchangeOrder','sale_exchange_order'],
+  ['/stock/StockAll','stock_inventory'], ['/stock/InOutFlow','stock_flow'], ['/stock/WarehouseName','warehouses'],
+  ['/stock/OtherOut','stock_other_out'], ['/stock/OtherIn','stock_other_in'], ['/stock/Allocation','stock_allocation'], ['/stock/StockCheck','stock_checks'],
+  ['/procure/supplier','supplier'], ['/procure/ProcurePlan','procure_plan'], ['/procure/ProcureInhouse','procure_inhouse'], ['/procure/ProcureReturn','procure_return'],
+  ['/finance/CollectAccounts','finance_receivable'], ['/finance/PayAccounts','finance_payable'], ['/finance/CollectReceipt','collect_receipt'],
+  ['/finance/PayReceipt','pay_receipt'], ['/finance/Invoice','finance_invoices'], ['/finance/Statement','finance_statements'],
+  ['/finance/Expense','finance_expenses'], ['/finance/Fund','finance_funds'], ['/finance/Cost','finance_costs'], ['/finance/Prepay','prepay_record'],
+  ['/retail/order','retail_orders'], ['/retail/member','retail_members'], ['/retail/recharge','retail_recharge'], ['/retail/store','retail_stores'],
+  ['/goods/BomGoods','bom_order'],
+]
+
+function scopedResource(rawPath) {
+  const path = String(rawPath || '').replace(/^\/adminapi(?=\/)/, '')
+  const hit = ADMIN_SCOPE_RESOURCES.find(([prefix]) => path === prefix || path.startsWith(prefix + '/'))
+  return hit?.[1] || ''
+}
+
 function ok(res, data = {}, message = '') {
   return res.json({ code: 1, data, message })
 }
@@ -318,7 +352,7 @@ async function migrateMultiTenant() {
   // 所有业务表加 shop_id（DEFAULT 1 保证现有数据不丢）
   const tables = [
     'goods','goods_cate','goods_unit','goods_brand','goods_spec',
-    'sale_customers','sale_contracts','sale_out_order','sale_return_order','sale_offers','sale_samples',
+    'sale_customers','sale_contracts','sale_out_order','sale_return_order','sale_offers','sale_samples','sale_exchange_order',
     'purchase_order','procure_inhouse','procure_return','procure_plan',
     'stock_flow','stock_inventory','warehouses','stock_other_in','stock_other_out','stock_allocation','stock_checks',
     'supplier','bom_order','bom_items',
@@ -331,6 +365,17 @@ async function migrateMultiTenant() {
   ]
   for (const t of tables) {
     await pool.query(`ALTER TABLE IF EXISTS ${t} ADD COLUMN IF NOT EXISTS shop_id INTEGER NOT NULL DEFAULT 1`).catch(() => {})
+  }
+  // 给所有业务表补齐录入人字段；历史记录归属店铺超级管理员，避免被店员误读。
+  for (const t of ADMIN_SCOPED_TABLES) {
+    await pool.query(`ALTER TABLE IF EXISTS ${t} ADD COLUMN IF NOT EXISTS admin_id INTEGER NOT NULL DEFAULT 0`).catch(() => {})
+    await pool.query(`ALTER TABLE IF EXISTS ${t} ADD COLUMN IF NOT EXISTS admin_name VARCHAR(100) DEFAULT ''`).catch(() => {})
+    await pool.query(`
+      UPDATE ${t} r SET admin_id=a.id, admin_name=a.name
+      FROM admins a
+      WHERE r.shop_id=a.shop_id AND a.role_id=0 AND a.deleted_at IS NULL
+        AND (r.admin_id IS NULL OR r.admin_id=0)
+    `).catch(() => {})
   }
 }
 
@@ -398,7 +443,10 @@ function shopBase(req, base) {
 
 async function listQuery(res, table, { keyword, keywordCols, extra = '', extraParams = [], baseWhere = 'deleted_at IS NULL', orderBy = 'id DESC', page, list_rows, offset }) {
   const kw = buildKeywordWhere(keyword, keywordCols || [], extraParams.length + 1)
-  const where = 'WHERE ' + baseWhere + (extra ? ' AND ' + extra : '') + kw.where
+  const req = res.req
+  const ownerScope = req?.admin?.is_owner ? '' : ` AND admin_id=${parseInt(req?.admin?.id) || 0}`
+  const scopedWhere = ADMIN_SCOPED_TABLES.has(table) ? baseWhere + ownerScope : baseWhere
+  const where = 'WHERE ' + scopedWhere + (extra ? ' AND ' + extra : '') + kw.where
   const allParams = [...extraParams, ...kw.params]
   const countSql = `SELECT COUNT(*) FROM ${table} ${where}`
   const rowsSql = `SELECT * FROM ${table} ${where} ORDER BY ${orderBy} LIMIT $${allParams.length + 1} OFFSET $${allParams.length + 2}`
@@ -437,6 +485,48 @@ app.use('/adminapi', (req, res, next) => {
     if (!canAccess(req.admin, req.method, req.path)) return fail(res, '无权执行此操作', 403)
     next()
   })
+})
+
+// 数据权限不能只靠前端隐藏：店员的列表、详情和写操作都强制绑定到自己的 admin_id。
+app.use('/adminapi', async (req, res, next) => {
+  if (['/login/account','/login/register','/login/logout'].includes(req.path)) return next()
+  const table = scopedResource(req.path)
+  if (!table || req.admin?.is_owner) return next()
+  try {
+    await ensureAdminCols(table)
+    const adminId = parseInt(req.admin?.id) || 0
+    const shopId = parseInt(req.admin?.shop_id) || 1
+    if (req.method === 'GET' || req.method === 'HEAD') {
+      // 列表由 listQuery 自动追加 admin_id；详情接口在这里先做一次归属校验。
+      const checkId = req.query?.id ?? req.query?.goods_id
+      if (checkId) {
+        const row = await pool.query(`SELECT 1 FROM ${table} WHERE id=$1 AND shop_id=$2 AND admin_id=$3 LIMIT 1`, [parseInt(checkId), shopId, adminId])
+        if (!row.rows.length) return fail(res, '无权访问此数据', 403)
+      }
+      return next()
+    }
+    const path = String(req.path || '')
+    if (path.endsWith('/add')) {
+      let name = ''
+      try { name = (await pool.query('SELECT name FROM admins WHERE id=$1', [adminId])).rows[0]?.name || '' } catch {}
+      req.body = { ...(req.body || {}), admin_id: adminId, admin_name: name, shop_id: shopId }
+      return next()
+    }
+    const rawIds = req.body?.ids ?? req.body?.id ?? req.body?.goods_id
+    const rawIdList = Array.isArray(rawIds) ? rawIds : String(rawIds ?? '').split(',')
+    const ids = rawIdList.map(Number).filter(Number.isInteger)
+    if (!ids.length) return fail(res, '缺少数据 ID')
+    const owned = await pool.query(`SELECT COUNT(*)::int AS count FROM ${table} WHERE id=ANY($1::int[]) AND shop_id=$2 AND admin_id=$3`, [ids, shopId, adminId])
+    if (Number(owned.rows[0]?.count || 0) !== ids.length) return fail(res, '无权操作其他账号录入的数据', 403)
+    // 归属字段不可由店员改写。
+    if (req.body && typeof req.body === 'object') {
+      const { admin_id, admin_name, ...rest } = req.body
+      req.body = { ...rest, shop_id: shopId }
+    }
+    return next()
+  } catch (e) {
+    return fail(res, e.message || '数据权限校验失败', 503)
+  }
 })
 
 // ─── login / auth ───────────────────────────────────────────────────────────
@@ -719,7 +809,7 @@ router.post('/goods/ShopGoodsCate/add', async (req, res) => {
     const shopId = parseInt(req.admin?.shop_id) || 1
     const dup = await pool.query('SELECT * FROM goods_cate WHERE name=$1 AND parent_id=$2 AND shop_id=$3 LIMIT 1', [name, parent_id, shopId])
     if (dup.rows.length) return ok(res, dup.rows[0])
-    const r = await pool.query('INSERT INTO goods_cate (name,parent_id,sort,status,shop_id) VALUES ($1,$2,$3,$4,$5) RETURNING *', [name, parent_id, sort, status, shopId])
+    const r = await pool.query('INSERT INTO goods_cate (name,parent_id,sort,status,shop_id,admin_id,admin_name) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *', [name, parent_id, sort, status, shopId, req.admin?.id || 0, req.admin?.name || ''])
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })
@@ -755,7 +845,7 @@ router.post('/goods/ShopUnit/add', async (req, res) => {
     const { name, status = 1 } = req.body
     if (!name) return fail(res, '名称不能为空')
     const shopId = parseInt(req.admin?.shop_id) || 1
-    const r = await pool.query('INSERT INTO goods_unit (name,status,shop_id) VALUES ($1,$2,$3) RETURNING *', [name, status, shopId])
+    const r = await pool.query('INSERT INTO goods_unit (name,status,shop_id,admin_id,admin_name) VALUES ($1,$2,$3,$4,$5) RETURNING *', [name, status, shopId, req.admin?.id || 0, req.admin?.name || ''])
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })
@@ -829,7 +919,7 @@ router.post('/goods/ShopBrand/add', async (req, res) => {
     const { name, status = 1 } = req.body
     if (!name) return fail(res, '名称不能为空')
     const shopId = parseInt(req.admin?.shop_id) || 1
-    const r = await pool.query('INSERT INTO goods_brand (name,status,shop_id) VALUES ($1,$2,$3) RETURNING *', [name, status, shopId])
+    const r = await pool.query('INSERT INTO goods_brand (name,status,shop_id,admin_id,admin_name) VALUES ($1,$2,$3,$4,$5) RETURNING *', [name, status, shopId, req.admin?.id || 0, req.admin?.name || ''])
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })
@@ -864,7 +954,7 @@ router.post('/goods/ShopSpec/add', async (req, res) => {
     const { name, values = '', status = 1 } = req.body
     if (!name) return fail(res, '名称不能为空')
     const shopId = parseInt(req.admin?.shop_id) || 1
-    const r = await pool.query('INSERT INTO goods_spec (name,values,status,shop_id) VALUES ($1,$2,$3,$4) RETURNING *', [name, values, status, shopId])
+    const r = await pool.query('INSERT INTO goods_spec (name,values,status,shop_id,admin_id,admin_name) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *', [name, values, status, shopId, req.admin?.id || 0, req.admin?.name || ''])
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })
@@ -1857,7 +1947,7 @@ router.post('/stock/WarehouseName/add', async (req, res) => {
     const { name, address = '', remark = '', status = 1 } = req.body
     if (!name) return fail(res, '仓库名称不能为空')
     const shopId = parseInt(req.admin?.shop_id) || 1
-    const r = await pool.query('INSERT INTO warehouses (name,address,remark,status,shop_id) VALUES ($1,$2,$3,$4,$5) RETURNING *', [name, address, remark, status, shopId])
+    const r = await pool.query('INSERT INTO warehouses (name,address,remark,status,shop_id,admin_id,admin_name) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *', [name, address, remark, status, shopId, req.admin?.id || 0, req.admin?.name || ''])
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })
@@ -4011,6 +4101,8 @@ async function start() {
     await migrateSaleExchangeOrder()
     await loadTableCols()
     await migrateMultiTenant()
+    // migrateMultiTenant 新增的 admin_id/admin_name 也加入写入白名单。
+    await loadTableCols()
     // 补填历史退货单 fund 信息（一次性，幂等）
     await pool.query(`UPDATE sale_return_order SET fund_id=58, fund_name='公司收入账号' WHERE id=51 AND fund_id=0`).catch(() => {})
     console.log('Database ready')
@@ -4029,9 +4121,10 @@ router.get('/goods/BomGoods/index', async (req, res) => {
     const { page, list_rows, offset } = pageParams(req.query)
     const keyword = req.query.keyword || ''
     const shopId = parseInt(req.admin?.shop_id) || 1
+    const ownerWhere = req.admin?.is_owner ? '' : ` AND admin_id=${parseInt(req.admin?.id) || 0}`
     const where = keyword
-      ? `deleted_at IS NULL AND shop_id=${shopId} AND (goods_name ILIKE $1 OR goods_sn ILIKE $1 OR bom_code ILIKE $1)`
-      : `deleted_at IS NULL AND shop_id=${shopId}`
+      ? `deleted_at IS NULL AND shop_id=${shopId}${ownerWhere} AND (goods_name ILIKE $1 OR goods_sn ILIKE $1 OR bom_code ILIKE $1)`
+      : `deleted_at IS NULL AND shop_id=${shopId}${ownerWhere}`
     const params = keyword ? [`%${keyword}%`] : []
     const count = await pool.query(`SELECT COUNT(*) FROM bom_order WHERE ${where}`, params)
     const rows = await pool.query(
@@ -4056,16 +4149,19 @@ router.get('/goods/BomGoods/detail', async (req, res) => {
 
 router.post('/goods/BomGoods/add', async (req, res) => {
   try {
+    await ensureAdminCols('bom_order')
     const { goods_name, goods_sn, spec, unit_name, remark, items = [] } = req.body
     if (!goods_name) return fail(res, '商品名称不能为空')
     const shopId = parseInt(req.admin?.shop_id) || 1
     const countR = await pool.query('SELECT COUNT(*) FROM bom_order WHERE deleted_at IS NULL AND shop_id=$1', [shopId])
     const sn = parseInt(countR.rows[0].count) + 1
     const bomCode = 'BOM' + String(sn).padStart(6, '0')
+    const adminId = parseInt(req.admin?.id) || 0
+    const adminName = req.admin?.name || ''
     const r = await pool.query(
-      `INSERT INTO bom_order (bom_code, goods_name, goods_sn, spec, unit_name, remark, shop_id)
-       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
-      [bomCode, goods_name, goods_sn || '', spec || '', unit_name || '', remark || '', shopId]
+      `INSERT INTO bom_order (bom_code, goods_name, goods_sn, spec, unit_name, remark, shop_id, admin_id, admin_name)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+      [bomCode, goods_name, goods_sn || '', spec || '', unit_name || '', remark || '', shopId, adminId, adminName]
     )
     const bomId = r.rows[0].id
     for (const item of items) {

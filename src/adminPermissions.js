@@ -83,10 +83,22 @@ const extraReads = {
 }
 function hasMenu(permissions, key) {
   const legacyGroup = key.startsWith('sale-client') ? 'customer' : key.startsWith('mini-') ? 'miniapp' : key.split('-')[0]
-  return permissions.includes('*') || permissions.includes(key) || permissions.includes(legacyGroup)
+  // Read legacy role values defensively at the authorization boundary too.
+  // Some existing roles may reach this process before loadAccess has rebuilt
+  // the normalized permission list.
+  const normalized = permissions.flatMap(p => {
+    if (typeof p !== 'string') return []
+    const match = p.match(/^menu\.group\.([\w-]+)(?:\(\d+\))?$/i)
+    return match ? [p, match[1]] : [p]
+  })
+  return normalized.includes('*') || normalized.includes(key) || normalized.includes(legacyGroup)
 }
 function hasModule(permissions, module) {
-  return permissions.some(p => p === module || p.startsWith(module + '-'))
+  return permissions.some(p => {
+    if (typeof p !== 'string') return false
+    const normalized = p.match(/^menu\.group\.([\w-]+)(?:\(\d+\))?$/i)?.[1] || p
+    return normalized === module || normalized.startsWith(module + '-')
+  })
 }
 function canAccess(user, method, rawPath) {
   if (user.is_owner) return true

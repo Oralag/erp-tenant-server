@@ -958,6 +958,8 @@ router.get('/shop/ContractOrder/index', async (req, res) => {
   try {
     const { page, list_rows, offset } = pageParams(req.query)
     const conditions = ['deleted_at IS NULL']
+    // 店员只能看到自己录入的合同；超级管理员保留全店视图。
+    if (!req.admin?.is_owner) conditions.push(`admin_id=${parseInt(req.admin?.id) || 0}`)
     if (req.query.status !== undefined && req.query.status !== '') conditions.push(`status=${parseInt(req.query.status)}`)
     if (req.query.customer_name) conditions.push(`customer_name ILIKE '%${req.query.customer_name.replace(/'/g,"''")}%'`)
     await listQuery(res, 'sale_contracts', { keyword: req.query.keyword, keywordCols: ['order_no'], baseWhere: shopBase(req, conditions.join(' AND ')), orderBy: 'id DESC', page, list_rows, offset })
@@ -965,9 +967,16 @@ router.get('/shop/ContractOrder/index', async (req, res) => {
 })
 router.get('/shop/ContractOrder/detail', async (req, res) => {
   try {
+    await ensureAdminCols('sale_contracts')
     const id = parseInt(req.query.id || 0)
     if (!id) return fail(res, 'id不能为空')
-    const r = await pool.query('SELECT * FROM sale_contracts WHERE id=$1 AND deleted_at IS NULL LIMIT 1', [id])
+    const params = [id, parseInt(req.admin?.shop_id) || 1]
+    let scope = 'id=$1 AND shop_id=$2 AND deleted_at IS NULL'
+    if (!req.admin?.is_owner) {
+      scope += ' AND admin_id=$3'
+      params.push(parseInt(req.admin?.id) || 0)
+    }
+    const r = await pool.query(`SELECT * FROM sale_contracts WHERE ${scope} LIMIT 1`, params)
     if (!r.rows[0]) return fail(res, '合同不存在')
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
@@ -997,24 +1006,36 @@ router.post('/shop/ContractOrder/add', async (req, res) => {
 })
 router.post('/shop/ContractOrder/edit', async (req, res) => {
   try {
+    await ensureAdminCols('sale_contracts')
     const { id, ...rest } = req.body
     if (!id) return fail(res, 'id不能为空')
-    const cols = Object.keys(rest).filter(k => rest[k] !== undefined)
+    // 归属字段由服务端维护，避免店员通过请求体改绑合同或跨店写入。
+    const protectedCols = new Set(['id', 'admin_id', 'admin_name', 'shop_id'])
+    const cols = Object.keys(rest).filter(k => rest[k] !== undefined && !protectedCols.has(k))
     if (!cols.length) return fail(res, '无有效字段')
     const sets = cols.map((k,i) => `${k}=$${i+1}`)
     const vals = cols.map(k => typeof rest[k] === 'object' ? JSON.stringify(rest[k]) : rest[k])
     const shopId = parseInt(req.admin?.shop_id) || 1
-    const r = await pool.query(`UPDATE sale_contracts SET ${sets.join(',')} WHERE id=$${vals.length+1} AND shop_id=$${vals.length+2} RETURNING *`, [...vals, id, shopId])
+    const where = [`id=$${vals.length + 1}`, `shop_id=$${vals.length + 2}`, 'deleted_at IS NULL']
+    const params = [...vals, id, shopId]
+    if (!req.admin?.is_owner) {
+      where.push(`admin_id=$${params.length + 1}`)
+      params.push(parseInt(req.admin?.id) || 0)
+    }
+    const r = await pool.query(`UPDATE sale_contracts SET ${sets.join(',')} WHERE ${where.join(' AND ')} RETURNING *`, params)
     return ok(res, r.rows[0])
   } catch (e) { fail(res, e.message) }
 })
 router.post('/shop/ContractOrder/del', async (req, res) => {
   try {
+    await ensureAdminCols('sale_contracts')
     const { id } = req.body
     if (!id) return fail(res, 'id不能为空')
     const delShopId = parseInt(req.admin?.shop_id) || 1
+    const ownerClause = req.admin?.is_owner ? '' : ' AND admin_id=$3'
+    const contractParams = req.admin?.is_owner ? [id, delShopId] : [id, delShopId, parseInt(req.admin?.id) || 0]
     // 已审核的合同删除时，同步撤销关联收款单并扣余额（同反审核逻辑）
-    const cR = await pool.query('SELECT * FROM sale_contracts WHERE id=$1 AND shop_id=$2', [id, delShopId])
+    const cR = await pool.query(`SELECT * FROM sale_contracts WHERE id=$1 AND shop_id=$2 AND deleted_at IS NULL${ownerClause}`, contractParams)
     const contract = cR.rows[0]
     if (contract && Number(contract.status) === 1) {
       const orderSn = contract.order_sn || contract.order_no || ''
@@ -1042,18 +1063,21 @@ router.post('/shop/ContractOrder/del', async (req, res) => {
         }
       }
     }
-    await pool.query('UPDATE sale_contracts SET deleted_at=NOW() WHERE id=$1 AND shop_id=$2', [id, delShopId])
+    await pool.query(`UPDATE sale_contracts SET deleted_at=NOW() WHERE id=$1 AND shop_id=$2${ownerClause}`, contractParams)
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })
 router.post('/shop/ContractOrder/audit', async (req, res) => {
   try {
+    await ensureAdminCols('sale_contracts')
     const { id, status } = req.body
     if (!id) return fail(res, 'id不能为空')
     const isAudit = Number(status ?? 1) === 1
 
     const shopId = parseInt(req.admin?.shop_id) || 1
-    const contractR = await pool.query('SELECT * FROM sale_contracts WHERE id=$1 AND shop_id=$2', [id, shopId])
+    const ownerClause = req.admin?.is_owner ? '' : ' AND admin_id=$3'
+    const contractParams = req.admin?.is_owner ? [id, shopId] : [id, shopId, parseInt(req.admin?.id) || 0]
+    const contractR = await pool.query(`SELECT * FROM sale_contracts WHERE id=$1 AND shop_id=$2 AND deleted_at IS NULL${ownerClause}`, contractParams)
     const contract = contractR.rows[0]
     if (!contract) return fail(res, '合同不存在')
 
@@ -1113,7 +1137,10 @@ router.post('/shop/ContractOrder/audit', async (req, res) => {
       }
     }
 
-    await pool.query('UPDATE sale_contracts SET status=$1 WHERE id=$2 AND shop_id=$3', [status ?? 1, id, shopId])
+    const updateParams = [status ?? 1, id, shopId]
+    const updateOwnerClause = req.admin?.is_owner ? '' : ' AND admin_id=$4'
+    if (!req.admin?.is_owner) updateParams.push(parseInt(req.admin?.id) || 0)
+    await pool.query(`UPDATE sale_contracts SET status=$1 WHERE id=$2 AND shop_id=$3 AND deleted_at IS NULL${updateOwnerClause}`, updateParams)
     return ok(res)
   } catch (e) { fail(res, e.message) }
 })

@@ -3073,6 +3073,25 @@ async function ensureAdminCols(table) {
 }
 const ensureRetailAdminCols = () => ensureAdminCols('retail_orders')
 
+// One-time ownership correction requested for the legacy retail order shown
+// in the clerk account. Keep the record in the same shop, but move its data
+// owner to that shop's super administrator so the clerk no longer sees it.
+async function transferLegacyRetailOrderToOwner() {
+  try {
+    await ensureRetailAdminCols()
+    await pool.query(`
+      UPDATE retail_orders r
+      SET admin_id = a.id, admin_name = a.name
+      FROM admins a
+      WHERE r.order_sn = $1
+        AND a.shop_id = r.shop_id
+        AND a.role_id = 0
+        AND a.deleted_at IS NULL
+    `, ['LS202607249486'])
+  } catch (e) { console.error('[retail ownership correction]', e.message) }
+}
+transferLegacyRetailOrderToOwner()
+
 router.get('/retail/order/index', async (req, res) => {
   try { await exhibitions.ensure() } catch (e) { return fail(res, e.message) }
   try { await pool.query(`ALTER TABLE retail_orders ADD COLUMN IF NOT EXISTS fee_items JSONB DEFAULT '[]'`) } catch {}

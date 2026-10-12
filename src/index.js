@@ -3081,9 +3081,9 @@ async function ensureAdminCols(table) {
 }
 const ensureRetailAdminCols = () => ensureAdminCols('retail_orders')
 
-// One-time ownership correction requested for the legacy retail order shown
-// in the clerk account. Keep the record in the same shop, but move its data
-// owner to that shop's super administrator so the clerk no longer sees it.
+// One-time ownership corrections requested for retail orders entered under
+// the wrong clerk account. Keep each record in the same shop, but move its
+// data owner to that shop's super administrator.
 async function transferLegacyRetailOrderToOwner() {
   try {
     await ensureRetailAdminCols()
@@ -3091,11 +3091,11 @@ async function transferLegacyRetailOrderToOwner() {
       UPDATE retail_orders r
       SET admin_id = a.id, admin_name = a.name
       FROM admins a
-      WHERE r.order_sn = $1
+      WHERE r.order_sn = ANY($1::text[])
         AND a.shop_id = r.shop_id
         AND a.role_id = 0
         AND a.deleted_at IS NULL
-    `, ['LS202607249486'])
+    `, [['LS202607249486', 'LS202610124340']])
   } catch (e) { console.error('[retail ownership correction]', e.message) }
 }
 transferLegacyRetailOrderToOwner()

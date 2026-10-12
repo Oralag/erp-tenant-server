@@ -304,6 +304,12 @@ const ADMIN_SCOPED_TABLES = new Set([
   'retail_orders','retail_members','retail_recharge','retail_stores',
 ])
 
+// Master/reference data is shared within a shop. Employees may read the
+// catalog and store list even though transactional records stay owner-scoped.
+const SHARED_READ_TABLES = new Set([
+  'goods','goods_cate','goods_unit','goods_brand','goods_spec','warehouses','retail_stores',
+])
+
 const ADMIN_SCOPE_RESOURCES = [
   ['/goods/ShopGoodsCate','goods_cate'], ['/goods/GoodsUnitConvert','goods'], ['/goods/ShopUnit','goods_unit'],
   ['/goods/ShopBrand','goods_brand'], ['/goods/ShopSpec','goods_spec'], ['/goods/ShopGoods','goods'],
@@ -445,7 +451,9 @@ async function listQuery(res, table, { keyword, keywordCols, extra = '', extraPa
   const kw = buildKeywordWhere(keyword, keywordCols || [], extraParams.length + 1)
   const req = res.req
   const ownerScope = req?.admin?.is_owner ? '' : ` AND admin_id=${parseInt(req?.admin?.id) || 0}`
-  const scopedWhere = ADMIN_SCOPED_TABLES.has(table) ? baseWhere + ownerScope : baseWhere
+  const scopedWhere = ADMIN_SCOPED_TABLES.has(table) && !SHARED_READ_TABLES.has(table)
+    ? baseWhere + ownerScope
+    : baseWhere
   const where = 'WHERE ' + scopedWhere + (extra ? ' AND ' + extra : '') + kw.where
   const allParams = [...extraParams, ...kw.params]
   const countSql = `SELECT COUNT(*) FROM ${table} ${where}`

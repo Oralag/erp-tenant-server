@@ -5,7 +5,19 @@ function parsePermissions(value) {
   try {
     if (typeof value === 'string') value = JSON.parse(value.startsWith(PERM_PREFIX) ? value.slice(PERM_PREFIX.length) : value)
     const keys = Array.isArray(value) ? value : value?.menus
-    return Array.isArray(keys) ? keys.filter(k => typeof k === 'string') : []
+    if (!Array.isArray(keys)) return []
+    const normalized = new Set()
+    for (const key of keys) {
+      if (typeof key !== 'string') continue
+      normalized.add(key)
+      // 兼容旧角色权限格式：menu.group.procure(1) -> procure。
+      const legacy = key.match(/^menu\.group\.([\w-]+)\(\d+\)$/i)
+      if (legacy) normalized.add(legacy[1])
+      // 部分旧数据使用 menu.group.procure，不带数量后缀。
+      const group = key.match(/^menu\.group\.([\w-]+)$/i)
+      if (group) normalized.add(group[1])
+    }
+    return [...normalized]
   } catch { return [] }
 }
 

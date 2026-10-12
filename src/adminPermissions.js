@@ -32,10 +32,12 @@ async function loadAccess(pool, id) {
   else if (Number(user.role_id) > 0) {
     const role = await pool.query('SELECT permissions,status FROM roles WHERE id=$1 AND shop_id=$2', [user.role_id,user.shop_id])
     if (Number(role.rows[0]?.status) === 1) permissions = parsePermissions(role.rows[0].permissions)
+    if (!permissions.length) permissions = parsePermissions(user.remark)
   } else if (user.role_name) {
     const role = await pool.query('SELECT permissions,status FROM roles WHERE name=$1 AND shop_id=$2 ORDER BY id LIMIT 1', [user.role_name,user.shop_id])
     if (role.rows[0]) {
       if (Number(role.rows[0].status) === 1) permissions = parsePermissions(role.rows[0].permissions)
+      if (!permissions.length) permissions = parsePermissions(user.remark)
     } else permissions = parsePermissions(user.remark)
   } else permissions = parsePermissions(user.remark)
   return { ...user, permissions, is_owner: owner, remark: PERM_PREFIX + JSON.stringify({ menus: permissions }) }

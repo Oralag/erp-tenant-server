@@ -505,6 +505,8 @@ app.use('/adminapi', async (req, res, next) => {
     const adminId = parseInt(req.admin?.id) || 0
     const shopId = parseInt(req.admin?.shop_id) || 1
     if (req.method === 'GET' || req.method === 'HEAD') {
+      // 共享主数据允许同店员工读取详情，不做录入员工归属校验。
+      if (SHARED_READ_TABLES.has(table)) return next()
       // 列表由 listQuery 自动追加 admin_id；详情接口在这里先做一次归属校验。
       const checkId = req.query?.id ?? req.query?.goods_id
       if (checkId) {

@@ -76,7 +76,8 @@ const extraReads = {
   '/goods/ShopUnit': ['sale','procure','retail','warehouse'],
   '/goods/GoodsUnitConvert': ['sale','procure','retail','warehouse'],
   '/stock/WarehouseName': ['sale','procure','retail','warehouse','production'],
-  '/shop/ShopCustomer': ['sale','finance'], '/procure/supplier': ['procure','finance'],
+  // 销售合同录入需要读取客户下拉，但不因此获得客户档案管理权限
+  '/shop/ShopCustomer': ['sale','finance','sale-contract'], '/procure/supplier': ['procure','finance'],
   '/retail/store': ['retail'], '/retail/member': ['retail'],
   '/finance/Fund': ['finance','procure','sale','retail'],
   '/finance/PayReceipt': ['procure','finance-payable','retail-order','retail-exhibition'],

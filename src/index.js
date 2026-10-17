@@ -526,7 +526,18 @@ app.use('/adminapi', async (req, res, next) => {
     const rawIdList = Array.isArray(rawIds) ? rawIds : String(rawIds ?? '').split(',')
     const ids = rawIdList.map(Number).filter(Number.isInteger)
     if (!ids.length) return fail(res, '缺少数据 ID')
-    const owned = await pool.query(`SELECT COUNT(*)::int AS count FROM ${table} WHERE id=ANY($1::int[]) AND shop_id=$2 AND admin_id=$3`, [ids, shopId, adminId])
+    // 商品展示开关属于同店共享目录；模块权限已在前一层校验。
+    // 仅豁免这三个布尔展示字段的录入人限制，其他编辑/删除仍按原归属检查。
+    const fields = req.body?.brand_fields
+    const sharedDisplayPatch = req.method === 'POST' && path === '/goods/ShopGoods/patchBrand'
+      && fields && typeof fields === 'object' && !Array.isArray(fields)
+      && Object.keys(req.body).every(key => ['id', 'brand_fields'].includes(key))
+      && Object.keys(fields).length > 0
+      && Object.entries(fields).every(([key, value]) => ['show', 'delivery', 'deliveryOff'].includes(key) && typeof value === 'boolean')
+    const owned = await pool.query(
+      `SELECT COUNT(*)::int AS count FROM ${table} WHERE id=ANY($1::int[]) AND shop_id=$2${sharedDisplayPatch ? ' AND deleted_at IS NULL' : ' AND admin_id=$3'}`,
+      sharedDisplayPatch ? [ids, shopId] : [ids, shopId, adminId]
+    )
     if (Number(owned.rows[0]?.count || 0) !== ids.length) return fail(res, '无权操作其他账号录入的数据', 403)
     // 归属字段不可由店员改写。
     if (req.body && typeof req.body === 'object') {

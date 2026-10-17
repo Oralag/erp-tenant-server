@@ -48,6 +48,7 @@ const resources = {
   '/goods/ShopGoods': ['goods-info'], '/goods/ShopGoodsCate': ['goods-info'],
   '/goods/ShopUnit': ['goods-unit'], '/goods/GoodsUnitConvert': ['goods-unit'],
   '/goods/ShopBrand': ['goods-brand'], '/goods/ShopSpec': ['goods-info'], '/goods/Bom': ['goods-bom'],
+  '/goods/BomGoods': ['goods-bom'],
   '/shop/ShopCustomer': ['sale-client'], '/shop/ContractOrder': ['sale-contract'],
   '/shop/offerOrder': ['sale-offer'], '/shop/SampleOrder': ['sale-sample'],
   '/stock/PurchaseOrder': ['procure-order'], '/stock/SaleOutOrder': ['sale-out'], '/stock/SaleReturnOrder': ['sale-return'],
@@ -73,8 +74,10 @@ const resources = {
 const extraReads = {
   '/goods/ShopGoods': ['sale','procure','retail','warehouse','production'],
   '/goods/ShopGoodsCate': ['sale','procure','retail','warehouse'],
-  '/goods/ShopUnit': ['sale','procure','retail','warehouse'],
-  '/goods/GoodsUnitConvert': ['sale','procure','retail','warehouse'],
+  '/goods/ShopUnit': ['goods-info','sale','procure','retail','warehouse'],
+  '/goods/GoodsUnitConvert': ['goods-info','sale','procure','retail','warehouse'],
+  '/goods/ShopBrand': ['goods-info'],
+  '/goods/BomGoods': ['goods-info'],
   '/stock/WarehouseName': ['sale','procure','retail','warehouse','production'],
   // 销售合同录入需要读取客户下拉，但不因此获得客户档案管理权限
   '/shop/ShopCustomer': ['sale','finance','sale-contract'], '/procure/supplier': ['procure','finance'],

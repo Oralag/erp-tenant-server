@@ -307,7 +307,7 @@ const ADMIN_SCOPED_TABLES = new Set([
 // Master/reference data is shared within a shop. Employees may read the
 // catalog and store list even though transactional records stay owner-scoped.
 const SHARED_READ_TABLES = new Set([
-  'goods','goods_cate','goods_unit','goods_brand','goods_spec','warehouses','retail_stores',
+  'goods','goods_cate','goods_unit','goods_brand','goods_spec','sale_customers','warehouses','retail_stores',
 ])
 
 const ADMIN_SCOPE_RESOURCES = [
